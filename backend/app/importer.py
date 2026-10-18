@@ -1,0 +1,123 @@
+"""Import local files and folders without following symlinks outside the root."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import uuid
+from pathlib import Path
+
+from .errors import CraftsError
+from .probe import probe_file
+from .security import MAX_HASH_BYTES, is_within, resolve_existing
+
+CANDIDATE_EXTENSIONS = {".mp4", ".mov", ".mxf", ".mts", ".m2ts"}
+MAX_FOLDER_FILES = 500
+MAX_DEPTH = 8
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            total += len(block)
+            if total > MAX_HASH_BYTES:
+                raise CraftsError("File exceeds the hash size limit.", code="too_large")
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def file_record(path: Path, ffprobe: str) -> dict:
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file():
+        raise CraftsError("Path is not a file.", code="bad_path")
+    digest = sha256_file(resolved)
+    stat = resolved.stat()
+    probed = probe_file(ffprobe, resolved)
+    if not probed.get("video"):
+        raise CraftsError("ffprobe found no video stream.", code="unreadable_media")
+    return {
+        "id": str(uuid.uuid4()),
+        "path": str(resolved),
+        "name": resolved.name,
+        "sha256": digest,
+        "size": stat.st_size,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "probe": probed,
+        "flag": "",
+        "notes": "",
+        "markers": [],
+        "trim_in": 0.0,
+        "trim_out": probed.get("duration") or 0.0,
+        "duplicate": False,
+    }
+
+
+def import_path(raw: str, ffprobe: str) -> dict:
+    resolved = resolve_existing(raw)
+    if resolved.is_dir():
+        return import_folder(resolved, ffprobe)
+    if resolved.is_file():
+        return {"clips": [file_record(resolved, ffprobe)], "skipped": [], "root": str(resolved.parent)}
+    raise CraftsError("Path is neither a file nor a folder.", code="bad_path")
+
+
+def import_folder(root: Path, ffprobe: str) -> dict:
+    root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise CraftsError("Folder import needs a directory.", code="bad_path")
+    clips = []
+    skipped = []
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(dirpath)
+        depth = len(current.relative_to(root).parts)
+        if depth >= MAX_DEPTH:
+            dirnames[:] = []
+        kept = []
+        for name in dirnames:
+            candidate = current / name
+            if candidate.is_symlink():
+                try:
+                    target = candidate.resolve(strict=True)
+                except OSError:
+                    skipped.append({"path": str(candidate), "reason": "symlink could not be resolved"})
+                    continue
+                if not is_within(target, root):
+                    skipped.append({"path": str(candidate), "reason": "symlink escapes the selected folder"})
+                    continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in filenames:
+            candidate = current / name
+            if candidate.suffix.lower() not in CANDIDATE_EXTENSIONS:
+                continue
+            seen += 1
+            if seen > MAX_FOLDER_FILES:
+                skipped.append({"path": str(candidate), "reason": "folder file limit reached"})
+                return {"clips": clips, "skipped": skipped, "root": str(root)}
+            if candidate.is_symlink():
+                try:
+                    target = candidate.resolve(strict=True)
+                except OSError:
+                    skipped.append({"path": str(candidate), "reason": "symlink could not be resolved"})
+                    continue
+                if not is_within(target, root):
+                    skipped.append({"path": str(candidate), "reason": "symlink escapes the selected folder"})
+                    continue
+                probe_path = target
+            else:
+                probe_path = candidate.resolve(strict=True)
+                if not is_within(probe_path, root):
+                    skipped.append({"path": str(candidate), "reason": "path escapes the selected folder"})
+                    continue
+            try:
+                clips.append(file_record(probe_path, ffprobe))
+            except CraftsError as exc:
+                skipped.append({"path": str(probe_path), "reason": exc.message})
+    return {"clips": clips, "skipped": skipped, "root": str(root)}
