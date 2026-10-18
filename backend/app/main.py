@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -90,6 +91,50 @@ class GyroBody(BaseModel):
     output_path: str
 
 
+class BatchExportBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    preset_id: str
+    audio: bool = True
+    acknowledge_bit_depth_conversion: bool = False
+    exposure: float = Field(default=0, ge=-1, le=1)
+    saturation: float = Field(default=1, ge=0, le=3)
+    lut_path: str | None = None
+    rotate: str = "0"
+    fit: str = "none"
+    width: int | None = Field(default=None, ge=2, le=7680)
+    height: int | None = Field(default=None, ge=2, le=4320)
+    stabilization: str = "off"
+    stab_shakiness: int = Field(default=5, ge=1, le=10)
+    stab_accuracy: int = Field(default=15, ge=1, le=15)
+    stab_smoothing: int = Field(default=10, ge=0, le=1000)
+    stab_crop: str = "black"
+    stab_zoom: int = Field(default=0, ge=-100, le=100)
+    stab_optzoom: int = Field(default=0, ge=0, le=2)
+    deshake_rx: int = Field(default=16, ge=0, le=64)
+    deshake_ry: int = Field(default=16, ge=0, le=64)
+    crf: int | None = Field(default=None, ge=0, le=51)
+    use_vidstab_auto: bool = False
+
+
+class BatchGyroBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    format: Literal["h264_mp4", "prores_422"]
+    audio: bool = True
+    width: int | None = Field(default=None, ge=2, le=7680)
+    height: int | None = Field(default=None, ge=2, le=4320)
+    preset_path: str | None = None
+
+
+class BatchBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operation: Literal["export", "gyro"]
+    clip_ids: list[str] = Field(min_length=1, max_length=40)
+    destination_dir: str = Field(min_length=1, max_length=4096)
+    suffix: str = ""
+    export: BatchExportBody | None = None
+    gyro: BatchGyroBody | None = None
+
+
 class SettingsBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     ffmpeg: str | None = None
@@ -133,7 +178,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(CraftsError)
     async def crafts_error(_request: Request, exc: CraftsError):
-        return JSONResponse({"detail": exc.message, "code": exc.code}, status_code=exc.status)
+        body: dict = {"detail": exc.message, "code": exc.code}
+        if exc.details:
+            body["problems"] = exc.details
+        return JSONResponse(body, status_code=exc.status)
 
     @app.get("/api/health")
     def health():
@@ -241,6 +289,27 @@ def create_app() -> FastAPI:
     @app.post("/api/jobs/gyroflow")
     def gyro_job(body: GyroBody):
         return service.enqueue_gyro(body.model_dump())
+
+    @app.post("/api/jobs/batch")
+    def batch_job(body: BatchBody):
+        payload = body.model_dump()
+        if body.operation == "export" and body.export is None:
+            raise CraftsError("Export batch settings are missing.", code="bad_batch")
+        if body.operation == "gyro" and body.gyro is None:
+            raise CraftsError("Gyro batch settings are missing.", code="bad_batch")
+        return service.enqueue_batch(payload)
+
+    @app.get("/api/jobs/batch/{batch_id}")
+    def batch_status(batch_id: str):
+        return service.batch_status(batch_id)
+
+    @app.post("/api/jobs/batch/{batch_id}/cancel")
+    def batch_cancel(batch_id: str):
+        return service.cancel_batch(batch_id)
+
+    @app.post("/api/jobs/batch/{batch_id}/retry")
+    def batch_retry(batch_id: str):
+        return service.retry_batch_failures(batch_id)
 
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel(job_id: str):

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import type { Capabilities, Clip, Job } from "./types";
 
@@ -31,6 +31,20 @@ function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+type ThemeChoice = "light" | "dark" | "system";
+const THEME_KEY = "crafts-prepare-theme";
+
+function readTheme(): ThemeChoice {
+  const stored = window.localStorage.getItem(THEME_KEY);
+  return stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
+}
+
+function applyTheme(choice: ThemeChoice) {
+  const dark = choice === "dark" || (choice === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  document.documentElement.dataset.themeChoice = choice;
 }
 
 export function App() {
@@ -78,8 +92,20 @@ export function App() {
   const [ffprobePath, setFfprobePath] = useState("ffprobe");
   const [gyroPath, setGyroPath] = useState("gyroflow");
   const [telemetryPath, setTelemetryPath] = useState("");
+  const [checked, setChecked] = useState<string[]>([]);
+  const [batchOp, setBatchOp] = useState<"export" | "gyro">("export");
+  const [gyroFormat, setGyroFormat] = useState<"h264_mp4" | "prores_422">("h264_mp4");
+  const [gyroSourceSize, setGyroSourceSize] = useState(true);
+  const [gyroWidth, setGyroWidth] = useState(1920);
+  const [gyroHeight, setGyroHeight] = useState(1080);
+  const [gyroAudio, setGyroAudio] = useState(true);
+  const [batchPreset, setBatchPreset] = useState("");
+  const [batchProblems, setBatchProblems] = useState<{ clip_id: string | null; code: string; message: string }[]>([]);
+  const [theme, setTheme] = useState<ThemeChoice>(readTheme);
+  const libraryPath = useRef<string | undefined>(undefined);
 
   const selected = clips.find((clip) => clip.id === selectedId) ?? null;
+  const checkedClips = clips.filter((clip) => checked.includes(clip.id));
 
   async function refresh() {
     const [nextCaps, project, queue] = await Promise.all([api.capabilities(), api.project(), api.jobs()]);
@@ -87,13 +113,32 @@ export function App() {
     setClips(project.clips);
     setJobs(queue.jobs);
     setProjectName(project.name);
+    const nextPath = project.path ?? "";
     if (project.path) setProjectPath(project.path);
-    setSelectedId((current) => current ?? project.clips[0]?.id ?? null);
+    setChecked((current) => {
+      const previous = libraryPath.current;
+      const switched = previous !== undefined && previous !== "" && nextPath !== "" && previous !== nextPath;
+      if (switched) return [];
+      const ids = new Set(project.clips.map((clip) => clip.id));
+      return current.filter((id) => ids.has(id));
+    });
+    libraryPath.current = nextPath;
+    setSelectedId((current) => (current && project.clips.some((clip) => clip.id === current) ? current : project.clips[0]?.id ?? null));
   }
 
   useEffect(() => {
     refresh().catch((error: Error) => setNotice(error.message));
   }, []);
+
+  useEffect(() => {
+    applyTheme(theme);
+    window.localStorage.setItem(THEME_KEY, theme);
+    if (theme !== "system") return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () => applyTheme("system");
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, [theme]);
 
   useEffect(() => {
     if (!jobs.some((job) => job.status === "queued" || job.status === "running")) return;
@@ -219,6 +264,67 @@ export function App() {
     }
   }
 
+  async function onBatch() {
+    if (!destination || checkedClips.length === 0) return;
+    setBusy(true);
+    setBatchProblems([]);
+    const sharedExport = {
+      preset_id: preset,
+      audio,
+      acknowledge_bit_depth_conversion: ack,
+      exposure,
+      saturation,
+      rotate,
+      fit,
+      width: fit === "none" ? null : width,
+      height: fit === "none" ? null : height,
+      stabilization,
+      use_vidstab_auto: false,
+      stab_smoothing: smoothing,
+      stab_shakiness: shakiness,
+      stab_accuracy: accuracy,
+      stab_crop: cropMode,
+      stab_zoom: zoom,
+      stab_optzoom: optzoom,
+      deshake_rx: deshakeRx,
+      deshake_ry: deshakeRy,
+      lut_path: lutPath.trim() || null,
+    };
+    const body =
+      batchOp === "export"
+        ? {
+            operation: "export",
+            clip_ids: checkedClips.map((clip) => clip.id),
+            destination_dir: destination,
+            suffix,
+            export: sharedExport,
+          }
+        : {
+            operation: "gyro",
+            clip_ids: checkedClips.map((clip) => clip.id),
+            destination_dir: destination,
+            suffix,
+            gyro: {
+              format: gyroFormat,
+              audio: gyroAudio,
+              width: gyroSourceSize ? null : gyroWidth,
+              height: gyroSourceSize ? null : gyroHeight,
+              preset_path: batchPreset.trim() || null,
+            },
+          };
+    try {
+      const result = await api.batch(body);
+      setNotice(`Queued ${result.count} ${batchOp === "gyro" ? "gyro" : "export"} job${result.count === 1 ? "" : "s"}.`);
+      await refresh();
+    } catch (error) {
+      const coded = error as Error & { code?: string; problems?: { clip_id: string | null; code: string; message: string }[] };
+      setBatchProblems(coded.problems ?? []);
+      setNotice(coded.problems?.length ? "Nothing was queued." : coded.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function applyAuto() {
     if (!caps) return;
     setStabilization("vidstab");
@@ -250,6 +356,14 @@ export function App() {
             <h1>Crafts Prepare</h1>
           </div>
         </div>
+        <label className="theme-choice">
+          Theme
+          <select aria-label="Color theme" value={theme} onChange={(event) => setTheme(event.target.value as ThemeChoice)}>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+            <option value="system">System</option>
+          </select>
+        </label>
         <label className="project-name">
           Project
           <input value={projectName} onChange={(event) => setProjectName(event.target.value)} onBlur={() => api.rename(projectName).catch((error: Error) => setNotice(error.message))} />
@@ -284,11 +398,35 @@ export function App() {
               Import
             </button>
           </div>
+          <div className="select-row">
+            <button type="button" className="ghost" onClick={() => setChecked(clips.map((clip) => clip.id))} disabled={!clips.length}>
+              Select all
+            </button>
+            <button type="button" className="ghost" onClick={() => setChecked([])} disabled={!checked.length}>
+              Clear selection
+            </button>
+            <span>{checkedClips.length} selected</span>
+          </div>
           <ul>
             {clips.length === 0 && <li className="empty">No clips yet.</li>}
             {clips.map((clip) => (
-              <li key={clip.id}>
-                <button className={clip.id === selectedId ? "clip active" : "clip"} onClick={() => setSelectedId(clip.id)}>
+              <li key={clip.id} className="clip-row">
+                <label className="clip-check">
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${clip.name} for batch`}
+                    checked={checked.includes(clip.id)}
+                    onChange={(event) =>
+                      setChecked((current) =>
+                        event.target.checked ? [...current, clip.id] : current.filter((id) => id !== clip.id),
+                      )
+                    }
+                  />
+                </label>
+                <button
+                  className={`clip${clip.id === selectedId ? " active" : ""}${checked.includes(clip.id) ? " checked" : ""}`}
+                  onClick={() => setSelectedId(clip.id)}
+                >
                   <strong>{clip.name}</strong>
                   <span>
                     {clip.summary.codec} · {clip.summary.width}×{clip.summary.height} · {clip.summary.frame_rate} · {clip.summary.bit_depth ?? "?"}
@@ -557,6 +695,101 @@ export function App() {
           </button>
         </div>
         {activePreset && <p className="preset-note">{activePreset.reason || `${activePreset.label} declares ${activePreset.pix_fmt}, ${activePreset.bit_depth}-bit.`}</p>}
+        <section className="batch-panel">
+          <header>
+            <h2>Batch</h2>
+            <p>
+              {checkedClips.length} clip{checkedClips.length === 1 ? "" : "s"} will be queued. The focused preview clip is separate from the checked clips.
+            </p>
+          </header>
+          <div className="export-row">
+            <label>
+              Operation
+              <select aria-label="Batch operation" value={batchOp} onChange={(event) => setBatchOp(event.target.value as "export" | "gyro")}>
+                <option value="export">Export</option>
+                <option value="gyro">Gyro stabilization</option>
+              </select>
+            </label>
+            {batchOp === "gyro" && (
+              <>
+                <label>
+                  Gyro output
+                  <select aria-label="Gyro output format" value={gyroFormat} onChange={(event) => setGyroFormat(event.target.value as "h264_mp4" | "prores_422")}>
+                    <option value="h264_mp4">H.264 MP4 8-bit</option>
+                    <option value="prores_422">ProRes 422 MOV 10-bit</option>
+                  </select>
+                </label>
+                <label className="check">
+                  <input type="checkbox" checked={gyroSourceSize} onChange={(event) => setGyroSourceSize(event.target.checked)} /> Source resolution
+                </label>
+                {!gyroSourceSize && (
+                  <>
+                    <label>
+                      Width
+                      <input type="number" value={gyroWidth} min={2} step={2} onChange={(event) => setGyroWidth(Number(event.target.value))} />
+                    </label>
+                    <label>
+                      Height
+                      <input type="number" value={gyroHeight} min={2} step={2} onChange={(event) => setGyroHeight(Number(event.target.value))} />
+                    </label>
+                  </>
+                )}
+                <label className="check">
+                  <input type="checkbox" checked={gyroAudio} onChange={(event) => setGyroAudio(event.target.checked)} /> Gyro audio
+                </label>
+                <label>
+                  Shared Gyroflow preset
+                  <input aria-label="Shared Gyroflow preset" value={batchPreset} placeholder="Optional .gyroflow preset" onChange={(event) => setBatchPreset(event.target.value)} />
+                </label>
+              </>
+            )}
+            <button onClick={onBatch} disabled={busy || checkedClips.length === 0 || !destination}>
+              Queue {checkedClips.length} {batchOp === "gyro" ? "gyro" : "export"} job{checkedClips.length === 1 ? "" : "s"}
+            </button>
+          </div>
+          {batchOp === "export" ? (
+            <p>
+              Ordinary export uses each checked clip's saved trim and the preset, audio, LUT, geometry, and visual stabilization above. It does not read gyro.
+            </p>
+          ) : (
+            <p>
+              Gyro stabilization processes each whole clip with the installed Gyroflow CLI. It honors the format, resolution, audio, and optional preset here. It does not apply export trim, exposure, LUT, or visual stabilization, and it does not reuse another clip's project.
+            </p>
+          )}
+          {batchProblems.length > 0 && (
+            <ul className="problems">
+              {batchProblems.map((problem) => (
+                <li key={`${problem.clip_id}-${problem.code}-${problem.message}`}>
+                  {problem.clip_id ?? "Batch"}: {problem.message}
+                </li>
+              ))}
+            </ul>
+          )}
+          {[...new Set(jobs.map((job) => job.batch_id).filter((id): id is string => Boolean(id)))].map((batchId) => {
+            const members = jobs.filter((job) => job.batch_id === batchId);
+            const count = (status: string) => members.filter((job) => job.status === status).length;
+            return (
+              <div key={batchId}>
+                <div className="counts" aria-label={`Batch ${batchId}`}>
+                  <span>total {members.length}</span>
+                  <span>queued {count("queued")}</span>
+                  <span>running {count("running")}</span>
+                  <span>succeeded {count("succeeded")}</span>
+                  <span>failed {count("failed")}</span>
+                  <span>cancelled {count("cancelled")}</span>
+                </div>
+                <div className="job-actions">
+                  <button className="ghost" onClick={() => api.cancelBatch(batchId).then(refresh).catch((error: Error) => setNotice(error.message))}>
+                    Cancel batch
+                  </button>
+                  <button className="ghost" onClick={() => api.retryBatch(batchId).then(refresh).catch((error: Error) => setNotice(error.message))}>
+                    Retry failed
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </section>
         <ul className="jobs">
           {jobs.length === 0 && <li className="empty">Queue is empty.</li>}
           {jobs.map((job) => {
@@ -576,6 +809,7 @@ export function App() {
                 <strong>{filename || kind}</strong>
                 <span>
                   {status} · attempt {attempt} · {Math.round((Number(job.progress) || 0) * 100)}%
+                  {job.batch_id ? ` · batch ${job.batch_id.slice(0, 8)}` : ""}
                 </span>
                 {conversion && <p>{conversion}</p>}
                 {stabLabel && <p>{stabLabel}</p>}

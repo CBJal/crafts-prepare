@@ -50,6 +50,7 @@ export type VideoStream = {
 
 export type Job = {
   id: string;
+  batch_id?: string;
   kind: string;
   status: string;
   progress: number;
@@ -63,7 +64,17 @@ export type Job = {
     stabilization?: { label?: string; mode: string; kind: string };
     validation?: Record<string, unknown>;
   } | null;
-  request: { filename?: string; preset_id?: string; conversion?: { message: string } };
+  request: { filename?: string; preset_id?: string; clip_id?: string; conversion?: { message: string } };
+};
+
+export type BatchStatus = {
+  batch_id: string;
+  total: number;
+  queued: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
 };
 
 export type Capabilities = {

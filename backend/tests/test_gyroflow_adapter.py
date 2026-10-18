@@ -55,14 +55,88 @@ if "--version" in sys.argv:
     raise SystemExit(0)
 log = Path(os.environ["GYRO_LOG"])
 log.write_text("\\n".join(sys.argv))
-# Sleep immediately after the argv log so a cancel test that sees the log
-# is inside the render, not still parsing the project or already exiting.
-if os.environ.get("GYRO_MODE") == "sleep":
-    time.sleep(30)
 blocked = {"--watch", "--when-done", "--overwrite", "-f", "--open"}
 if blocked.intersection(sys.argv):
     print("blocked flag")
     raise SystemExit(3)
+
+def flag_value(name):
+    if name not in sys.argv:
+        return None
+    index = sys.argv.index(name)
+    return sys.argv[index + 1] if index + 1 < len(sys.argv) else None
+
+def positional_media():
+    skip = False
+    for arg in sys.argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if arg in {"--out-params", "--export-metadata", "--export-project", "--preset", "--gyro-file"}:
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg
+    return None
+
+if flag_value("--export-metadata"):
+    spec = flag_value("--export-metadata")
+    _kind, path = spec.split(":", 1)
+    if os.environ.get("GYRO_META") == "sleep":
+        Path(os.environ["GYRO_META_READY"]).write_text("ready")
+        time.sleep(30)
+    meta = os.environ.get("GYRO_META", "samples")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    media_name = Path(positional_media() or "").name
+    empty_names = {item for item in os.environ.get("GYRO_META_EMPTY", "").split(",") if item}
+    if meta == "invalid":
+        target.write_text("{", encoding="utf-8")
+    elif meta == "absent" or media_name in empty_names:
+        target.write_text(json.dumps({"detected_source": "none", "raw_imu": []}), encoding="utf-8")
+    else:
+        target.write_text(json.dumps({"raw_imu": [{"timestamp_ms": 0, "gyro": [0, 0, 0]}], "detected_source": "synthetic"}), encoding="utf-8")
+    raise SystemExit(0)
+
+if "--export-project" in sys.argv:
+    from urllib.parse import unquote, urlparse
+    params = json.loads(flag_value("--out-params"))
+    folder = params.get("output_folder")
+    name = params.get("output_filename")
+    if isinstance(folder, str) and folder.lower().startswith("file:"):
+        folder_path = unquote(urlparse(folder).path)
+        if len(folder_path) >= 3 and folder_path[0] == "/" and folder_path[2] == ":":
+            folder_path = folder_path[1:]
+        dest = Path(folder_path) / name
+    else:
+        dest = Path(folder) / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    media_arg = positional_media()
+    output = {
+        "output_folder": params.get("output_folder"),
+        "output_filename": "rendered-from-project.mp4",
+        "codec": params.get("codec", "H.264/AVC"),
+        "pixel_format": params.get("pixel_format", "yuv420p"),
+        "audio": params.get("audio", True),
+    }
+    if params.get("output_width") and params.get("output_height"):
+        output["output_width"] = params["output_width"]
+        output["output_height"] = params["output_height"]
+    dest.write_text(json.dumps({
+        "videofile": media_arg,
+        "gyro_source": {"filepath": media_arg},
+        "stabilization": {"fov": 1.1},
+        "output": output,
+    }), encoding="utf-8")
+    raise SystemExit(0)
+
+# Sleep immediately after the argv log so a cancel test that sees the log
+# is inside the render, not still parsing the project or already exiting.
+# Metadata and project export return above, so preflight can finish while a
+# later render invocation is the one that sleeps.
+if os.environ.get("GYRO_MODE") == "sleep":
+    time.sleep(30)
 raw = sys.argv[sys.argv.index("--out-params") + 1]
 out = Path(json.loads(raw)["output_path"])
 # Real Gyroflow 1.6.3 uses the project or preset output fields, not --out-params.

@@ -10,9 +10,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const payload = text ? JSON.parse(text) : {};
   if (!response.ok) {
     const detail = payload.detail || response.statusText;
-    const error = new Error(detail) as Error & { code?: string; status?: number };
+    const error = new Error(detail) as Error & { code?: string; status?: number; problems?: { clip_id: string | null; code: string; message: string }[] };
     error.code = payload.code;
     error.status = response.status;
+    error.problems = payload.problems;
     throw error;
   }
   return payload as T;
@@ -41,6 +42,14 @@ export const api = {
       { method: "POST" },
     ),
   gyro: (body: unknown) => request<import("./types").Job>("/api/jobs/gyroflow", { method: "POST", body: JSON.stringify(body) }),
+  batch: (body: unknown) =>
+    request<{ batch_id: string; count: number; queued: import("./types").Job[] }>("/api/jobs/batch", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  batchStatus: (id: string) => request<import("./types").BatchStatus>(`/api/jobs/batch/${id}`),
+  cancelBatch: (id: string) => request(`/api/jobs/batch/${id}/cancel`, { method: "POST" }),
+  retryBatch: (id: string) => request(`/api/jobs/batch/${id}/retry`, { method: "POST" }),
   parseGcsv: (path: string) => request<Record<string, unknown>>("/api/gcsv/parse", { method: "POST", body: JSON.stringify({ path }) }),
   telemetry: (id: string) => request<Record<string, unknown>>(`/api/media/${id}/telemetry`, { method: "POST" }),
   settings: (body: unknown) => request("/api/settings", { method: "PUT", body: JSON.stringify(body) }),

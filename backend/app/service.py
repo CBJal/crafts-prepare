@@ -15,9 +15,9 @@ from pathlib import Path
 from .capabilities import inspect_tools
 from .errors import Cancelled, CraftsError
 from .export import output_filename, run_export
-from .filters import VIDSTAB_AUTO, FilterSpec, validate_adjustment
+from .filters import VIDSTAB_AUTO, FilterSpec, validate_adjustment, validate_lut
 from .gcsv import parse_gcsv_file
-from .gyroflow_cli import run_gyroflow
+from .gyroflow_cli import gyro_format, run_gyroflow
 from .importer import import_path
 from .presets import PRESETS, conversion_note, preset_availability
 from .preview import PROXY_LIMIT_SECONDS, browser_playable, extract_thumbnail, make_proxy
@@ -163,6 +163,137 @@ class Service:
         encoders["_eq"] = bool(filters.get("eq"))
         encoders["_lut3d"] = bool(filters.get("lut3d"))
         return encoders
+
+    def _reserved_outputs(self) -> set[str]:
+        reserved: set[str] = set()
+        for job in self.project["jobs"]:
+            if job.get("status") not in {"queued", "running"}:
+                continue
+            request = job.get("request") or {}
+            output = request.get("output_path")
+            if isinstance(output, str) and output.strip():
+                reserved.add(str(Path(output).resolve(strict=False)))
+                continue
+            folder = request.get("destination_dir")
+            filename = request.get("filename")
+            if isinstance(folder, str) and isinstance(filename, str):
+                reserved.add(str((Path(folder) / filename).resolve(strict=False)))
+        return reserved
+
+    def _validate_shared_export(self, shared: dict) -> None:
+        if not isinstance(shared, dict):
+            raise CraftsError("Export batch settings are missing.", code="bad_batch")
+        preset = PRESETS.get(shared.get("preset_id"))
+        if preset is None:
+            raise CraftsError("Unknown preset.", code="bad_preset")
+        flags = self._encoder_flags()
+        if not any(flags.get(name) for name in preset["encoder_aliases"]):
+            raise CraftsError(
+                f"{preset['label']} is unavailable because this ffmpeg build has no {preset['encoder']} encoder.",
+                code="encoder_missing",
+                status=424,
+            )
+        if shared.get("audio", True) and not flags.get(preset["audio_encoder_required"]):
+            raise CraftsError(
+                f"Audio encoder {preset['audio_encoder_required']} is missing. Turn audio off or install it.",
+                code="encoder_missing",
+                status=424,
+            )
+        spec = spec_from_body(shared)
+        if spec.stabilization == "vidstab" and not flags.get("_vidstab"):
+            raise CraftsError("Visual vidstab is not available in this ffmpeg build.", code="filter_missing")
+        if spec.stabilization == "deshake" and not flags.get("_deshake"):
+            raise CraftsError("deshake is not available in this ffmpeg build.", code="filter_missing")
+        if spec.lut_path:
+            validate_lut(spec.lut_path)
+
+    def _validate_shared_gyro(self, shared: dict) -> None:
+        if not isinstance(shared, dict):
+            raise CraftsError("Gyro batch settings are missing.", code="bad_batch")
+        gyro_format(shared.get("format") or "")
+        width = shared.get("width")
+        height = shared.get("height")
+        if (width is None) != (height is None):
+            raise CraftsError("Set both gyro width and height, or leave both empty to keep source resolution.", code="bad_batch")
+        for value, limit, label in ((width, 7680, "width"), (height, 4320, "height")):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 2 or value > limit or value % 2:
+                raise CraftsError(f"Gyro {label} must be an even size from 2 to {limit}.", code="bad_batch")
+        preset = shared.get("preset_path")
+        if preset:
+            path = resolve_existing(preset)
+            if path.suffix.lower() != ".gyroflow":
+                raise CraftsError("A shared Gyroflow preset must be a .gyroflow file.", code="gyro_input")
+        if not isinstance(shared.get("audio", True), bool):
+            raise CraftsError("Gyro audio flag is invalid.", code="bad_batch")
+
+    def _plan_export_clip(self, clip: dict, shared: dict, destination: Path, suffix: str) -> dict:
+        preset = PRESETS[shared["preset_id"]]
+        trim_in = float(clip.get("trim_in") or 0)
+        trim_out = float(clip.get("trim_out") or 0)
+        if trim_out <= trim_in:
+            raise CraftsError("Saved trim in/out must be a positive interval.", code="bad_trim")
+        duration = float(clip["probe"].get("duration") or 0)
+        video = (clip["probe"].get("video") or [None])[0] or {}
+        if video and video.get("frame_rate_num") and video.get("frame_rate_den"):
+            frame = float(video["frame_rate_den"]) / float(video["frame_rate_num"])
+        else:
+            frame = 0.04
+        if duration and trim_out > duration + frame:
+            raise CraftsError("Saved trim out is past the end of the clip.", code="bad_trim")
+        note = conversion_note(video.get("pix_fmt"), video.get("bit_depth"), preset)
+        if note["bit_depth_conversion"] and not shared.get("acknowledge_bit_depth_conversion"):
+            raise CraftsError(note["message"], code="bit_depth", status=409)
+        spec = spec_from_body(shared)
+        filename = output_filename(_stem(clip["name"]), suffix, preset["container"])
+        final = exclusive_output(destination / filename, Path(clip["path"]))
+        request = {
+            **shared,
+            "clip_id": clip["id"],
+            "in_seconds": trim_in,
+            "out_seconds": trim_out,
+            "suffix": suffix,
+            "destination_dir": str(destination),
+            "filename": filename,
+            "source_path": clip["path"],
+            "source_sha256": clip["sha256"],
+            "resolved_stabilization": {
+                "mode": spec.stabilization,
+                "smoothing": spec.stab_smoothing,
+                "crop": spec.stab_crop,
+                "zoom": spec.stab_zoom,
+                "optzoom": spec.stab_optzoom,
+                "shakiness": shared.get("stab_shakiness", 5),
+                "accuracy": shared.get("stab_accuracy", 15),
+                "deshake_rx": spec.deshake_rx,
+                "deshake_ry": spec.deshake_ry,
+            },
+            "conversion": note,
+        }
+        return {"kind": "export", "filename": filename, "output": str(final), "request": request}
+
+    def _plan_gyro_clip(self, clip: dict, shared: dict, destination: Path, suffix: str) -> dict:
+        chosen = gyro_format(shared["format"])
+        filename = output_filename(_stem(clip["name"]), suffix, chosen["container"])
+        final = exclusive_output(destination / filename, Path(clip["path"]))
+        preset = shared.get("preset_path") or None
+        request = {
+            "clip_id": clip["id"],
+            "media_path": clip["path"],
+            "output_path": str(final),
+            "preset_path": preset,
+            "automatic": True,
+            "filename": filename,
+            "source_sha256": clip["sha256"],
+            "output_settings": {
+                "format": shared["format"],
+                "audio": bool(shared.get("audio", True)),
+                "width": shared.get("width"),
+                "height": shared.get("height"),
+            },
+        }
+        return {"kind": "gyroflow", "filename": filename, "output": str(final), "request": request}
 
     def import_media(self, raw: str) -> dict:
         _ffmpeg, ffprobe = self._tools()
@@ -407,6 +538,197 @@ class Service:
             self.wake.set()
         return job
 
+    def enqueue_batch(self, body: dict) -> dict:
+        """Queue every selected clip, or queue none and list every problem."""
+        operation = body.get("operation")
+        clip_ids = body.get("clip_ids")
+        if operation not in {"export", "gyro"}:
+            raise CraftsError("Batch operation must be export or gyro.", code="bad_batch")
+        if not isinstance(clip_ids, list) or not clip_ids or len(clip_ids) > 40:
+            raise CraftsError("A batch needs 1 to 40 clips.", code="batch_limit")
+        if not all(isinstance(item, str) and item.strip() for item in clip_ids):
+            raise CraftsError("Batch clip ids must be text.", code="bad_batch")
+        suffix = safe_suffix(body.get("suffix") or "")
+        destination = resolve_existing(body["destination_dir"])
+        if not destination.is_dir():
+            raise CraftsError("Destination is not a directory.", code="bad_path")
+        problems: list[dict] = []
+        plans: list[dict] = []
+        seen: dict[str, int] = {}
+        claimed: dict[str, str] = {}
+        with self.lock:
+            if len(self.project["jobs"]) + len(clip_ids) > 500:
+                raise CraftsError("The queue cannot hold this batch.", code="batch_limit")
+            reserved = self._reserved_outputs()
+            if operation == "export":
+                shared = body.get("export") or {}
+                self._validate_shared_export(shared)
+            else:
+                shared = body.get("gyro") or {}
+                self._validate_shared_gyro(shared)
+            for clip_id in clip_ids:
+                if clip_id in seen:
+                    problems.append(
+                        {
+                            "clip_id": clip_id,
+                            "code": "duplicate",
+                            "message": "This clip id is listed more than once. Nothing was queued.",
+                        }
+                    )
+                    continue
+                seen[clip_id] = len(seen)
+                clip = next((item for item in self.project["clips"] if item["id"] == clip_id), None)
+                if clip is None:
+                    problems.append(
+                        {
+                            "clip_id": clip_id,
+                            "code": "missing_clip",
+                            "message": "This clip is not in the open project. Nothing was queued.",
+                        }
+                    )
+                    continue
+                try:
+                    if operation == "export":
+                        plan = self._plan_export_clip(clip, shared, destination, suffix)
+                    else:
+                        plan = self._plan_gyro_clip(clip, shared, destination, suffix)
+                    key = str(Path(plan["output"]).resolve(strict=False))
+                    if key in claimed:
+                        raise CraftsError(
+                            f"Output {plan['filename']} collides with another clip in this batch.",
+                            code="collision",
+                            status=409,
+                        )
+                    if key in reserved:
+                        raise CraftsError(
+                            f"Output {plan['filename']} is already used by a queued or running job.",
+                            code="collision",
+                            status=409,
+                        )
+                    claimed[key] = clip_id
+                    plans.append(plan)
+                except CraftsError as exc:
+                    problems.append({"clip_id": clip_id, "code": exc.code, "message": exc.message})
+            if problems:
+                raise CraftsError(
+                    "Nothing was queued. Every invalid, duplicate, or colliding clip is listed.",
+                    code="batch_rejected",
+                    status=409,
+                    details=problems,
+                )
+            batch_id = uuid.uuid4().hex
+            jobs = []
+            for plan in plans:
+                job = {
+                    "id": str(uuid.uuid4()),
+                    "batch_id": batch_id,
+                    "kind": plan["kind"],
+                    "status": "queued",
+                    "progress": 0.0,
+                    "error": None,
+                    "code": None,
+                    "result": None,
+                    "attempt": 1,
+                    "created_at": utcnow(),
+                    "finished_at": None,
+                    "request": plan["request"],
+                }
+                self.project["jobs"].append(job)
+                self.cancel_flags[job["id"]] = threading.Event()
+                jobs.append(job)
+            self._persist()
+            self.wake.set()
+            return {"batch_id": batch_id, "queued": jobs, "count": len(jobs)}
+
+    def batch_status(self, batch_id: str) -> dict:
+        _batch_id(batch_id)
+        with self.lock:
+            jobs = [job for job in self.project["jobs"] if job.get("batch_id") == batch_id]
+        if not jobs:
+            raise CraftsError("No jobs belong to that batch.", code="not_found", status=404)
+        counts = {name: 0 for name in ("queued", "running", "succeeded", "failed", "cancelled", "paused", "interrupted")}
+        for job in jobs:
+            counts[job["status"]] = counts.get(job["status"], 0) + 1
+        return {
+            "batch_id": batch_id,
+            "total": len(jobs),
+            "queued": counts["queued"],
+            "running": counts["running"],
+            "succeeded": counts["succeeded"],
+            "failed": counts["failed"],
+            "cancelled": counts["cancelled"],
+            "paused": counts["paused"],
+            "interrupted": counts["interrupted"],
+            "jobs": [
+                {
+                    "id": job["id"],
+                    "clip_id": (job.get("request") or {}).get("clip_id"),
+                    "status": job["status"],
+                    "code": job.get("code"),
+                    "error": job.get("error"),
+                    "output_path": (job.get("result") or {}).get("output_path") if isinstance(job.get("result"), dict) else None,
+                    "filename": (job.get("request") or {}).get("filename"),
+                }
+                for job in jobs
+            ],
+        }
+
+    def cancel_batch(self, batch_id: str) -> dict:
+        _batch_id(batch_id)
+        cancelled = []
+        signalled = []
+        with self.lock:
+            found = False
+            for job in self.project["jobs"]:
+                if job.get("batch_id") != batch_id:
+                    continue
+                found = True
+                if job["status"] == "queued":
+                    job["status"] = "cancelled"
+                    job["error"] = "Cancelled before it started."
+                    job["code"] = "cancelled"
+                    job["finished_at"] = utcnow()
+                    cancelled.append(job["id"])
+                elif job["status"] == "running":
+                    self.cancel_flags.setdefault(job["id"], threading.Event()).set()
+                    signalled.append(job["id"])
+            if not found:
+                raise CraftsError("No jobs belong to that batch.", code="not_found", status=404)
+            self._persist()
+        return {"batch_id": batch_id, "cancelled": cancelled, "signalled": signalled}
+
+    def retry_batch_failures(self, batch_id: str) -> dict:
+        """Requeue failed jobs in this batch. Succeeded jobs stay finished and their files stay put."""
+        _batch_id(batch_id)
+        retried = []
+        succeeded = []
+        with self.lock:
+            found = False
+            for job in self.project["jobs"]:
+                if job.get("batch_id") != batch_id:
+                    continue
+                found = True
+                if job["status"] == "succeeded":
+                    succeeded.append(job["id"])
+                    continue
+                if job["status"] != "failed":
+                    continue
+                job["status"] = "queued"
+                job["progress"] = 0.0
+                job["error"] = None
+                job["code"] = None
+                job["result"] = None
+                job["finished_at"] = None
+                job["attempt"] = int(job.get("attempt") or 1) + 1
+                self.cancel_flags[job["id"]] = threading.Event()
+                retried.append(job["id"])
+            if not found:
+                raise CraftsError("No jobs belong to that batch.", code="not_found", status=404)
+            if retried:
+                self._persist()
+                self.wake.set()
+        return {"batch_id": batch_id, "retried": retried, "succeeded_left_unchanged": succeeded}
+
     def jobs(self) -> list[dict]:
         with self.lock:
             return list(self.project["jobs"])
@@ -570,6 +892,8 @@ class Service:
             ffprobe=ffprobe,
             cancel=cancel,
             on_progress=lambda value: self._progress(job_id, value),
+            automatic=bool(request.get("automatic")),
+            output_settings=request.get("output_settings") if request.get("automatic") else None,
         )
 
     def _progress(self, job_id: str, value: float) -> None:
@@ -976,6 +1300,8 @@ def _validate_stored_job(job: object, seen: set[str], clip_ids: set[str]) -> dic
     for key in ("error", "code"):
         if job.get(key) is not None and not isinstance(job.get(key), str):
             raise CraftsError("Job error text is invalid.", code="bad_project")
+    if job.get("batch_id") is not None:
+        _batch_id(job.get("batch_id"))
     if job.get("result") is not None:
         _validate_job_result(job.get("result"))
     filename = request.get("filename")
@@ -1062,6 +1388,23 @@ def _validate_gyro_request(request: dict, clip_ids: set[str]) -> None:
             continue
         if not isinstance(value, str) or not value.strip() or len(value) > 4096 or "\x00" in value or "://" in value:
             raise CraftsError("Gyroflow input path is invalid.", code="bad_project")
+    if "automatic" in request and not isinstance(request.get("automatic"), bool):
+        raise CraftsError("Automatic gyro flag is invalid.", code="bad_project")
+    if request.get("automatic") is True:
+        settings = request.get("output_settings")
+        if not isinstance(settings, dict):
+            raise CraftsError("Automatic gyro output settings are missing.", code="bad_project")
+        gyro_format(str(settings.get("format") or ""))
+        if not isinstance(request.get("media_path"), str):
+            raise CraftsError("Automatic gyro job is missing its media path.", code="bad_project")
+        if not isinstance(settings.get("audio", True), bool):
+            raise CraftsError("Automatic gyro audio flag is invalid.", code="bad_project")
+
+
+def _batch_id(value: object) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise CraftsError("Batch id is invalid.", code="bad_batch")
+    return value
 
 
 def new_project() -> dict:

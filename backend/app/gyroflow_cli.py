@@ -26,6 +26,10 @@ from .process import run_captured
 from .security import exclusive_output, publish_exclusive, same_file
 
 MEDIA_SUFFIXES = {".mp4", ".mov", ".mxf", ".mkv", ".m2ts", ".mts"}
+GYRO_FORMATS = {
+    "h264_mp4": {"codec": "H.264/AVC", "pixel_format": "yuv420p", "container": "mp4"},
+    "prores_422": {"codec": "ProRes", "pixel_format": "yuv422p10le", "container": "mov"},
+}
 
 MAX_PROJECT_BYTES = 64 * 1024 * 1024
 _WIN_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -166,7 +170,14 @@ def native_reference_path(value: str) -> Path | None:
     return Path(value)
 
 
-def stage_gyroflow_document(source: Path, staging_dir: Path, staging_output: Path, *, role: str) -> Path:
+def stage_gyroflow_document(
+    source: Path,
+    staging_dir: Path,
+    staging_output: Path,
+    *,
+    role: str,
+    output_overrides: dict | None = None,
+) -> Path:
     """Write an owned copy whose output target is the staging file.
 
     Original bytes are not modified. Only output location fields are overridden.
@@ -191,13 +202,16 @@ def stage_gyroflow_document(source: Path, staging_dir: Path, staging_output: Pat
         raise CraftsError("The .gyroflow project has no videofile, so it was not rendered.", code="gyro_stage")
     output = payload.get("output")
     destination = staging_dir / ("project.gyroflow" if role == "project" else "preset.gyroflow")
-    if output is None:
+    if output is None and not output_overrides:
         # Gyroflow 1.6.3 replaces the whole render-options object when a project
         # or preset contains "output". Inventing a path-only object would drop
         # codec and pixel format. With no output section, the CLI --out-params
         # path is what the tool keeps, and that path is this staging file.
         destination.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return destination
+    if output is None:
+        output = {}
+        payload["output"] = output
     if not isinstance(output, dict):
         raise CraftsError(f"The {role} output section is not an object.", code="gyro_stage")
     if staging_output.parent.resolve() != staging_dir.resolve():
@@ -207,6 +221,9 @@ def stage_gyroflow_document(source: Path, staging_dir: Path, staging_output: Pat
     # the same staging file. A macOS output_folder_bookmark is removed on the
     # copy only: import resolves it back over output_folder.
     output.pop("output_folder_bookmark", None)
+    for key in ("codec", "pixel_format", "audio", "output_width", "output_height"):
+        if output_overrides and key in output_overrides and output_overrides[key] is not None:
+            output[key] = output_overrides[key]
     output["output_folder"] = directory_file_uri(staging_output.parent)
     output["output_filename"] = staging_output.name
     output["output_path"] = str(staging_output.resolve())
@@ -289,6 +306,68 @@ def inspect_motion_inputs(
     }
 
 
+def gyro_format(name: str) -> dict:
+    found = GYRO_FORMATS.get(name)
+    if found is None:
+        raise CraftsError("Gyro output must be H.264 MP4 8-bit or ProRes 422 MOV 10-bit.", code="bad_preset")
+    return found
+
+
+def _check_cancel(cancel: threading.Event) -> None:
+    if cancel.is_set():
+        raise Cancelled("Cancelled.")
+
+
+def _contained(path: Path, directory: Path) -> None:
+    try:
+        path.resolve(strict=False).relative_to(directory.resolve(strict=False))
+    except ValueError as exc:
+        raise CraftsError(
+            "Gyroflow was asked to write outside this job's staging directory. The job stopped.",
+            code="gyro_stage",
+        ) from exc
+
+
+def _motion_sample_count(path: Path, staging_dir: Path) -> int:
+    """Count raw_imu samples in the metadata file this job asked Gyroflow to write."""
+    _contained(path, staging_dir)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise CraftsError(
+            "Gyroflow did not write parsed metadata inside staging, so this clip was not rendered.",
+            code="gyro_motion_missing",
+            status=424,
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CraftsError(
+            "Gyroflow metadata in staging was not JSON, so this clip was not rendered.",
+            code="gyro_motion_missing",
+            status=424,
+        ) from exc
+    raw = payload.get("raw_imu") if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raise CraftsError(
+            "Gyroflow parsed this clip and found no raw IMU samples. "
+            "A data stream, lens tag, or another clip's project is not treated as motion. This clip was not rendered.",
+            code="gyro_motion_missing",
+            status=424,
+        )
+    return len(raw)
+
+
+def _argv_with_out(executable: str, media: Path, output: Path, extra: list[str]) -> list[str]:
+    params = {
+        "output_path": str(output),
+        "output_folder": directory_file_uri(output.parent),
+        "output_filename": output.name,
+    }
+    args = [*launch_argv(executable), str(media), *extra, "--out-params", json.dumps(params, separators=(",", ":")), "--stdout-progress"]
+    if any(token in FORBIDDEN for token in args):
+        raise CraftsError("Refusing a Gyroflow command that includes a blocked flag.", code="gyro_argv")
+    return args
+
+
 def run_gyroflow(
     *,
     settings: dict,
@@ -300,6 +379,8 @@ def run_gyroflow(
     ffprobe: str,
     cancel: threading.Event,
     on_progress,
+    automatic: bool = False,
+    output_settings: dict | None = None,
 ) -> dict:
     executable = discover_executable(settings.get("gyroflow") or "gyroflow")
     if not executable:
@@ -327,9 +408,18 @@ def run_gyroflow(
             code="gyro_missing",
             status=424,
         )
-    motion = inspect_motion_inputs(media=media, project=project, gyro_file=gyro_file)
-    if motion["kind"] == "missing":
-        raise CraftsError(motion["message"], code="gyro_motion_missing", status=424)
+    if automatic:
+        if media is None or not media.is_file():
+            raise CraftsError("Automatic gyro needs the clip's own media file.", code="gyro_input")
+        if project is not None or gyro_file is not None:
+            raise CraftsError("Automatic gyro does not reuse another clip's project or gyro log.", code="gyro_input")
+        chosen = gyro_format((output_settings or {}).get("format") or "")
+        motion = {"kind": "embedded-preflight", "samples": 0}
+    else:
+        chosen = None
+        motion = inspect_motion_inputs(media=media, project=project, gyro_file=gyro_file)
+        if motion["kind"] == "missing":
+            raise CraftsError(motion["message"], code="gyro_motion_missing", status=424)
     source_for_alias = media or project
     if source_for_alias is None:
         raise CraftsError("Missing input.", code="gyro_input")
@@ -345,11 +435,30 @@ def run_gyroflow(
     staging = staging_dir / f"staged{final.suffix}"
     staging_dir.mkdir()
     try:
+        if automatic:
+            assert media is not None and chosen is not None
+            project, motion = _prepare_embedded_project(
+                executable,
+                media,
+                staging_dir,
+                cancel,
+                on_progress,
+            )
         # A loaded .gyroflow project or preset overrides CLI --out-params with its
         # own output_folder and output_filename. Rewrite those fields on owned
         # copies so the external tool can only target this job's staging file.
+        overrides = None
+        if automatic and chosen is not None:
+            overrides = {"codec": chosen["codec"], "pixel_format": chosen["pixel_format"], "audio": bool((output_settings or {}).get("audio", True))}
+            width = (output_settings or {}).get("width")
+            height = (output_settings or {}).get("height")
+            if width and height:
+                overrides["output_width"] = int(width)
+                overrides["output_height"] = int(height)
         project_for_cli = (
-            stage_gyroflow_document(project, staging_dir, staging, role="project") if project is not None else None
+            stage_gyroflow_document(project, staging_dir, staging, role="project", output_overrides=overrides)
+            if project is not None
+            else None
         )
         preset_for_cli = (
             stage_gyroflow_document(preset, staging_dir, staging, role="preset") if preset is not None else None
@@ -409,13 +518,74 @@ def run_gyroflow(
                 "height": probed["video"][0].get("height"),
             },
             "note": (
-                "Output was produced by the installed Gyroflow CLI and probed with ffprobe. "
-                "This job processes the whole source or project. Export trim and grade settings are not applied. "
-                "A full ffmpeg decode was not run."
+                (
+                    f"Gyroflow reported {motion.get('samples')} raw IMU samples for this clip, "
+                    "then rendered a project that was written only inside this job's staging directory. "
+                    "Trim, LUT, exposure, and visual stabilization were not applied. "
+                    "Lens and camera calibration are only what Gyroflow stored from this file."
+                )
+                if automatic
+                else (
+                    "Output was produced by the installed Gyroflow CLI and probed with ffprobe. "
+                    "This job processes the whole source or project. Export trim and grade settings are not applied. "
+                    "A full ffmpeg decode was not run."
+                )
             ),
+            "motion_samples": motion.get("samples"),
         }
     finally:
         _remove_owned_staging(staging_dir, final)
+
+
+def _prepare_embedded_project(
+    executable: str,
+    media: Path,
+    staging_dir: Path,
+    cancel: threading.Event,
+    on_progress,
+) -> tuple[Path, dict]:
+    """Inspect this file's parsed IMU, then export a project that can only render into staging."""
+    _check_cancel(cancel)
+    metadata = staging_dir / "motion.json"
+    _contained(metadata, staging_dir)
+    meta_args = _argv_with_out(
+        executable,
+        media,
+        staging_dir / "preflight-unused.mp4",
+        ["--export-metadata", f"2:{metadata}"],
+    )
+    code, stdout, stderr = run_captured(meta_args, timeout=60 * 30, cancel=cancel, on_stdout=lambda line: _progress(line, on_progress))
+    if code != 0:
+        raise CraftsError(
+            f"Gyroflow metadata export failed ({code}). This clip was not rendered. {(stdout + stderr)[-800:]}",
+            code="gyro_failed",
+        )
+    samples = _motion_sample_count(metadata, staging_dir)
+    on_progress(0.1)
+    _check_cancel(cancel)
+    prepared = staging_dir / "prepared.gyroflow"
+    project_args = _argv_with_out(executable, media, prepared, ["--export-project", "2"])
+    # The public CLI takes the project type as the option value, not as a filename.
+    # _argv_with_out already placed the media path and the extra tokens.
+    code, stdout, stderr = run_captured(
+        project_args,
+        timeout=60 * 30,
+        cancel=cancel,
+        on_stdout=lambda line: _progress(line, on_progress),
+    )
+    if code != 0:
+        raise CraftsError(
+            f"Gyroflow project export failed ({code}). This clip was not rendered. {(stdout + stderr)[-800:]}",
+            code="gyro_failed",
+        )
+    _contained(prepared, staging_dir)
+    if not prepared.is_file() or prepared.stat().st_size == 0:
+        raise CraftsError(
+            "Gyroflow did not write prepared.gyroflow inside staging, so this clip was not rendered.",
+            code="gyro_unverified",
+        )
+    on_progress(0.2)
+    return prepared, {"kind": "embedded-preflight", "samples": samples}
 
 
 def _reject_protected(path: Path, protected: list[Path]) -> None:
