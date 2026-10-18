@@ -4,11 +4,57 @@ import hashlib
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 from app.gyroflow_cli import resolve_reference, stage_gyroflow_document
 from tests.test_gyroflow_adapter import _write_fake
 from tests.test_prepare import drain_job
+
+_TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
+
+
+def _job_view(client, job_id: str) -> dict:
+    service = client.app.state.service
+    with service.lock:
+        job = next(item for item in service.project["jobs"] if item["id"] == job_id)
+        error = job.get("error")
+        if isinstance(error, str) and len(error) > 500:
+            error = error[:500]
+        return {"status": job.get("status"), "code": job.get("code"), "error": error}
+
+
+def _wait_for_fake_render(client, job_id: str, ready: Path, *, timeout: float = 20.0) -> dict:
+    """Wait until the fake render process has created `ready`, or the job has finished.
+
+    A short blind sleep treats a slow Windows interpreter start the same as a
+    job that already failed before the render. Terminal state fails immediately
+    with the job's status, code, and error. The bound is long enough for a
+    cold Python 3.14 process start and still returns as soon as the file exists.
+    """
+    started = time.monotonic()
+    last = {"status": None, "code": None, "error": None}
+    while True:
+        elapsed = time.monotonic() - started
+        if ready.is_file():
+            last = _job_view(client, job_id)
+            if last["status"] in _TERMINAL:
+                raise AssertionError(_render_diag("fake render file appeared after the job finished", last, ready, elapsed))
+            return last
+        last = _job_view(client, job_id)
+        if last["status"] in _TERMINAL:
+            raise AssertionError(_render_diag("job finished before the fake render started", last, ready, elapsed))
+        if elapsed >= timeout:
+            raise AssertionError(_render_diag(f"fake render did not start within {timeout:.0f}s", last, ready, elapsed))
+        threading.Event().wait(0.05)
+
+
+def _render_diag(reason: str, job: dict, ready: Path, elapsed: float) -> str:
+    return (
+        f"{reason} after {elapsed:.2f}s: status={job.get('status')} code={job.get('code')} "
+        f"error={job.get('error')!r} mode={os.environ.get('GYRO_MODE')!r} "
+        f"ready={ready} exists={ready.exists()}"
+    )
 
 
 def _sha(path: Path) -> str:
@@ -239,11 +285,7 @@ def test_project_cancel_and_racing_final_only_touch_staging(client, media_dir: P
     ).json()
     worker = threading.Thread(target=client.app.state.service.drain)
     worker.start()
-    for _ in range(50):
-        if ready.exists():
-            break
-        threading.Event().wait(0.05)
-    assert ready.exists()
+    _wait_for_fake_render(client, queued["id"], ready)
     requested.write_bytes(b"preserve-me")
     go.write_text("go")
     worker.join(10)
@@ -268,25 +310,27 @@ def test_project_cancel_and_racing_final_only_touch_staging(client, media_dir: P
     assert list((folder / "project-output").iterdir()) == []
     assert list(tmp_path.glob(".crafts-gyro-*")) == []
 
+    # Separate log from the race and fail phases. Those phases already wrote
+    # argv.txt; this phase waits for a file that only its own render can create.
+    cancel_log = tmp_path / "cancel-argv.txt"
+    assert not cancel_log.exists()
+    os.environ["GYRO_LOG"] = str(cancel_log)
     os.environ["GYRO_MODE"] = "sleep"
-    ready.unlink(missing_ok=True)
-    go.unlink(missing_ok=True)
-    log = Path(os.environ["GYRO_LOG"])
-    log.unlink(missing_ok=True)
     cancel_out = tmp_path / "cancel.mp4"
-    queued = client.post(
+    response = client.post(
         "/api/jobs/gyroflow",
         json={"project_path": str(project), "output_path": str(cancel_out)},
-    ).json()
+    )
+    assert response.status_code == 200, response.text
+    queued = response.json()
     worker = threading.Thread(target=client.app.state.service.drain)
     worker.start()
-    for _ in range(50):
-        if log.exists():
-            break
-        threading.Event().wait(0.05)
-    assert log.exists()
+    running = _wait_for_fake_render(client, queued["id"], cancel_log)
+    assert running["status"] == "running"
+    assert worker.is_alive()
     client.post(f"/api/jobs/{queued['id']}/cancel")
-    worker.join(10)
+    worker.join(15)
+    assert not worker.is_alive()
     job = next(item for item in client.get("/api/jobs").json()["jobs"] if item["id"] == queued["id"])
     assert job["status"] == "cancelled"
     assert not cancel_out.exists()

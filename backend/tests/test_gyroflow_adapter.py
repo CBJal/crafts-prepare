@@ -55,6 +55,10 @@ if "--version" in sys.argv:
     raise SystemExit(0)
 log = Path(os.environ["GYRO_LOG"])
 log.write_text("\\n".join(sys.argv))
+# Sleep immediately after the argv log so a cancel test that sees the log
+# is inside the render, not still parsing the project or already exiting.
+if os.environ.get("GYRO_MODE") == "sleep":
+    time.sleep(30)
 blocked = {"--watch", "--when-done", "--overwrite", "-f", "--open"}
 if blocked.intersection(sys.argv):
     print("blocked flag")
@@ -135,8 +139,6 @@ for arg, data in documents:
             raise SystemExit(4)
 print("[0000000a] Rendering progress: 1/2 frames (50.0%) ETA 1.0s", flush=True)
 mode = os.environ.get("GYRO_MODE", "ok")
-if mode == "sleep":
-    time.sleep(30)
 if mode == "wait":
     Path(os.environ["GYRO_READY"]).write_text("ready")
     deadline = time.time() + 15
