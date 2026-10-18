@@ -4,7 +4,7 @@ import sys
 import threading
 from pathlib import Path
 
-from app.gyroflow_cli import FORBIDDEN, build_argv, launch_argv, parse_progress
+from app.gyroflow_cli import FORBIDDEN, build_argv, extract_gyroflow_version, launch_argv, parse_progress
 
 
 def test_argv_uses_public_flags_and_blocks_watch_shutdown_overwrite(tmp_path: Path):
@@ -61,6 +61,78 @@ if blocked.intersection(sys.argv):
     raise SystemExit(3)
 raw = sys.argv[sys.argv.index("--out-params") + 1]
 out = Path(json.loads(raw)["output_path"])
+# Real Gyroflow 1.6.3 uses the project or preset output fields, not --out-params.
+from urllib.parse import unquote, urlparse
+def from_document(data):
+    output = data.get("output") if isinstance(data, dict) else None
+    if not isinstance(output, dict):
+        return None
+    folder = output.get("output_folder")
+    name = output.get("output_filename")
+    if not isinstance(folder, str) or not isinstance(name, str):
+        return None
+    if folder.lower().startswith("file:"):
+        path = unquote(urlparse(folder).path)
+        if len(path) >= 3 and path[0] == "/" and path[2] == ":":
+            path = path[1:]
+        return Path(path) / name
+    return Path(folder) / name
+preset_out = None
+project_out = None
+documents = []
+for arg in sys.argv:
+    if not arg.endswith(".gyroflow") or not Path(arg).is_file():
+        continue
+    try:
+        data = json.loads(Path(arg).read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    documents.append((arg, data))
+    chosen = from_document(data)
+    if chosen is None:
+        continue
+    if isinstance(data, dict) and data.get("videofile"):
+        project_out = chosen
+    else:
+        preset_out = chosen
+if preset_out is not None:
+    out = preset_out
+elif project_out is not None:
+    out = project_out
+
+def locate(project_file, reference):
+    if not isinstance(reference, str) or not reference.strip():
+        return None
+    if reference.lower().startswith("file:"):
+        path = unquote(urlparse(reference).path)
+        if len(path) >= 3 and path[0] == "/" and path[2] == ":":
+            path = path[1:]
+        candidate = Path(path)
+        return candidate if candidate.is_file() else None
+    drive = len(reference) >= 3 and reference[1] == ":"
+    if drive or reference.startswith("\\\\\\\\") or reference.startswith("/"):
+        candidate = Path(reference)
+        return candidate if candidate.is_file() else None
+    # Relative references are resolved beside the project file Gyroflow was given.
+    sibling = Path(project_file).resolve().parent / Path(reference).name
+    return sibling if sibling.is_file() else None
+
+source_media = os.environ.get("GYRO_MEDIA")
+for arg, data in documents:
+    video = data.get("videofile") if isinstance(data, dict) else None
+    if not isinstance(video, str):
+        continue
+    found = locate(arg, video)
+    if found is None:
+        print("videofile not found after project relocation", flush=True)
+        raise SystemExit(4)
+    source_media = str(found)
+    gyro = data.get("gyro_source") if isinstance(data, dict) else None
+    gyro_path = gyro.get("filepath") if isinstance(gyro, dict) else None
+    if isinstance(gyro_path, str) and gyro_path.strip():
+        if locate(arg, gyro_path) is None:
+            print("gyro filepath not found after project relocation", flush=True)
+            raise SystemExit(4)
 print("[0000000a] Rendering progress: 1/2 frames (50.0%) ETA 1.0s", flush=True)
 mode = os.environ.get("GYRO_MODE", "ok")
 if mode == "sleep":
@@ -79,10 +151,21 @@ if mode == "fail":
 if mode == "empty":
     out.write_bytes(b"")
     raise SystemExit(0)
-shutil.copyfile(os.environ["GYRO_MEDIA"], out)
+shutil.copyfile(source_media, out)
 print("[0000000a] Rendering completed: ok", flush=True)
 """
     )
+
+
+def test_version_banner_ignores_qt_debug_prefix():
+    text = "qt.qpa.plugin: Could not load the Qt platform plugin\nDEBUG: something\nGyroflow v1.6.3\n"
+    assert extract_gyroflow_version(text) == "Gyroflow v1.6.3"
+    real = (
+        "20:22:00 [DEBUG] (1) gyroflow: [in main] Qt version: 6.4.3\n"
+        "20:22:00 [DEBUG] (1) gyroflow: Gyroflow 1.6.3 (gh2453)\n"
+        "Gyroflow v1.6.3 (gh2453)\n"
+    )
+    assert extract_gyroflow_version(real) == "Gyroflow v1.6.3"
 
 
 def test_python_test_double_uses_sys_executable(tmp_path: Path):
