@@ -6,8 +6,8 @@ It is an independent app. Sony Catalyst Prepare is a separate product. Public Ca
 
 ## What you need
 
-- Windows 10 or later, or another OS with Python 3.11+
-- Python 3.11 or newer
+- Windows 10 or later, or another OS with Python 3.12, 3.13, or 3.14
+- Python 3.12, 3.13, or 3.14. Python 3.14 is supported with the pinned wheels in `backend/requirements.lock` (`pydantic` 2.14.1 / `pydantic-core` 2.50.1). Do not install another system Python just to run this app.
 - Node.js 20 or newer, the first time, to build the web UI
 - ffmpeg and ffprobe on `PATH`, installed by you
 
@@ -47,7 +47,7 @@ Then open http://127.0.0.1:8765
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r backend/requirements.txt
+pip install -r backend/requirements.lock
 cd frontend && npm ci && npm run build && cd ..
 cd backend && python -m pytest
 ```
@@ -71,7 +71,11 @@ Visual stabilization has two modes:
 
 Neither mode is gyro stabilization. "Fill vidstab auto values" writes the documented numbers (shakiness 5, accuracy 15, smoothing 10, crop black, zoom 0, optzoom 2) into those fields.
 
-Gyro stabilization is a separate queue item that runs an external Gyroflow executable. You pass the media, a `.gcsv` or other gyro log, a `.gyroflow` project, or a preset file, plus an output path. The command includes `--stdout-progress` and `--out-params`. It does not include `--overwrite`, `--watch`, or `--when-done`. If Gyroflow or the motion file is missing, the job fails and no finished file is published.
+Gyro stabilization is a separate queue item in the Gyro panel. It runs an external Gyroflow executable on the whole source or a `.gyroflow` project. It does not apply the export trim, exposure, LUT, resize, or vidstab settings. You pass a gyro log, a project, an optional preset, and an output path. The command includes `--stdout-progress` and `--out-params`. It does not include `--overwrite`, `--watch`, or `--when-done`. Gyroflow writes into a private staging file. Crafts Prepare probes that file and only then publishes it. If Gyroflow or the motion file is missing, the job fails and no finished file is published.
+
+Opening a saved project does not start its queue. Use Retry on a paused job. The app refuses to switch projects while a job is queued or running.
+
+Filter graphs are one `-vf` argument. User paths are not pasted into that graph: a LUT is copied to `grade.cube` in the job directory first. That keeps Windows drive letters, spaces, and apostrophes out of the filter syntax.
 
 ## Optional telemetry helper
 

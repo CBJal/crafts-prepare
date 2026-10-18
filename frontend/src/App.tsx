@@ -57,7 +57,15 @@ export function App() {
   const [deshakeRx, setDeshakeRx] = useState(16);
   const [deshakeRy, setDeshakeRy] = useState(16);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewKind, setPreviewKind] = useState<"source" | "proxy" | "still">("still");
   const [previewNote, setPreviewNote] = useState("");
+  const [lutPath, setLutPath] = useState("");
+  const [gyroLog, setGyroLog] = useState("");
+  const [gyroProject, setGyroProject] = useState("");
+  const [gyroPreset, setGyroPreset] = useState("");
+  const [gyroOutput, setGyroOutput] = useState("");
+  const [gcsvText, setGcsvText] = useState("");
+  const [telemetryText, setTelemetryText] = useState("");
   const [ffmpegPath, setFfmpegPath] = useState("ffmpeg");
   const [ffprobePath, setFfprobePath] = useState("ffprobe");
   const [gyroPath, setGyroPath] = useState("gyroflow");
@@ -90,15 +98,18 @@ export function App() {
   useEffect(() => {
     if (!selected) {
       setPreviewUrl(null);
+      setPreviewKind("still");
       return;
     }
     if (selected.browser_playable) {
+      setPreviewKind("source");
       setPreviewUrl(`/api/media/${selected.id}/file`);
       setPreviewNote("This player shows the source file. Exposure, saturation, and LUT stills use the same FFmpeg filters as export. Vidstab and deshake run only in the export.");
       return;
     }
+    setPreviewKind("still");
     setPreviewUrl(`/api/media/${selected.id}/thumbnail?t=0`);
-    setPreviewNote("This container is not played in the browser. The still is an FFmpeg frame. Create a viewing proxy if you want motion playback.");
+    setPreviewNote("This container is not played directly. The image is one frame. Create a viewing proxy for at most 60 seconds of motion playback.");
   }, [selected?.id, selected?.browser_playable]);
 
   const stillUrl = useMemo(() => {
@@ -114,8 +125,9 @@ export function App() {
       params.set("width", String(width));
       params.set("height", String(height));
     }
+    if (lutPath.trim()) params.set("lut", lutPath.trim());
     return `/api/media/${selected.id}/thumbnail?${params.toString()}`;
-  }, [selected, exposure, saturation, rotate, fit, width, height]);
+  }, [selected, exposure, saturation, rotate, fit, width, height, lutPath]);
 
   async function onImport() {
     setBusy(true);
@@ -186,6 +198,7 @@ export function App() {
         stab_optzoom: optzoom,
         deshake_rx: deshakeRx,
         deshake_ry: deshakeRy,
+        lut_path: lutPath.trim() || null,
       });
       setNotice(`Queued ${job.request.filename ?? "export"}.`);
       await refresh();
@@ -278,11 +291,35 @@ export function App() {
           <header>
             <h2>Preview</h2>
             <p>{previewNote}</p>
+            {selected && !selected.browser_playable && (
+              <button
+                className="ghost"
+                onClick={() =>
+                  api
+                    .proxy(selected.id)
+                    .then((proxy) => {
+                      if (proxy.kind === "proxy") {
+                        setPreviewKind("proxy");
+                        setPreviewUrl(proxy.url);
+                        const limit = proxy.duration_limit_seconds ?? 60;
+                        setPreviewNote(`${proxy.note} Playback here is capped at ${limit} seconds.`);
+                      } else {
+                        setPreviewKind("source");
+                        setPreviewUrl(proxy.url);
+                        setPreviewNote(proxy.note);
+                      }
+                    })
+                    .catch((error: Error) => setNotice(error.message))
+                }
+              >
+                Create viewing proxy
+              </button>
+            )}
           </header>
-          {selected && previewUrl && selected.browser_playable && (
+          {selected && previewUrl && (previewKind === "source" || previewKind === "proxy") && (
             <video key={previewUrl} src={previewUrl} controls preload="metadata" />
           )}
-          {selected && !selected.browser_playable && <img src={previewUrl ?? ""} alt="Frame from the selected clip" />}
+          {selected && previewKind === "still" && previewUrl && <img src={previewUrl} alt="Frame from the selected clip" />}
           {!selected && <div className="stage-empty">Import a clip to preview it.</div>}
           {selected && (
             <div className="trim">
@@ -396,6 +433,10 @@ export function App() {
                 <option value="180">180°</option>
                 <option value="270">270° clockwise</option>
               </select>
+            </label>
+            <label>
+              .cube LUT path
+              <input aria-label="CUBE LUT path" value={lutPath} placeholder="Optional .cube file" onChange={(event) => setLutPath(event.target.value)} />
             </label>
             <label>
               Fit
@@ -521,7 +562,7 @@ export function App() {
                     Cancel
                   </button>
                 )}
-                {["failed", "cancelled", "interrupted"].includes(job.status) && (
+                {["failed", "cancelled", "interrupted", "paused"].includes(job.status) && (
                   <button className="ghost" onClick={() => api.retry(job.id).then(refresh)}>
                     Retry
                   </button>
@@ -530,6 +571,80 @@ export function App() {
             </li>
           ))}
         </ul>
+      </section>
+
+      <section className="queue gyro-panel">
+        <header>
+          <h2>Gyro</h2>
+          <p>
+            This is a separate Gyroflow job. It processes the whole source or the .gyroflow project. Trim, exposure,
+            saturation, LUT, resize, and vidstab/deshake from the export form are not applied.
+          </p>
+        </header>
+        <div className="export-row">
+          <label>
+            Gyro log
+            <input aria-label="Gyro log path" value={gyroLog} placeholder=".gcsv or other gyro log" onChange={(event) => setGyroLog(event.target.value)} />
+          </label>
+          <label>
+            Gyroflow project
+            <input aria-label="Gyroflow project path" value={gyroProject} placeholder=".gyroflow project" onChange={(event) => setGyroProject(event.target.value)} />
+          </label>
+          <label>
+            Preset
+            <input aria-label="Gyroflow preset path" value={gyroPreset} placeholder="Optional preset file" onChange={(event) => setGyroPreset(event.target.value)} />
+          </label>
+          <label>
+            Output file
+            <input aria-label="Gyro output path" value={gyroOutput} placeholder="Output .mp4 or .mov path" onChange={(event) => setGyroOutput(event.target.value)} />
+          </label>
+          <button
+            onClick={() => {
+              const body: Record<string, string> = { output_path: gyroOutput };
+              if (selected) body.clip_id = selected.id;
+              if (gyroLog.trim()) body.gyro_path = gyroLog.trim();
+              if (gyroProject.trim()) body.project_path = gyroProject.trim();
+              if (gyroPreset.trim()) body.preset_path = gyroPreset.trim();
+              api
+                .gyro(body)
+                .then(() => {
+                  setNotice("Gyroflow job queued. Missing Gyroflow or motion data fails the job. It does not use export trim or grade.");
+                  return refresh();
+                })
+                .catch((error: Error) => setNotice(error.message));
+            }}
+            disabled={!gyroOutput.trim()}
+          >
+            Queue gyro
+          </button>
+          <button
+            className="ghost"
+            onClick={() =>
+              api
+                .parseGcsv(gyroLog.trim())
+                .then((summary) => setGcsvText(JSON.stringify(summary, null, 2)))
+                .catch((error: Error) => setGcsvText(error.message))
+            }
+            disabled={!gyroLog.trim()}
+          >
+            Read GCSV
+          </button>
+          <button
+            className="ghost"
+            onClick={() => {
+              if (!selected) return;
+              api
+                .telemetry(selected.id)
+                .then((report) => setTelemetryText(JSON.stringify(report, null, 2)))
+                .catch((error: Error) => setTelemetryText(error.message));
+            }}
+            disabled={!selected}
+          >
+            Inspect telemetry
+          </button>
+        </div>
+        {gcsvText && <pre className="mono report">{gcsvText}</pre>}
+        {telemetryText && <pre className="mono report">{telemetryText}</pre>}
       </section>
 
       {showSettings && caps && (
@@ -589,9 +704,17 @@ export function App() {
               className="ghost"
               onClick={() =>
                 api.proxy(selected.id).then((proxy) => {
-                  setPreviewUrl(proxy.url);
-                  setPreviewNote(proxy.note);
-                })
+                  if (proxy.kind === "proxy") {
+                    setPreviewKind("proxy");
+                    setPreviewUrl(proxy.url);
+                    const limit = proxy.duration_limit_seconds ?? 60;
+                    setPreviewNote(`${proxy.note} Playback here is capped at ${limit} seconds.`);
+                  } else {
+                    setPreviewKind("source");
+                    setPreviewUrl(proxy.url);
+                    setPreviewNote(proxy.note);
+                  }
+                }).catch((error: Error) => setNotice(error.message))
               }
             >
               Create viewing proxy

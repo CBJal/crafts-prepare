@@ -10,9 +10,10 @@ idna==3.20
 iniconfig==2.3.1
 packaging==24.0
 pluggy==1.7.0
-pydantic==2.10.4
-pydantic_core==2.27.2
+pydantic==2.14.1
+pydantic_core==2.50.1
 pytest==8.3.4
 starlette==0.41.3
+typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.34.0

@@ -86,6 +86,43 @@ t,gx,gy,gz
         )
 
 
+def test_missing_ascale_is_a_controlled_error_not_keyerror():
+    text = """GYROFLOW IMU LOG
+version,1.3
+id,custom_logger
+orientation,XYZ
+tscale,0.001
+gscale,0.001
+t,gx,gy,gz,ax,ay,az
+0,1,2,3,4,5,6
+1,1,2,3,4,5,6
+"""
+    with pytest.raises(CraftsError, match="ascale") as caught:
+        parse_gcsv_text(text)
+    assert caught.value.code == "bad_gcsv"
+
+
+def test_nan_and_inf_samples_are_rejected():
+    for bad in ("nan", "inf", "-inf"):
+        text = HEADER + f"0,1,2,3,0,0,0\n1,{bad},2,3,0,0,0\n"
+        with pytest.raises(CraftsError, match="non-finite") as caught:
+            parse_gcsv_text(text)
+        assert caught.value.code == "bad_gcsv"
+    text = """GYROFLOW IMU LOG
+version,1.3
+id,custom_logger
+orientation,XYZ
+tscale,nan
+gscale,0.001
+t,gx,gy,gz
+0,1,2,3
+1,1,2,3
+"""
+    with pytest.raises(CraftsError, match="tscale") as caught:
+        parse_gcsv_text(text)
+    assert caught.value.code == "bad_gcsv"
+
+
 def test_detects_timestamp_gaps_and_rejects_decreasing_time():
     text = HEADER + "0,0,0,0,0,0,0\n1,0,0,0,0,0,0\n2,0,0,0,0,0,0\n50,0,0,0,0,0,0\n"
     log = parse_gcsv_text(text)

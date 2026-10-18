@@ -199,11 +199,11 @@ def parse_gcsv_text(text: str) -> GcsvLog:
     gscale = _positive_float("gscale", metadata["gscale"])
     has_accel = "ax" in columns
     has_mag = "mx" in columns
-    ascale = _positive_float("ascale", metadata["ascale"]) if has_accel else _optional_float("ascale", metadata.get("ascale"))
     if has_accel and "ascale" not in metadata:
         _fail("ascale is required when accelerometer columns are present.")
     if has_mag and "mscale" not in metadata:
         _fail("mscale is required when magnetometer columns are present.")
+    ascale = _positive_float("ascale", metadata["ascale"]) if has_accel else _optional_float("ascale", metadata.get("ascale"))
     mscale = _positive_float("mscale", metadata["mscale"]) if has_mag else _optional_float("mscale", metadata.get("mscale"))
 
     readout = _optional_float("frame_readout_time", metadata.get("frame_readout_time"))

@@ -35,6 +35,13 @@ export const api = {
   exportJob: (body: unknown) => request<import("./types").Job>("/api/jobs/export", { method: "POST", body: JSON.stringify(body) }),
   cancel: (id: string) => request(`/api/jobs/${id}/cancel`, { method: "POST" }),
   retry: (id: string) => request(`/api/jobs/${id}/retry`, { method: "POST" }),
-  proxy: (id: string) => request<{ kind: string; url: string; note: string }>(`/api/media/${id}/proxy`, { method: "POST" }),
+  proxy: (id: string) =>
+    request<{ kind: string; url: string; note: string; duration_limit_seconds: number | null; limited: boolean }>(
+      `/api/media/${id}/proxy`,
+      { method: "POST" },
+    ),
+  gyro: (body: unknown) => request<import("./types").Job>("/api/jobs/gyroflow", { method: "POST", body: JSON.stringify(body) }),
+  parseGcsv: (path: string) => request<Record<string, unknown>>("/api/gcsv/parse", { method: "POST", body: JSON.stringify({ path }) }),
+  telemetry: (id: string) => request<Record<string, unknown>>(`/api/media/${id}/telemetry`, { method: "POST" }),
   settings: (body: unknown) => request("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
 };

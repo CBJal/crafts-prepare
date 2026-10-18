@@ -237,8 +237,24 @@ def publish_exclusive(partial: Path, final: Path, source: Path) -> None:
     partial.unlink(missing_ok=True)
 
 
+def quote_ffmpeg_filter_path(posix_path: str) -> str:
+    """Return one filter-graph token for a path.
+
+    The token is single-quoted. Colons, including a Windows drive letter, are
+    escaped. An apostrophe ends the quote, inserts \\', and reopens it. Spaces
+    stay inside the quotes. This is the filter parser's quoting, not a shell
+    command string: the result is one argv element.
+    """
+    if any(char in posix_path for char in ("\x00", "\n", "\r")):
+        raise CraftsError("Filter path contains a control character.", code="bad_path")
+    escaped = posix_path.replace("\\", "\\\\").replace(":", r"\:").replace("'", r"'\''")
+    return f"'{escaped}'"
+
+
 def ffmpeg_filter_path(path: Path) -> str:
-    """Escape a path for an FFmpeg filter option. The path is one we created."""
-    text = path.resolve().as_posix()
-    text = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-    return text
+    """Quote a real path for an FFmpeg filter graph value."""
+    try:
+        text = path.resolve(strict=False).as_posix()
+    except OSError:
+        text = path.as_posix()
+    return quote_ffmpeg_filter_path(text)

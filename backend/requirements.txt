@@ -1,5 +1,8 @@
+# Python 3.12, 3.13, and 3.14.
+# pydantic 2.14.1 depends on pydantic-core 2.50.1, which publishes a
+# cp314 win_amd64 wheel. pydantic 2.10.4 / pydantic-core 2.27.2 does not.
 fastapi==0.115.6
 uvicorn==0.34.0
-pydantic==2.10.4
+pydantic==2.14.1
 httpx==0.28.1
 pytest==8.3.4

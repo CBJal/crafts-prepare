@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -96,16 +97,28 @@ def test_import_probe_dedup_and_rejects_bad_paths(client, media_dir: Path, tmp_p
     assert sha256(media_dir / "h264_8.mp4") == before
 
 
-def test_folder_import_skips_symlink_escape_and_probes_real_codecs(client, media_dir: Path, tmp_path: Path):
+def _symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror == 1314 or exc.errno in {errno.EPERM, errno.EACCES, errno.EOPNOTSUPP}:
+            pytest.skip(
+                "This assertion needs a symlink and the process cannot create one "
+                f"(winerror={winerror}, errno={exc.errno}). Format import and hardlink alias tests still run."
+            )
+        raise
+
+
+def test_folder_symlink_escape_is_skipped(client, media_dir: Path, tmp_path: Path):
     library = tmp_path / "library"
     library.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     secret = outside / "secret.mp4"
     secret.write_bytes((media_dir / "h264_8.mp4").read_bytes())
-    (library / "escape.mp4").symlink_to(secret)
-    (library / "inside.mov").symlink_to(media_dir / "prores_422_10.mov")
-    # inside.mov points outside the selected folder too.
+    _symlink(library / "escape.mp4", secret)
+    _symlink(library / "inside.mov", media_dir / "prores_422_10.mov")
     response = client.post("/api/media/import", json={"path": str(library)})
     assert response.status_code == 200, response.text
     body = response.json()
@@ -113,6 +126,8 @@ def test_folder_import_skips_symlink_escape_and_probes_real_codecs(client, media
     reasons = {item["reason"] for item in body["skipped"]}
     assert any("escapes" in reason for reason in reasons)
 
+
+def test_folder_import_probes_real_codecs(client, media_dir: Path, tmp_path: Path):
     held = tmp_path / "held"
     held.mkdir()
     for name in ("h264_8.mp4", "hevc_10.mp4", "prores_422_10.mov", "dnxhr_hq.mxf"):
@@ -203,6 +218,9 @@ def test_trimmed_resized_h264_and_prores_exports(client, media_dir: Path, tmp_pa
     assert output.name == "h264_8_web.mp4"
     assert "eq=brightness=0.1000:saturation=0.5000" in job["result"]["filter_chain"]
     assert "scale=320:180" in job["result"]["filter_chain"]
+    assert "-vf" in job["result"]["command_preview"]
+    assert "-filter_script:v" not in job["result"]["command_preview"]
+    assert "filter_script" not in " ".join(job["result"]["command_preview"])
     decode_ok(output)
     info = probe(output)
     video = next(stream for stream in info["streams"] if stream["codec_type"] == "video")
@@ -339,7 +357,15 @@ def test_collision_source_alias_and_failed_ffmpeg_leave_no_finished_file(client,
 
     alias = tmp_path / "alias"
     alias.mkdir()
-    (alias / "h264_8_cut.mp4").symlink_to(source)
+    alias_file = alias / "h264_8_cut.mp4"
+    try:
+        alias_file.symlink_to(source)
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror == 1314 or exc.errno in {errno.EPERM, errno.EACCES, errno.EOPNOTSUPP}:
+            os.link(source, alias_file)
+        else:
+            raise
     aliased = client.post(
         "/api/jobs/export",
         json={
@@ -431,6 +457,20 @@ def test_collision_source_alias_and_failed_ffmpeg_leave_no_finished_file(client,
     assert job["status"] != "succeeded"
     assert list(out.glob("*.mp4")) == []
     assert list(out.glob("*.crafts-partial")) == []
+
+
+def test_invalid_clip_edit_does_not_change_saved_state(client, media_dir: Path):
+    clip = import_clip(client, media_dir / "h264_8.mp4")
+    before = client.get(f"/api/media/{clip['id']}").json()
+    bad_trim = client.patch(f"/api/media/{clip['id']}", json={"trim_in": 1.5, "trim_out": 0.2})
+    assert bad_trim.status_code == 400
+    bad_flag = client.patch(f"/api/media/{clip['id']}", json={"flag": "MAYBE", "trim_out": 0.4})
+    assert bad_flag.status_code == 400
+    again = client.get(f"/api/media/{clip['id']}").json()
+    assert again["trim_in"] == before["trim_in"]
+    assert again["trim_out"] == before["trim_out"]
+    assert again["flag"] == before["flag"]
+    assert again["notes"] == before["notes"]
 
 
 def test_invalid_trim_suffix_and_queue_cancel_retry(client, media_dir: Path, tmp_path: Path, monkeypatch):

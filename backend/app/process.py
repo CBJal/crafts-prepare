@@ -12,7 +12,7 @@ from collections.abc import Callable
 from .errors import Cancelled, CraftsError
 
 
-def spawn(args: list[str]) -> subprocess.Popen[str]:
+def spawn(args: list[str], cwd: str | None = None) -> subprocess.Popen[str]:
     if not args or not isinstance(args[0], str):
         raise CraftsError("Missing executable.", code="missing_tool")
     kwargs: dict = {
@@ -22,6 +22,7 @@ def spawn(args: list[str]) -> subprocess.Popen[str]:
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
+        "cwd": cwd,
     }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -63,8 +64,9 @@ def run_captured(
     timeout: float,
     cancel: threading.Event | None = None,
     on_stdout: Callable[[str], None] | None = None,
+    cwd: str | None = None,
 ) -> tuple[int, str, str]:
-    proc = spawn(args)
+    proc = spawn(args, cwd=cwd)
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     stdout_lock = threading.Lock()

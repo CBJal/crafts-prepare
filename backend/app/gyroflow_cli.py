@@ -12,19 +12,37 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import sys
 import threading
+import uuid
 from pathlib import Path
 
 from .errors import Cancelled, CraftsError
 from .probe import discover_executable, probe_file
 from .process import run_captured, tool_version
-from .security import exclusive_output, same_file
+from .security import exclusive_output, publish_exclusive, same_file
+
+MEDIA_SUFFIXES = {".mp4", ".mov", ".mxf", ".mkv", ".m2ts", ".mts"}
 
 PROGRESS_RE = re.compile(
     r"Rendering progress:\s+(\d+)/(\d+)\s+frames\s+\(([0-9.]+)%\)"
 )
 SYNC_RE = re.compile(r"Synchronization progress:\s+([0-9.]+)%")
 FORBIDDEN = {"--overwrite", "-f", "--watch", "--when-done", "-d", "--open"}
+
+
+def launch_argv(executable: str) -> list[str]:
+    """How to start the configured tool.
+
+    A real Gyroflow install is an executable. A `.py` path is the test double
+    and is started with this interpreter so the same file runs on Windows,
+    where a POSIX shebang is not executable.
+    """
+    path = Path(executable)
+    if path.suffix.lower() == ".py":
+        return [sys.executable, str(path)]
+    return [executable]
 
 
 def build_argv(
@@ -44,7 +62,7 @@ def build_argv(
         "output_folder": str(output.parent),
         "output_filename": output.name,
     }
-    args = [executable]
+    args = launch_argv(executable)
     if project is not None:
         args.append(str(project))
     else:
@@ -133,7 +151,7 @@ def run_gyroflow(
             code="gyro_missing",
             status=424,
         )
-    ok, version = tool_version([executable, "--version"])
+    ok, version = tool_version([*launch_argv(executable), "--version"])
     if not ok:
         raise CraftsError(
             "Gyroflow did not respond to --version, so no render was started. "
@@ -148,65 +166,111 @@ def run_gyroflow(
     if source_for_alias is None:
         raise CraftsError("Missing input.", code="gyro_input")
     final = exclusive_output(output, source_for_alias)
-    if gyro_file and same_file(final, gyro_file):
-        raise CraftsError("Refusing to overwrite the gyro log.", code="source_overwrite")
-    args = build_argv(
-        executable,
-        media=media,
-        project=project if motion["kind"] == "project" else None,
-        gyro_file=motion.get("gyro_file"),
-        preset=preset,
-        output=final,
-    )
-    try:
-        code, stdout, stderr = run_captured(
-            args,
-            timeout=60 * 60 * 6,
-            cancel=cancel,
-            on_stdout=lambda line: _progress(line, on_progress),
-        )
-    except Cancelled:
-        if final.exists() and not same_file(final, source_for_alias):
-            final.unlink(missing_ok=True)
-        raise
-    combined = (stdout + "\n" + stderr)[-2000:]
-    if code != 0:
-        if final.exists() and not same_file(final, source_for_alias):
-            final.unlink(missing_ok=True)
-        raise CraftsError(f"Gyroflow exited {code}. {combined}", code="gyro_failed")
-    if not final.exists() or final.stat().st_size == 0:
-        if final.exists() and not same_file(final, source_for_alias):
-            final.unlink()
+    if final.suffix.lower() not in MEDIA_SUFFIXES:
         raise CraftsError(
-            "Gyroflow exited 0 but the expected output file is missing or empty. "
-            "This is not reported as success. " + combined,
-            code="gyro_unverified",
+            "Gyroflow output needs a media extension such as .mp4 or .mov.",
+            code="bad_name",
         )
-    if same_file(final, source_for_alias):
-        raise CraftsError("Gyroflow output aliases the source. Refusing to treat that as success.", code="source_overwrite")
+    protected = [item for item in (media, project, gyro_file, preset, source_for_alias) if item is not None]
+    _reject_protected(final, protected)
+    staging_dir = final.parent / f".crafts-gyro-{uuid.uuid4().hex[:12]}"
+    staging = staging_dir / f"staged{final.suffix}"
+    staging_dir.mkdir()
     try:
-        probed = probe_file(ffprobe, final)
-    except CraftsError as exc:
-        final.unlink(missing_ok=True)
-        raise CraftsError(
-            "Gyroflow wrote a file that ffprobe could not decode, so it was removed. " + exc.message,
-            code="gyro_unverified",
-        ) from exc
-    if not probed.get("video"):
-        final.unlink(missing_ok=True)
-        raise CraftsError("Gyroflow output has no video stream.", code="gyro_unverified")
-    return {
-        "output_path": str(final),
-        "gyroflow_version": version.splitlines()[0] if version else None,
-        "argv": args,
-        "validation": {
-            "codec": probed["video"][0].get("codec"),
-            "duration": probed.get("duration"),
-            "width": probed["video"][0].get("width"),
-            "height": probed["video"][0].get("height"),
-        },
-        "note": "Output was produced by the installed Gyroflow CLI and decoded with ffprobe.",
-    }
+        args = build_argv(
+            executable,
+            media=media,
+            project=project if motion["kind"] == "project" else None,
+            gyro_file=motion.get("gyro_file"),
+            preset=preset,
+            output=staging,
+        )
+        try:
+            code, stdout, stderr = run_captured(
+                args,
+                timeout=60 * 60 * 6,
+                cancel=cancel,
+                on_stdout=lambda line: _progress(line, on_progress),
+            )
+        except Cancelled:
+            raise
+        combined = (stdout + "\n" + stderr)[-2000:]
+        if code != 0:
+            raise CraftsError(f"Gyroflow exited {code}. {combined}", code="gyro_failed")
+        if not staging.exists() or staging.stat().st_size == 0:
+            raise CraftsError(
+                "Gyroflow exited 0 but the staging file is missing or empty. "
+                "This is not reported as success. " + combined,
+                code="gyro_unverified",
+            )
+        _reject_protected(staging, protected)
+        try:
+            probed = probe_file(ffprobe, staging)
+        except CraftsError as exc:
+            raise CraftsError(
+                "ffprobe could not probe the Gyroflow staging file, so it was not published. " + exc.message,
+                code="gyro_unverified",
+            ) from exc
+        if not probed.get("video"):
+            raise CraftsError("Gyroflow staging file has no video stream. It was not published.", code="gyro_unverified")
+        _reject_protected(final, protected)
+        if final.exists() or final.is_symlink():
+            raise CraftsError(
+                f"Output appeared during the job and was left untouched: {final}",
+                code="collision",
+                status=409,
+            )
+        publish_exclusive(staging, final, source_for_alias)
+        return {
+            "output_path": str(final),
+            "gyroflow_version": version.splitlines()[0] if version else None,
+            "argv": args,
+            "validation": {
+                "codec": probed["video"][0].get("codec"),
+                "duration": probed.get("duration"),
+                "width": probed["video"][0].get("width"),
+                "height": probed["video"][0].get("height"),
+            },
+            "note": (
+                "Output was produced by the installed Gyroflow CLI and probed with ffprobe. "
+                "This job processes the whole source or project. Export trim and grade settings are not applied. "
+                "A full ffmpeg decode was not run."
+            ),
+        }
+    finally:
+        _remove_owned_staging(staging_dir, final)
+
+
+def _reject_protected(path: Path, protected: list[Path]) -> None:
+    for item in protected:
+        try:
+            if path.resolve(strict=False) == item.resolve(strict=False):
+                raise CraftsError(
+                    "Refusing to write onto an input file or an alias of it.",
+                    code="source_overwrite",
+                )
+        except OSError:
+            continue
+        if item.exists() and path.exists() and same_file(path, item):
+            raise CraftsError(
+                "Refusing to write onto an input file or an alias of it.",
+                code="source_overwrite",
+            )
+
+
+def _remove_owned_staging(staging_dir: Path, final: Path) -> None:
+    """Delete only the directory this job created. Never the requested output."""
+    try:
+        staging_real = staging_dir.resolve(strict=False)
+        final_real = final.resolve(strict=False)
+        parent_real = final.parent.resolve(strict=False)
+    except OSError:
+        return
+    if staging_real in {final_real, parent_real}:
+        return
+    if not staging_dir.is_dir():
+        return
+    shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _progress(line: str, on_progress) -> None:

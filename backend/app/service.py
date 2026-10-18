@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -19,7 +20,7 @@ from .gcsv import parse_gcsv_file
 from .gyroflow_cli import run_gyroflow
 from .importer import import_path
 from .presets import PRESETS, conversion_note, preset_availability
-from .preview import browser_playable, extract_thumbnail, make_proxy
+from .preview import PROXY_LIMIT_SECONDS, browser_playable, extract_thumbnail, make_proxy
 from .probe import discover_executable
 from .process import run_captured
 from .security import MAX_PROJECT_BYTES, exclusive_output, resolve_existing, safe_filename, same_file
@@ -196,26 +197,36 @@ class Service:
     def update_clip(self, clip_id: str, patch: dict) -> dict:
         with self.lock:
             clip = self._clip(clip_id)
+            new_flag = clip.get("flag") or ""
+            new_notes = clip.get("notes") or ""
+            new_markers = list(clip.get("markers") or [])
+            new_in = float(clip.get("trim_in") or 0)
+            new_out = float(clip.get("trim_out") or 0)
             if "flag" in patch and patch["flag"] is not None:
                 if patch["flag"] not in {"", "OK", "KEEP", "NG"}:
                     raise CraftsError("Flag must be OK, KEEP, NG, or empty.", code="bad_flag")
-                clip["flag"] = patch["flag"]
+                new_flag = patch["flag"]
             if "notes" in patch and patch["notes"] is not None:
                 notes = patch["notes"]
                 if not isinstance(notes, str) or len(notes) > 8000:
                     raise CraftsError("Notes must be text up to 8000 characters.", code="bad_notes")
-                clip["notes"] = notes
+                new_notes = notes
             if "markers" in patch and patch["markers"] is not None:
-                clip["markers"] = _markers(patch["markers"])
-            duration = float(clip["probe"].get("duration") or 0)
+                new_markers = _markers(patch["markers"])
             if "trim_in" in patch and patch["trim_in"] is not None:
-                clip["trim_in"] = float(patch["trim_in"])
+                new_in = _finite_number("Trim in", patch["trim_in"])
             if "trim_out" in patch and patch["trim_out"] is not None:
-                clip["trim_out"] = float(patch["trim_out"])
-            if clip["trim_in"] < 0 or clip["trim_out"] <= clip["trim_in"]:
+                new_out = _finite_number("Trim out", patch["trim_out"])
+            duration = float(clip["probe"].get("duration") or 0)
+            if new_in < 0 or new_out <= new_in:
                 raise CraftsError("Trim in/out must be a positive interval.", code="bad_trim")
-            if duration and clip["trim_out"] > duration + 0.05:
+            if duration and new_out > duration + 0.05:
                 raise CraftsError("Trim out is past the end of the clip.", code="bad_trim")
+            clip["flag"] = new_flag
+            clip["notes"] = new_notes
+            clip["markers"] = new_markers
+            clip["trim_in"] = new_in
+            clip["trim_out"] = new_out
             self._persist()
             return public_clip(clip)
 
@@ -248,10 +259,14 @@ class Service:
             digest = clip["sha256"]
             duration = float(clip["probe"].get("duration") or 0)
             playable = browser_playable(clip["probe"])
+        limit = min(duration, PROXY_LIMIT_SECONDS) if duration and duration > 0 else PROXY_LIMIT_SECONDS
         if playable:
             return {
                 "kind": "source",
                 "url": f"/api/media/{clip_id}/file",
+                "duration_limit_seconds": None,
+                "source_duration": duration,
+                "limited": False,
                 "note": "Browser playback uses the source file. Adjustments are not baked into this player.",
             }
         destination = self.data_dir / f"proxy-{digest}.mp4"
@@ -260,10 +275,13 @@ class Service:
         return {
             "kind": "proxy",
             "url": f"/api/media/{clip_id}/proxy-file",
+            "duration_limit_seconds": limit,
+            "source_duration": duration,
+            "limited": bool(duration and duration > PROXY_LIMIT_SECONDS),
             "note": (
-                "This is a 640px H.264 viewing proxy. The source file was not modified. "
-                "Adjustments are shown on the still preview, which uses the same filter graph as export, "
-                "except temporal stabilization (vidstab/deshake) which is applied only during export."
+                f"Viewing proxy is H.264, about 640px wide, and at most {int(PROXY_LIMIT_SECONDS)} seconds. "
+                "It is not full-clip playback when the source is longer. The source file was not modified. "
+                "Adjustments are on the still preview. Vidstab and deshake run only during export."
             ),
             "proxy_path": str(destination),
         }
@@ -403,8 +421,11 @@ class Service:
     def retry(self, job_id: str) -> dict:
         with self.lock:
             job = self._job(job_id)
-            if job["status"] not in {"failed", "cancelled", "interrupted"}:
-                raise CraftsError("Only failed, cancelled, or interrupted jobs can be retried.", code="bad_state")
+            if job["status"] not in {"failed", "cancelled", "interrupted", "paused"}:
+                raise CraftsError(
+                    "Only failed, cancelled, interrupted, or paused jobs can be retried.",
+                    code="bad_state",
+                )
             job["status"] = "queued"
             job["progress"] = 0.0
             job["error"] = None
@@ -557,7 +578,12 @@ class Service:
 
     def _finish(self, job_id: str, status: str, error: str | None = None, code: str | None = None, result: dict | None = None) -> None:
         with self.lock:
-            job = self._job(job_id)
+            try:
+                job = self._job(job_id)
+            except CraftsError:
+                # The project changed out from under a finished worker. Do not
+                # kill the queue thread, and do not invent a success.
+                return
             job["status"] = status
             job["error"] = error
             job["code"] = code
@@ -576,26 +602,36 @@ class Service:
     def open_project(self, raw: str) -> dict:
         path = resolve_existing(raw)
         self._assert_project_path(path)
-        if path.stat().st_size > MAX_PROJECT_BYTES:
+        size = path.stat().st_size
+        if size == 0:
+            raise CraftsError("Project file is empty.", code="bad_project")
+        if size > MAX_PROJECT_BYTES:
             raise CraftsError("Project file is too large.", code="too_large")
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise CraftsError("Project file is not JSON.", code="bad_project") from exc
-        if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
-            raise CraftsError("This file is not a Crafts Prepare project.", code="bad_project")
-        if payload.get("version") != VERSION:
-            raise CraftsError("Unsupported project version.", code="bad_project")
-        for job in payload.get("jobs") or []:
-            if job.get("status") == "running":
+        document = validate_project_document(payload)
+        for job in document["jobs"]:
+            if job.get("status") == "queued":
+                job["status"] = "paused"
+                job["error"] = "Saved jobs stay paused. Use Retry to run this one."
+                job["code"] = "paused"
+            elif job.get("status") == "running":
                 job["status"] = "interrupted"
-                job["error"] = "The app stopped while this job was running. It was not marked successful."
+                job["error"] = "The app stopped while this job was running. It was not marked successful. Use Retry to run it again."
                 job["code"] = "interrupted"
                 job["finished_at"] = job.get("finished_at") or utcnow()
         with self.lock:
-            self.project = payload
+            if any(job["status"] in {"queued", "running"} for job in self.project.get("jobs") or []):
+                raise CraftsError(
+                    "Finish or cancel the current queue before opening another project. Nothing was switched.",
+                    code="busy_project",
+                    status=409,
+                )
+            self.project = document
             self.project_path = path
-            self.cancel_flags = {job["id"]: threading.Event() for job in self.project.get("jobs") or []}
+            self.cancel_flags = {job["id"]: threading.Event() for job in document["jobs"]}
         return self.project_summary()
 
     def save_project(self, raw: str | None) -> dict:
@@ -606,19 +642,25 @@ class Service:
                 if path.exists():
                     existing = path.resolve(strict=True)
                     self._assert_project_path(existing)
-                    if existing.stat().st_size and existing.stat().st_size < MAX_PROJECT_BYTES:
-                        try:
-                            previous = json.loads(existing.read_text(encoding="utf-8"))
-                        except json.JSONDecodeError as exc:
-                            raise CraftsError(
-                                "Refusing to overwrite a file that is not a Crafts Prepare project.",
-                                code="bad_project",
-                            ) from exc
-                        if previous.get("schema") != SCHEMA:
-                            raise CraftsError(
-                                "Refusing to overwrite a file that is not a Crafts Prepare project.",
-                                code="bad_project",
-                            )
+                    size = existing.stat().st_size
+                    if size == 0:
+                        raise CraftsError(
+                            "Refusing to overwrite an empty file. Choose a new .crafts.json path.",
+                            code="bad_project",
+                        )
+                    if size > MAX_PROJECT_BYTES:
+                        raise CraftsError(
+                            "Refusing to overwrite a file larger than a Crafts Prepare project.",
+                            code="too_large",
+                        )
+                    try:
+                        previous = json.loads(existing.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError as exc:
+                        raise CraftsError(
+                            "Refusing to overwrite a file that is not a Crafts Prepare project.",
+                            code="bad_project",
+                        ) from exc
+                    validate_project_document(previous)
                 else:
                     if not path.parent.exists():
                         raise CraftsError("Project directory does not exist.", code="bad_path", status=404)
@@ -700,6 +742,103 @@ class Service:
         for clip in self.project.get("clips") or []:
             if Path(clip["path"]).resolve(strict=False) == path.resolve(strict=False):
                 raise CraftsError("Refusing to use a source clip as the project file.", code="source_overwrite")
+
+
+def _finite_number(label: str, value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CraftsError(f"{label} must be a number.", code="bad_trim")
+    number = float(value)
+    if not math.isfinite(number):
+        raise CraftsError(f"{label} must be a finite number.", code="bad_trim")
+    return number
+
+
+def validate_project_document(payload: object) -> dict:
+    """Return a checked project. Raise before any live state is replaced."""
+    if not isinstance(payload, dict):
+        raise CraftsError("Project file must be a JSON object.", code="bad_project")
+    if payload.get("schema") != SCHEMA:
+        raise CraftsError("This file is not a Crafts Prepare project.", code="bad_project")
+    if payload.get("version") != VERSION:
+        raise CraftsError("Unsupported project version.", code="bad_project")
+    name = payload.get("name", "Untitled")
+    if not isinstance(name, str) or not name.strip() or len(name) > 120:
+        raise CraftsError("Project name is invalid.", code="bad_project")
+    clips = payload.get("clips")
+    jobs = payload.get("jobs")
+    if not isinstance(clips, list) or not isinstance(jobs, list):
+        raise CraftsError("Project clips and jobs must be lists.", code="bad_project")
+    if len(clips) > 500 or len(jobs) > 500:
+        raise CraftsError("Project has too many clips or jobs.", code="bad_project")
+    seen_clips: set[str] = set()
+    seen_jobs: set[str] = set()
+    cleaned_clips = [_validate_stored_clip(clip, seen_clips) for clip in clips]
+    cleaned_jobs = [_validate_stored_job(job, seen_jobs) for job in jobs]
+    return {
+        "schema": SCHEMA,
+        "version": VERSION,
+        "name": name.strip(),
+        "clips": cleaned_clips,
+        "jobs": cleaned_jobs,
+    }
+
+
+def _validate_stored_clip(clip: object, seen: set[str]) -> dict:
+    if not isinstance(clip, dict):
+        raise CraftsError("Each clip must be an object.", code="bad_project")
+    clip_id = clip.get("id")
+    if not isinstance(clip_id, str) or not clip_id or len(clip_id) > 80 or clip_id in seen:
+        raise CraftsError("Clip id is missing or duplicated.", code="bad_project")
+    seen.add(clip_id)
+    path = clip.get("path")
+    if not isinstance(path, str) or not path or len(path) > 4096 or "\x00" in path:
+        raise CraftsError("Clip path is invalid.", code="bad_project")
+    digest = clip.get("sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise CraftsError("Clip identity is invalid.", code="bad_project")
+    if not isinstance(clip.get("name"), str) or not clip["name"]:
+        raise CraftsError("Clip name is invalid.", code="bad_project")
+    size = clip.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise CraftsError("Clip size is invalid.", code="bad_project")
+    if not isinstance(clip.get("probe"), dict):
+        raise CraftsError("Clip probe data is invalid.", code="bad_project")
+    flag = clip.get("flag") or ""
+    if flag not in {"", "OK", "KEEP", "NG"}:
+        raise CraftsError("Clip flag is invalid.", code="bad_project")
+    notes = clip.get("notes") or ""
+    if not isinstance(notes, str) or len(notes) > 8000:
+        raise CraftsError("Clip notes are invalid.", code="bad_project")
+    markers = clip.get("markers") or []
+    if not isinstance(markers, list) or len(markers) > 200:
+        raise CraftsError("Clip markers are invalid.", code="bad_project")
+    _finite_number("Trim in", clip.get("trim_in", 0))
+    _finite_number("Trim out", clip.get("trim_out", 0))
+    checked = dict(clip)
+    checked["flag"] = flag
+    checked["notes"] = notes
+    checked["markers"] = markers
+    return checked
+
+
+def _validate_stored_job(job: object, seen: set[str]) -> dict:
+    if not isinstance(job, dict):
+        raise CraftsError("Each job must be an object.", code="bad_project")
+    job_id = job.get("id")
+    if not isinstance(job_id, str) or not job_id or len(job_id) > 80 or job_id in seen:
+        raise CraftsError("Job id is missing or duplicated.", code="bad_project")
+    seen.add(job_id)
+    if job.get("kind") not in {"export", "gyroflow"}:
+        raise CraftsError("Job kind is invalid.", code="bad_project")
+    if job.get("status") not in {"queued", "running", "paused", "succeeded", "failed", "cancelled", "interrupted"}:
+        raise CraftsError("Job status is invalid. It was not queued.", code="bad_project")
+    if not isinstance(job.get("request"), dict):
+        raise CraftsError("Job request is invalid.", code="bad_project")
+    progress = job.get("progress", 0)
+    number = _finite_number("Job progress", progress)
+    if not 0 <= number <= 1:
+        raise CraftsError("Job progress is out of range.", code="bad_project")
+    return dict(job)
 
 
 def new_project() -> dict:

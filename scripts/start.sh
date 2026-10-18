@@ -5,9 +5,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 if ! command -v python3 >/dev/null; then
-  echo "Python 3.11+ is required." >&2
+  echo "Python 3.12, 3.13, or 3.14 is required." >&2
   exit 1
 fi
+python3 -c 'import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] <= (3, 14) else 1)' || {
+  echo "This Python is $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'). Crafts Prepare supports 3.12 through 3.14." >&2
+  exit 1
+}
 if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
   echo "Install ffmpeg and ffprobe yourself. Crafts Prepare does not download them." >&2
   exit 1
@@ -18,7 +22,7 @@ if [[ ! -d .venv ]]; then
 fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
-python -m pip install -r backend/requirements.txt
+python -m pip install -r backend/requirements.lock
 
 if [[ ! -f frontend/dist/index.html ]]; then
   if ! command -v npm >/dev/null; then

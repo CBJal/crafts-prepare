@@ -7,6 +7,7 @@ checks, and they are escaped for the filter parser.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,10 @@ class FilterSpec:
     deshake_ry: int = 16
     vidstab_trf: Path | None = None
     include_temporal: bool = True
+    # Safe filename in the ffmpeg working directory. The original path is not
+    # placed in the filter graph.
+    lut_name: str | None = None
+    trf_name: str | None = None
 
 
 def validate_adjustment(spec: FilterSpec) -> None:
@@ -62,7 +67,11 @@ def validate_adjustment(spec: FilterSpec) -> None:
         raise CraftsError("vidstab optzoom must be 0 (off), 1 (static), or 2 (adaptive).", code="bad_adjust")
     if not 0 <= spec.deshake_rx <= 64 or not 0 <= spec.deshake_ry <= 64:
         raise CraftsError("deshake rx and ry must be between 0 and 64.", code="bad_adjust")
-    if spec.lut_path:
+    if spec.lut_name and not re.fullmatch(r"[A-Za-z0-9._-]+", spec.lut_name):
+        raise CraftsError("Internal LUT filename is not safe.", code="bad_lut")
+    if spec.trf_name and not re.fullmatch(r"[A-Za-z0-9._-]+", spec.trf_name):
+        raise CraftsError("Internal transform filename is not safe.", code="bad_adjust")
+    if spec.lut_path and not spec.lut_name:
         validate_lut(spec.lut_path)
 
 
@@ -82,12 +91,15 @@ def chain_for(spec: FilterSpec) -> str:
     validate_adjustment(spec)
     parts: list[str] = []
     if spec.include_temporal and spec.stabilization == "vidstab":
-        if spec.vidstab_trf is None:
+        if spec.trf_name:
+            trf = spec.trf_name
+        elif spec.vidstab_trf is None:
             raise CraftsError("vidstab transform file is missing.", code="bad_adjust")
-        trf = ffmpeg_filter_path(spec.vidstab_trf)
+        else:
+            trf = ffmpeg_filter_path(spec.vidstab_trf)
         parts.append(
             "vidstabtransform="
-            f"input='{trf}':smoothing={int(spec.stab_smoothing)}:"
+            f"input={trf}:smoothing={int(spec.stab_smoothing)}:"
             f"crop={spec.stab_crop}:zoom={int(spec.stab_zoom)}:optzoom={int(spec.stab_optzoom)}"
         )
     elif spec.include_temporal and spec.stabilization == "deshake":
@@ -96,9 +108,11 @@ def chain_for(spec: FilterSpec) -> str:
         )
     if spec.exposure != 0 or spec.saturation != 1:
         parts.append(f"eq=brightness={spec.exposure:.4f}:saturation={spec.saturation:.4f}")
-    if spec.lut_path:
+    if spec.lut_name:
+        parts.append(f"lut3d=file={spec.lut_name}")
+    elif spec.lut_path:
         lut = validate_lut(spec.lut_path)
-        parts.append(f"lut3d=file='{ffmpeg_filter_path(lut)}'")
+        parts.append(f"lut3d=file={ffmpeg_filter_path(lut)}")
     if spec.rotate == "90":
         parts.append("transpose=1")
     elif spec.rotate == "180":
@@ -120,22 +134,16 @@ def chain_for(spec: FilterSpec) -> str:
     return ",".join(parts)
 
 
-def write_filter_script(spec: FilterSpec, destination: Path) -> Path | None:
-    chain = chain_for(spec)
-    if not chain:
-        return None
-    destination.write_text(chain + "\n", encoding="utf-8")
-    return destination
-
-
-def detect_chain(shakiness: int, accuracy: int, trf: Path) -> str:
+def detect_chain(shakiness: int, accuracy: int, result_name: str = "transforms.trf") -> str:
     if not 1 <= shakiness <= 10:
         raise CraftsError("vidstab shakiness must be between 1 and 10.", code="bad_adjust")
     if not 1 <= accuracy <= 15:
         raise CraftsError("vidstab accuracy must be between 1 and 15.", code="bad_adjust")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", result_name):
+        raise CraftsError("Internal transform filename is not safe.", code="bad_adjust")
     return (
         f"vidstabdetect=shakiness={int(shakiness)}:accuracy={int(accuracy)}:"
-        f"result='{ffmpeg_filter_path(trf)}'"
+        f"result={result_name}"
     )
 
 

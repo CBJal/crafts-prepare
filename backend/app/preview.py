@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 
 from .errors import CraftsError
-from .filters import FilterSpec, write_filter_script
+from .filters import FilterSpec, chain_for, validate_lut
 from .process import run_captured
+
+PROXY_LIMIT_SECONDS = 60
 
 
 def extract_thumbnail(
@@ -20,29 +24,30 @@ def extract_thumbnail(
 ) -> Path:
     if seconds < 0 or (duration and seconds > duration + 0.05):
         raise CraftsError("Thumbnail time is outside the clip.", code="bad_trim")
-    script_path = destination.with_suffix(".filter")
     # Stills do not include temporal stabilizers. The export path does.
     still = FilterSpec(**{**spec.__dict__, "include_temporal": False, "stabilization": "off"})
-    script = write_filter_script(still, script_path)
-    args = [
-        ffmpeg,
-        "-hide_banner",
-        "-nostdin",
-        "-y",
-        "-ss",
-        f"{seconds:.6f}",
-        "-i",
-        str(source),
-        "-frames:v",
-        "1",
-    ]
-    if script is not None:
-        args.extend(["-filter_script:v", str(script)])
-    args.extend(["-q:v", "3", str(destination)])
-    try:
-        code, _stdout, stderr = run_captured(args, timeout=120)
-    finally:
-        script_path.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="crafts-still-") as temp:
+        work = Path(temp)
+        if still.lut_path:
+            shutil.copyfile(validate_lut(still.lut_path), work / "grade.cube")
+            still.lut_name = "grade.cube"
+        chain = chain_for(still)
+        args = [
+            ffmpeg,
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-ss",
+            f"{seconds:.6f}",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+        ]
+        if chain:
+            args.extend(["-vf", chain])
+        args.extend(["-q:v", "3", str(destination)])
+        code, _stdout, stderr = run_captured(args, timeout=120, cwd=str(work))
     if code != 0 or not destination.exists():
         raise CraftsError("Thumbnail failed. " + (stderr or "")[-500:], code="ffmpeg_failed")
     return destination
@@ -68,7 +73,7 @@ def make_proxy(
     destination: Path,
     duration: float,
 ) -> Path:
-    limit = min(duration or 30, 60)
+    limit = min(duration, PROXY_LIMIT_SECONDS) if duration and duration > 0 else PROXY_LIMIT_SECONDS
     args = [
         ffmpeg,
         "-hide_banner",

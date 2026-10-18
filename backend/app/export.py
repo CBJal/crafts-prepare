@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
 import threading
 from pathlib import Path
 
 from .errors import Cancelled, CraftsError
-from .filters import FilterSpec, detect_chain, write_filter_script
+from .filters import FilterSpec, chain_for, detect_chain
 from .presets import PRESETS, conversion_note
 from .probe import Rational, parse_rational, probe_file
 from .process import run_captured
@@ -37,7 +38,7 @@ def build_export_args(
     encoder: str,
     audio: bool,
     crf: int | None,
-    filter_script: Path | None,
+    filter_chain: str | None,
 ) -> list[str]:
     args = [
         ffmpeg,
@@ -56,8 +57,9 @@ def build_export_args(
         "-frames:v",
         str(frames),
     ]
-    if filter_script is not None:
-        args.extend(["-filter_script:v", str(filter_script)])
+    if filter_chain:
+        # One argv value. A removed file-option form is not used.
+        args.extend(["-vf", filter_chain])
     args.extend(["-fps_mode", "cfr", "-r", rate.text, "-c:v", encoder])
     profile = preset.get("profile")
     if encoder.startswith("prores") and profile in PRORES_PROFILES:
@@ -175,12 +177,17 @@ def run_export(
     suffix_name = safe_filename(filename)
     final = exclusive_output(destination_dir / suffix_name, source)
     partial = partial_path(final, job_id)
-    work = partial.parent
-    trf = work / f".{job_id[:8]}.trf"
-    filter_file = work / f".{job_id[:8]}.filter"
+    token = "".join(char for char in job_id if char.isalnum())[:12] or "job"
+    work = final.parent / f".crafts-work-{token}"
+    work.mkdir()
     try:
+        if spec.lut_path:
+            from .filters import validate_lut
+
+            shutil.copyfile(validate_lut(spec.lut_path), work / "grade.cube")
+            spec.lut_name = "grade.cube"
         if spec.stabilization == "vidstab":
-            detect = detect_chain(shakiness, accuracy, trf)
+            detect = detect_chain(shakiness, accuracy, "transforms.trf")
             detect_args = [
                 ffmpeg,
                 "-hide_banner",
@@ -203,15 +210,16 @@ def run_export(
                 timeout=60 * 60,
                 cancel=cancel,
                 on_stdout=lambda line: on_progress(0.05),
+                cwd=str(work),
             )
+            trf = work / "transforms.trf"
             if code != 0 or not trf.exists() or trf.stat().st_size == 0:
                 raise CraftsError(
                     "vidstabdetect failed. " + (stderr or "")[-800:],
                     code="ffmpeg_failed",
                 )
-            spec.vidstab_trf = trf
-        script = write_filter_script(spec, filter_file)
-        filter_chain = script.read_text(encoding="utf-8").strip() if script else ""
+            spec.trf_name = "transforms.trf"
+        filter_chain = chain_for(spec)
         chosen_crf = crf if crf is not None else preset.get("crf_default")
         args = build_export_args(
             ffmpeg=ffmpeg,
@@ -225,7 +233,7 @@ def run_export(
             encoder=encoder,
             audio=audio,
             crf=chosen_crf,
-            filter_script=script,
+            filter_chain=filter_chain or None,
         )
 
         def on_line(line: str) -> None:
@@ -233,7 +241,9 @@ def run_export(
             if progress is not None:
                 on_progress(progress)
 
-        code, _stdout, stderr = run_captured(args, timeout=60 * 60 * 6, cancel=cancel, on_stdout=on_line)
+        code, _stdout, stderr = run_captured(
+            args, timeout=60 * 60 * 6, cancel=cancel, on_stdout=on_line, cwd=str(work)
+        )
         if code != 0 or not partial.exists() or partial.stat().st_size == 0:
             raise CraftsError("ffmpeg failed. " + (stderr or "no output")[-1200:], code="ffmpeg_failed")
         checked = _validate_output(
@@ -258,14 +268,13 @@ def run_export(
             "filter_chain": filter_chain,
         }
     except Cancelled:
-        _cleanup(partial, trf, filter_file)
+        _cleanup(partial)
         raise
     except Exception:
-        _cleanup(partial, trf, filter_file)
+        _cleanup(partial)
         raise
     finally:
-        trf.unlink(missing_ok=True)
-        filter_file.unlink(missing_ok=True)
+        shutil.rmtree(work, ignore_errors=True)
         partial.unlink(missing_ok=True)
 
 

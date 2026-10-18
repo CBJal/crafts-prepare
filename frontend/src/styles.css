@@ -103,6 +103,8 @@ label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
 .check input { width: auto; }
 fieldset { border: 1px solid var(--line); border-radius: 12px; margin-top: 0.8rem; }
 .queue { display: grid; gap: 0.6rem; }
+.gyro-panel { border-color: #6d5338; }
+.report { white-space: pre-wrap; max-height: 180px; overflow: auto; background: #120f0c; padding: 0.6rem; border-radius: 10px; }
 .job { display: flex; justify-content: space-between; gap: 1rem; padding: 0.7rem; border-radius: 12px; background: #18140f; }
 .job-succeeded { box-shadow: inset 3px 0 var(--ok); }
 .job-failed, .job-cancelled, .job-interrupted { box-shadow: inset 3px 0 var(--ng); }
