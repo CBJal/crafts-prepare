@@ -11,6 +11,7 @@ No Gyroflow source is included in this repository.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -27,9 +28,22 @@ from .security import exclusive_output, publish_exclusive, same_file
 
 MEDIA_SUFFIXES = {".mp4", ".mov", ".mxf", ".mkv", ".m2ts", ".mts"}
 GYRO_FORMATS = {
-    "h264_mp4": {"codec": "H.264/AVC", "pixel_format": "yuv420p", "container": "mp4"},
-    "prores_422": {"codec": "ProRes", "pixel_format": "yuv422p10le", "container": "mov"},
+    "h264_mp4": {
+        "codec": "H.264/AVC",
+        "codec_options": "",
+        "pixel_format": "yuv420p",
+        "container": "mp4",
+        "ffprobe_codec": "h264",
+    },
+    "prores_422": {
+        "codec": "ProRes",
+        "codec_options": "Standard",
+        "pixel_format": "yuv422p10le",
+        "container": "mov",
+        "ffprobe_codec": "prores",
+    },
 }
+MAX_MOTION_BYTES = 256 * 1024 * 1024
 
 MAX_PROJECT_BYTES = 64 * 1024 * 1024
 _WIN_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -221,7 +235,7 @@ def stage_gyroflow_document(
     # the same staging file. A macOS output_folder_bookmark is removed on the
     # copy only: import resolves it back over output_folder.
     output.pop("output_folder_bookmark", None)
-    for key in ("codec", "pixel_format", "audio", "output_width", "output_height"):
+    for key in ("codec", "codec_options", "pixel_format", "audio", "output_width", "output_height"):
         if output_overrides and key in output_overrides and output_overrides[key] is not None:
             output[key] = output_overrides[key]
     output["output_folder"] = directory_file_uri(staging_output.parent)
@@ -329,13 +343,20 @@ def _contained(path: Path, directory: Path) -> None:
 
 
 def _motion_sample_count(path: Path, staging_dir: Path) -> int:
-    """Count raw_imu samples in the metadata file this job asked Gyroflow to write."""
+    """Count usable raw_imu samples in the metadata file this job asked Gyroflow to write."""
     _contained(path, staging_dir)
     if not path.is_file() or path.stat().st_size == 0:
         raise CraftsError(
             "Gyroflow did not write parsed metadata inside staging, so this clip was not rendered.",
             code="gyro_motion_missing",
             status=424,
+        )
+    size = path.stat().st_size
+    if size > MAX_MOTION_BYTES:
+        raise CraftsError(
+            f"Parsed gyro metadata is {size} bytes, above the {MAX_MOTION_BYTES} byte limit. It was not decoded.",
+            code="gyro_motion_invalid",
+            status=422,
         )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -346,14 +367,46 @@ def _motion_sample_count(path: Path, staging_dir: Path) -> int:
             status=424,
         ) from exc
     raw = payload.get("raw_imu") if isinstance(payload, dict) else None
-    if not isinstance(raw, list) or not raw:
+    if not _usable_imu(raw):
         raise CraftsError(
-            "Gyroflow parsed this clip and found no raw IMU samples. "
+            "Gyroflow parsed this clip but the raw IMU samples are missing, malformed, or not a progressing sequence. "
             "A data stream, lens tag, or another clip's project is not treated as motion. This clip was not rendered.",
             code="gyro_motion_missing",
             status=424,
         )
     return len(raw)
+
+
+def _usable_imu(raw: object) -> bool:
+    """True for a sequence of finite, strictly increasing timestamped gyro vectors."""
+    if not isinstance(raw, list) or len(raw) < 2:
+        return False
+    previous: float | None = None
+    for item in raw:
+        if not isinstance(item, dict):
+            return False
+        timestamp = item.get("timestamp_ms")
+        gyro = item.get("gyro")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(float(timestamp)):
+            return False
+        if not _finite_vector(gyro):
+            return False
+        if "accl" in item and item.get("accl") is not None and not _finite_vector(item.get("accl")):
+            return False
+        stamp = float(timestamp)
+        if previous is not None and stamp <= previous:
+            return False
+        previous = stamp
+    return True
+
+
+def _finite_vector(value: object) -> bool:
+    if not isinstance(value, list) or len(value) != 3:
+        return False
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)):
+            return False
+    return True
 
 
 def _argv_with_out(executable: str, media: Path, output: Path, extra: list[str]) -> list[str]:
@@ -448,21 +501,30 @@ def run_gyroflow(
         # own output_folder and output_filename. Rewrite those fields on owned
         # copies so the external tool can only target this job's staging file.
         overrides = None
+        expected = None
         if automatic and chosen is not None:
-            overrides = {"codec": chosen["codec"], "pixel_format": chosen["pixel_format"], "audio": bool((output_settings or {}).get("audio", True))}
-            width = (output_settings or {}).get("width")
-            height = (output_settings or {}).get("height")
-            if width and height:
-                overrides["output_width"] = int(width)
-                overrides["output_height"] = int(height)
+            assert media is not None
+            expected = _automatic_contract(chosen, output_settings or {}, media, ffprobe, staging.name)
+            overrides = {
+                "codec": expected["codec"],
+                "codec_options": expected["codec_options"],
+                "pixel_format": expected["pixel_format"],
+                "audio": expected["audio"],
+                "output_width": expected["output_width"],
+                "output_height": expected["output_height"],
+            }
         project_for_cli = (
             stage_gyroflow_document(project, staging_dir, staging, role="project", output_overrides=overrides)
             if project is not None
             else None
         )
         preset_for_cli = (
-            stage_gyroflow_document(preset, staging_dir, staging, role="preset") if preset is not None else None
+            stage_gyroflow_document(preset, staging_dir, staging, role="preset", output_overrides=overrides)
+            if preset is not None
+            else None
         )
+        if automatic and expected is not None:
+            _assert_staged_contract(staging_dir, staging, expected)
         args = build_argv(
             executable,
             media=media,
@@ -499,6 +561,8 @@ def run_gyroflow(
             ) from exc
         if not probed.get("video"):
             raise CraftsError("Gyroflow staging file has no video stream. It was not published.", code="gyro_unverified")
+        if automatic and expected is not None:
+            _assert_rendered_contract(probed, expected)
         _reject_protected(final, protected)
         if final.exists() or final.is_symlink():
             raise CraftsError(
@@ -535,6 +599,85 @@ def run_gyroflow(
         }
     finally:
         _remove_owned_staging(staging_dir, final)
+
+
+def _automatic_contract(chosen: dict, settings: dict, media: Path, ffprobe: str, filename: str) -> dict:
+    width = settings.get("width")
+    height = settings.get("height")
+    if not width or not height:
+        probed = probe_file(ffprobe, media)
+        video = (probed.get("video") or [None])[0] or {}
+        width = video.get("width")
+        height = video.get("height")
+    if isinstance(width, bool) or isinstance(height, bool) or not isinstance(width, int) or not isinstance(height, int):
+        raise CraftsError(
+            "Source dimensions could not be read, so the gyro output size was not left to a preset.",
+            code="gyro_output_mismatch",
+        )
+    return {
+        "codec": chosen["codec"],
+        "codec_options": chosen["codec_options"],
+        "pixel_format": chosen["pixel_format"],
+        "ffprobe_codec": chosen["ffprobe_codec"],
+        "audio": bool(settings.get("audio", True)),
+        "output_width": width,
+        "output_height": height,
+        "output_filename": filename,
+    }
+
+
+def _assert_staged_contract(staging_dir: Path, staging_output: Path, expected: dict) -> None:
+    """Reject a staged project or preset whose output section is not the requested contract."""
+    folder = directory_file_uri(staging_output.parent)
+    found = False
+    for name in ("project.gyroflow", "preset.gyroflow"):
+        path = staging_dir / name
+        if not path.is_file():
+            continue
+        found = True
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CraftsError(f"{name} could not be read back before render.", code="gyro_output_mismatch") from exc
+        output = payload.get("output") if isinstance(payload, dict) else None
+        if not isinstance(output, dict):
+            raise CraftsError(f"{name} has no output section for the requested format.", code="gyro_output_mismatch")
+        mismatches = []
+        for key in ("codec", "codec_options", "pixel_format", "audio", "output_width", "output_height", "output_filename"):
+            if output.get(key) != expected[key]:
+                mismatches.append(f"{key}={output.get(key)!r}")
+        if output.get("output_folder") != folder:
+            mismatches.append("output_folder")
+        if mismatches:
+            raise CraftsError(
+                f"{name} would not render the requested gyro output ({', '.join(mismatches)}). Nothing was published.",
+                code="gyro_output_mismatch",
+            )
+    if not found:
+        raise CraftsError("No staged Gyroflow document was available to check.", code="gyro_output_mismatch")
+
+
+def _assert_rendered_contract(probed: dict, expected: dict) -> None:
+    video = (probed.get("video") or [None])[0] or {}
+    audios = probed.get("audio") if isinstance(probed.get("audio"), list) else []
+    problems = []
+    if video.get("codec") != expected["ffprobe_codec"]:
+        problems.append(f"codec {video.get('codec')}")
+    if video.get("pix_fmt") != expected["pixel_format"]:
+        problems.append(f"pixel format {video.get('pix_fmt')}")
+    if video.get("width") != expected["output_width"] or video.get("height") != expected["output_height"]:
+        problems.append(f"size {video.get('width')}x{video.get('height')}")
+    if expected["audio"] and not audios:
+        problems.append("missing audio")
+    if not expected["audio"] and audios:
+        problems.append("unexpected audio")
+    if problems:
+        raise CraftsError(
+            "The staged render does not match the requested gyro output ("
+            + ", ".join(problems)
+            + "). It was not published.",
+            code="gyro_output_mismatch",
+        )
 
 
 def _prepare_embedded_project(

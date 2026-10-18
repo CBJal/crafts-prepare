@@ -5,8 +5,17 @@ import os
 import threading
 from pathlib import Path
 
+import pytest
+
+from tests.gyro_sync import wait_for_fake_render
 from tests.test_gyroflow_adapter import _write_fake
 from tests.test_prepare import drain_job, import_clip
+
+
+@pytest.fixture(autouse=True)
+def _clear_encode_mode():
+    yield
+    os.environ.pop("GYRO_ENCODE", None)
 
 
 def _clips(client, media_dir):
@@ -254,11 +263,9 @@ def test_preflight_cancel_preset_precedence_and_empty_output(client, media_dir, 
     ).json()
     worker = threading.Thread(target=client.app.state.service.drain)
     worker.start()
-    for _ in range(80):
-        if ready.exists():
-            break
-        threading.Event().wait(0.05)
-    assert ready.exists()
+    running = wait_for_fake_render(client, queued["queued"][0]["id"], ready)
+    assert running["status"] == "running"
+    assert worker.is_alive()
     client.post(f"/api/jobs/{queued['queued'][0]['id']}/cancel")
     worker.join(15)
     assert not worker.is_alive()
@@ -306,12 +313,166 @@ def test_preflight_cancel_preset_precedence_and_empty_output(client, media_dir, 
     assert preset.read_bytes() == preset_hash
 
 
+def test_automatic_output_overrides_preset_and_rejects_a_different_encode(client, media_dir, tmp_path):
+    clip = import_clip(client, media_dir / "h264_8.mp4")
+    fake = tmp_path / "gyroflow_fake.py"
+    _write_fake(fake)
+    os.environ["GYRO_LOG"] = str(tmp_path / "argv.txt")
+    os.environ["GYRO_MEDIA"] = str(media_dir / "h264_8.mp4")
+    os.environ["GYRO_MODE"] = "ok"
+    os.environ["GYRO_META"] = "samples"
+    os.environ["GYRO_ENCODE"] = "1"
+    client.put("/api/settings", json={"gyroflow": str(fake)})
+    destination = tmp_path / "out"
+    destination.mkdir()
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    preset = tmp_path / "h264.gyroflow"
+    preset.write_text(
+        json.dumps(
+            {
+                "stabilization": {"fov": 1.25},
+                "lens_profile": {"name": "kept"},
+                "output": {
+                    "output_folder": foreign.resolve().as_uri() + "/",
+                    "output_filename": "preset.mp4",
+                    "codec": "H.264/AVC",
+                    "codec_options": "",
+                    "pixel_format": "yuv420p",
+                    "output_width": 1280,
+                    "output_height": 720,
+                    "audio": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = preset.read_bytes()
+    queued = client.post(
+        "/api/jobs/batch",
+        json={
+            "operation": "gyro",
+            "clip_ids": [clip["id"]],
+            "destination_dir": str(destination),
+            "suffix": "_prores",
+            "gyro": {
+                "format": "prores_422",
+                "audio": False,
+                "width": 640,
+                "height": 360,
+                "preset_path": str(preset),
+            },
+        },
+    )
+    assert queued.status_code == 200, queued.text
+    job = drain_job(client, queued.json()["queued"][0]["id"])
+    assert job["status"] == "succeeded", job
+    output = destination / "h264_8_prores.mov"
+    assert output.is_file()
+    probe = client.app.state.service._tools()
+    from app.probe import probe_file
+
+    probed = probe_file(probe[1], output)
+    video = probed["video"][0]
+    assert video["codec"] == "prores"
+    assert video["pix_fmt"] == "yuv422p10le"
+    assert video["width"] == 640
+    assert video["height"] == 360
+    assert probed["audio"] == []
+    assert list(foreign.iterdir()) == []
+    assert preset.read_bytes() == original
+
+    source_sized = client.post(
+        "/api/jobs/batch",
+        json={
+            "operation": "gyro",
+            "clip_ids": [clip["id"]],
+            "destination_dir": str(destination),
+            "suffix": "_source",
+            "gyro": {"format": "h264_mp4", "audio": True, "preset_path": str(preset)},
+        },
+    ).json()
+    sized = drain_job(client, source_sized["queued"][0]["id"])
+    assert sized["status"] == "succeeded", sized
+    sized_probe = probe_file(probe[1], destination / "h264_8_source.mp4")
+    assert sized_probe["video"][0]["width"] == 640
+    assert sized_probe["video"][0]["height"] == 360
+    assert sized_probe["video"][0]["codec"] == "h264"
+    assert sized_probe["audio"]
+    assert preset.read_bytes() == original
+
+    os.environ["GYRO_ENCODE"] = "force-h264"
+    forced = client.post(
+        "/api/jobs/batch",
+        json={
+            "operation": "gyro",
+            "clip_ids": [clip["id"]],
+            "destination_dir": str(destination),
+            "suffix": "_wrong",
+            "gyro": {"format": "prores_422", "audio": False, "width": 640, "height": 360, "preset_path": str(preset)},
+        },
+    ).json()
+    rejected = drain_job(client, forced["queued"][0]["id"])
+    assert rejected["status"] == "failed"
+    assert rejected["code"] == "gyro_output_mismatch"
+    assert not (destination / "h264_8_wrong.mov").exists()
+    assert preset.read_bytes() == original
+    os.environ.pop("GYRO_ENCODE", None)
+
+
+def test_motion_metadata_must_be_a_progressing_sequence_under_the_size_cap(tmp_path):
+    from app.gyroflow_cli import MAX_MOTION_BYTES, _motion_sample_count
+
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    valid = {
+        "raw_imu": [
+            {"timestamp_ms": 0, "gyro": [0.0, 0.1, -0.2], "accl": [0.0, 0.0, 1.0], "magn": None},
+            {"timestamp_ms": 0.5, "gyro": [0.2, 0.0, 0.0], "accl": [0.0, 0.0, 1.0], "magn": None},
+        ]
+    }
+    path = staging / "motion.json"
+    text = json.dumps(valid).encode()
+    path.write_bytes(text + b" " * (161_423_762 - len(text)))
+    assert path.stat().st_size == 161_423_762
+    assert MAX_MOTION_BYTES >= 161_423_762
+    assert _motion_sample_count(path, staging) == 2
+
+    huge = staging / "huge.json"
+    huge.write_bytes(b"{")
+    os.truncate(huge, MAX_MOTION_BYTES + 1)
+    try:
+        _motion_sample_count(huge, staging)
+    except Exception as exc:
+        assert getattr(exc, "code", "") == "gyro_motion_invalid"
+        assert "not decoded" in str(exc)
+    else:
+        raise AssertionError("oversized metadata was decoded")
+
+    for payload in (
+        {"raw_imu": [{"unexpected": 1}]},
+        {"raw_imu": []},
+        {"raw_imu": [{"timestamp_ms": 0, "gyro": [0, 0, 0]}]},
+        {"raw_imu": [{"timestamp_ms": float("nan"), "gyro": [0, 0, 0]}, {"timestamp_ms": 1, "gyro": [0, 0, 0]}]},
+        {"raw_imu": [{"timestamp_ms": 2, "gyro": [0, 0, 0]}, {"timestamp_ms": 1, "gyro": [0, 1, 0]}]},
+        {"detected_source": "rtmd"},
+    ):
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            _motion_sample_count(path, staging)
+        except Exception as exc:
+            assert getattr(exc, "code", "") == "gyro_motion_missing"
+        else:
+            raise AssertionError(payload)
+
+
 def test_running_batch_cancel_stops_only_that_batch(client, media_dir, tmp_path):
     first, second = _clips(client, media_dir)
     fake = tmp_path / "gyroflow_fake.py"
     _write_fake(fake)
     ready = tmp_path / "render-ready"
-    os.environ["GYRO_LOG"] = str(tmp_path / "argv.txt")
+    cancel_log = tmp_path / "cancel-argv.txt"
+    os.environ["GYRO_LOG"] = str(cancel_log)
     os.environ["GYRO_MEDIA"] = str(media_dir / "h264_8.mp4")
     os.environ["GYRO_MODE"] = "sleep"
     os.environ["GYRO_META"] = "samples"
@@ -345,11 +506,9 @@ def test_running_batch_cancel_stops_only_that_batch(client, media_dir, tmp_path)
     client.post(f"/api/jobs/{other['id']}/cancel")
     worker = threading.Thread(target=client.app.state.service.drain)
     worker.start()
-    for _ in range(80):
-        if Path(os.environ["GYRO_LOG"]).exists():
-            break
-        threading.Event().wait(0.05)
-    assert Path(os.environ["GYRO_LOG"]).exists()
+    running = wait_for_fake_render(client, gyro["queued"][0]["id"], cancel_log)
+    assert running["status"] == "running"
+    assert worker.is_alive()
     client.post(f"/api/jobs/batch/{gyro['batch_id']}/cancel")
     worker.join(15)
     assert not worker.is_alive()

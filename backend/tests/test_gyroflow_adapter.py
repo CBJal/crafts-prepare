@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 from app.gyroflow_cli import FORBIDDEN, build_argv, extract_gyroflow_version, launch_argv, parse_progress
+from tests.gyro_sync import wait_for_fake_render
 
 
 def test_argv_uses_public_flags_and_blocks_watch_shutdown_overwrite(tmp_path: Path):
@@ -93,10 +94,20 @@ if flag_value("--export-metadata"):
     empty_names = {item for item in os.environ.get("GYRO_META_EMPTY", "").split(",") if item}
     if meta == "invalid":
         target.write_text("{", encoding="utf-8")
+    elif meta == "malformed":
+        target.write_text(json.dumps({"raw_imu": [{"unexpected": 1}]}), encoding="utf-8")
+    elif meta == "flat":
+        target.write_text(json.dumps({"raw_imu": [
+            {"timestamp_ms": 1, "gyro": [0, 0, 0]},
+            {"timestamp_ms": 1, "gyro": [0, 0, 0]},
+        ]}), encoding="utf-8")
     elif meta == "absent" or media_name in empty_names:
         target.write_text(json.dumps({"detected_source": "none", "raw_imu": []}), encoding="utf-8")
     else:
-        target.write_text(json.dumps({"raw_imu": [{"timestamp_ms": 0, "gyro": [0, 0, 0]}], "detected_source": "synthetic"}), encoding="utf-8")
+        target.write_text(json.dumps({"raw_imu": [
+            {"timestamp_ms": 0, "gyro": [0, 0, 0], "accl": [0, 0, 1], "magn": None},
+            {"timestamp_ms": 0.5, "gyro": [0.1, 0, 0], "accl": [0, 0, 1], "magn": None},
+        ], "detected_source": "synthetic"}), encoding="utf-8")
     raise SystemExit(0)
 
 if "--export-project" in sys.argv:
@@ -157,6 +168,7 @@ def from_document(data):
     return Path(folder) / name
 preset_out = None
 project_out = None
+winner = None
 documents = []
 for arg in sys.argv:
     if not arg.endswith(".gyroflow") or not Path(arg).is_file():
@@ -173,10 +185,14 @@ for arg in sys.argv:
         project_out = chosen
     else:
         preset_out = chosen
+        winner = data.get("output")
 if preset_out is not None:
     out = preset_out
 elif project_out is not None:
     out = project_out
+    for _arg, data in documents:
+        if isinstance(data, dict) and data.get("videofile") and isinstance(data.get("output"), dict):
+            winner = data["output"]
 
 def locate(project_file, reference):
     if not isinstance(reference, str) or not reference.strip():
@@ -227,7 +243,37 @@ if mode == "fail":
 if mode == "empty":
     out.write_bytes(b"")
     raise SystemExit(0)
-shutil.copyfile(source_media, out)
+encode = os.environ.get("GYRO_ENCODE", "")
+if encode:
+    import shutil as _shutil
+    import subprocess
+    ffmpeg = _shutil.which("ffmpeg") or "ffmpeg"
+    spec = winner if isinstance(winner, dict) else {}
+    if encode == "force-h264":
+        codec, pix, width, height, audio = "H.264/AVC", "yuv420p", 1280, 720, True
+    else:
+        codec = spec.get("codec") or "H.264/AVC"
+        pix = spec.get("pixel_format") or "yuv420p"
+        width = int(spec.get("output_width") or 320)
+        height = int(spec.get("output_height") or 180)
+        audio = spec.get("audio", True)
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc=size={width}x{height}:rate=25:duration=0.2"]
+    if audio:
+        cmd += ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2", "-shortest"]
+    if codec == "ProRes" or pix == "yuv422p10le":
+        cmd += ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"]
+        if audio:
+            cmd += ["-c:a", "pcm_s16le"]
+    else:
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+        if audio:
+            cmd += ["-c:a", "aac"]
+    if not audio:
+        cmd.append("-an")
+    cmd.append(str(out))
+    subprocess.check_call(cmd)
+else:
+    shutil.copyfile(source_media, out)
 print("[0000000a] Rendering completed: ok", flush=True)
 """
     )
@@ -385,7 +431,8 @@ def test_file_appearing_at_final_path_is_preserved(client, media_dir: Path, tmp_
 
     os.environ["GYRO_MODE"] = "sleep"
     ready.unlink(missing_ok=True)
-    log.unlink(missing_ok=True)
+    cancel_log = tmp_path / "cancel-argv.txt"
+    os.environ["GYRO_LOG"] = str(cancel_log)
     cancel_out = tmp_path / "cancel.mp4"
     queued = client.post(
         "/api/jobs/gyroflow",
@@ -393,14 +440,13 @@ def test_file_appearing_at_final_path_is_preserved(client, media_dir: Path, tmp_
     ).json()
     worker = threading.Thread(target=client.app.state.service.drain)
     worker.start()
-    for _ in range(50):
-        if log.exists():
-            break
-        threading.Event().wait(0.05)
-    assert log.exists()
+    running = wait_for_fake_render(client, queued["id"], cancel_log)
+    assert running["status"] == "running"
+    assert worker.is_alive()
     cancel_out.write_bytes(b"preserve-cancel")
     client.post(f"/api/jobs/{queued['id']}/cancel")
-    worker.join(10)
+    worker.join(15)
+    assert not worker.is_alive()
     job = next(item for item in client.get("/api/jobs").json()["jobs"] if item["id"] == queued["id"])
     assert job["status"] == "cancelled"
     assert cancel_out.read_bytes() == b"preserve-cancel"

@@ -126,14 +126,22 @@ p { color: var(--muted); }
 .chip { border-radius: 999px; padding: 0.15rem 0.5rem; border: 1px solid var(--line); font-size: 0.8rem; color: var(--muted); }
 .chip.ok { color: var(--ok); }
 .notice { margin: 0; color: var(--ink); }
-.workspace { display: grid; grid-template-columns: 300px minmax(0, 1fr) 320px; gap: 0.75rem; min-height: 62vh; }
+.workspace { display: grid; grid-template-columns: 300px minmax(0, 1fr) 320px; gap: 0.75rem; min-height: 62vh; align-items: start; }
 .library, .viewer, .inspector, .queue, .settings, .batch-panel {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 0.85rem;
 }
-.library ul, .jobs { list-style: none; margin: 0.55rem 0 0; padding: 0; display: grid; gap: 0.35rem; }
+.library {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 8.5rem);
+  min-height: 0;
+  overflow: hidden;
+}
+.library ul, .jobs { list-style: none; margin: 0.55rem 0 0; padding: 0; display: grid; gap: 0.35rem; align-content: start; }
+.library ul { overflow: auto; min-height: 0; flex: 1 1 auto; }
 .clip-row { display: grid; grid-template-columns: auto 1fr; gap: 0.35rem; align-items: start; }
 .clip-check { display: flex; align-items: center; padding-top: 0.7rem; }
 .clip-check input { width: auto; }
@@ -194,4 +202,5 @@ fieldset { border: 1px solid var(--line); border-radius: 8px; margin-top: 0.7rem
 }
 @media (max-width: 1100px) {
   .workspace { grid-template-columns: 1fr; }
+  .library { max-height: 46vh; }
 }

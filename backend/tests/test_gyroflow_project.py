@@ -4,57 +4,12 @@ import hashlib
 import json
 import os
 import threading
-import time
 from pathlib import Path
 
 from app.gyroflow_cli import resolve_reference, stage_gyroflow_document
+from tests.gyro_sync import wait_for_fake_render as _wait_for_fake_render
 from tests.test_gyroflow_adapter import _write_fake
 from tests.test_prepare import drain_job
-
-_TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
-
-
-def _job_view(client, job_id: str) -> dict:
-    service = client.app.state.service
-    with service.lock:
-        job = next(item for item in service.project["jobs"] if item["id"] == job_id)
-        error = job.get("error")
-        if isinstance(error, str) and len(error) > 500:
-            error = error[:500]
-        return {"status": job.get("status"), "code": job.get("code"), "error": error}
-
-
-def _wait_for_fake_render(client, job_id: str, ready: Path, *, timeout: float = 20.0) -> dict:
-    """Wait until the fake render process has created `ready`, or the job has finished.
-
-    A short blind sleep treats a slow Windows interpreter start the same as a
-    job that already failed before the render. Terminal state fails immediately
-    with the job's status, code, and error. The bound is long enough for a
-    cold Python 3.14 process start and still returns as soon as the file exists.
-    """
-    started = time.monotonic()
-    last = {"status": None, "code": None, "error": None}
-    while True:
-        elapsed = time.monotonic() - started
-        if ready.is_file():
-            last = _job_view(client, job_id)
-            if last["status"] in _TERMINAL:
-                raise AssertionError(_render_diag("fake render file appeared after the job finished", last, ready, elapsed))
-            return last
-        last = _job_view(client, job_id)
-        if last["status"] in _TERMINAL:
-            raise AssertionError(_render_diag("job finished before the fake render started", last, ready, elapsed))
-        if elapsed >= timeout:
-            raise AssertionError(_render_diag(f"fake render did not start within {timeout:.0f}s", last, ready, elapsed))
-        threading.Event().wait(0.05)
-
-
-def _render_diag(reason: str, job: dict, ready: Path, elapsed: float) -> str:
-    return (
-        f"{reason} after {elapsed:.2f}s: status={job.get('status')} code={job.get('code')} "
-        f"error={job.get('error')!r} mode={os.environ.get('GYRO_MODE')!r} "
-        f"ready={ready} exists={ready.exists()}"
-    )
 
 
 def _sha(path: Path) -> str:
@@ -86,6 +41,59 @@ def _project(folder: Path, media: Path, *, relative: str, extra: dict | None = N
     path.write_text(json.dumps(payload), encoding="utf-8")
     (folder / "project-output").mkdir(exist_ok=True)
     return path
+
+
+def test_automatic_overrides_replace_preset_output_fields_only(tmp_path: Path, media_dir: Path):
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    media = folder / "clip.mp4"
+    media.write_bytes((media_dir / "h264_8.mp4").read_bytes())
+    preset = folder / "look.gyroflow"
+    preset.write_text(
+        json.dumps(
+            {
+                "stabilization": {"fov": 1.25},
+                "lens_profile": {"name": "kept"},
+                "output": {
+                    "codec": "H.264/AVC",
+                    "pixel_format": "yuv420p",
+                    "output_width": 1280,
+                    "output_height": 720,
+                    "audio": True,
+                    "output_folder": "file:///not-used/",
+                    "output_filename": "old.mp4",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = preset.read_bytes()
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    staged = stage_gyroflow_document(
+        preset,
+        staging,
+        staging / "staged.mov",
+        role="preset",
+        output_overrides={
+            "codec": "ProRes",
+            "codec_options": "Standard",
+            "pixel_format": "yuv422p10le",
+            "audio": False,
+            "output_width": 640,
+            "output_height": 360,
+        },
+    )
+    body = json.loads(staged.read_text(encoding="utf-8"))
+    assert body["stabilization"]["fov"] == 1.25
+    assert body["lens_profile"]["name"] == "kept"
+    assert body["output"]["codec"] == "ProRes"
+    assert body["output"]["codec_options"] == "Standard"
+    assert body["output"]["pixel_format"] == "yuv422p10le"
+    assert body["output"]["audio"] is False
+    assert body["output"]["output_width"] == 640
+    assert body["output"]["output_height"] == 360
+    assert preset.read_bytes() == before
 
 
 def test_reference_resolution_keeps_absolute_forms(tmp_path: Path):

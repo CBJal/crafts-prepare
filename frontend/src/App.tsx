@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
+import { nextChecked } from "./selection";
 import type { Capabilities, Clip, Job } from "./types";
 
 const FLAGS = ["", "OK", "KEEP", "NG"] as const;
@@ -114,15 +115,10 @@ export function App() {
     setJobs(queue.jobs);
     setProjectName(project.name);
     const nextPath = project.path ?? "";
-    if (project.path) setProjectPath(project.path);
-    setChecked((current) => {
-      const previous = libraryPath.current;
-      const switched = previous !== undefined && previous !== "" && nextPath !== "" && previous !== nextPath;
-      if (switched) return [];
-      const ids = new Set(project.clips.map((clip) => clip.id));
-      return current.filter((id) => ids.has(id));
-    });
+    const previousPath = libraryPath.current;
     libraryPath.current = nextPath;
+    if (project.path) setProjectPath(project.path);
+    setChecked((current) => nextChecked(current, previousPath, nextPath, project.clips.map((clip) => clip.id)));
     setSelectedId((current) => (current && project.clips.some((clip) => clip.id === current) ? current : project.clips[0]?.id ?? null));
   }
 
@@ -760,7 +756,7 @@ export function App() {
             <ul className="problems">
               {batchProblems.map((problem) => (
                 <li key={`${problem.clip_id}-${problem.code}-${problem.message}`}>
-                  {problem.clip_id ?? "Batch"}: {problem.message}
+                  {clips.find((clip) => clip.id === problem.clip_id)?.name ?? problem.clip_id ?? "Batch"}: {problem.message}
                 </li>
               ))}
             </ul>
