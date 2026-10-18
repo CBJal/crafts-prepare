@@ -54,7 +54,10 @@ def extract_thumbnail(
 
 
 def browser_playable(probe: dict) -> bool:
-    video = (probe.get("video") or [None])[0]
+    videos = probe.get("video") if isinstance(probe, dict) else None
+    if not isinstance(videos, list) or not videos or not isinstance(videos[0], dict):
+        return False
+    video = videos[0]
     if not video:
         return False
     codec = (video.get("codec") or "").lower()

@@ -93,6 +93,78 @@ def test_malformed_probe_trim_markers_and_job_do_not_replace_state(client, media
     assert base.is_file()
 
 
+def test_missing_probe_collections_and_unrenderable_job_fields(client, media_dir, tmp_path):
+    clip = import_clip(client, media_dir / "h264_8.mp4")
+    _base, payload = _saved_payload(client, tmp_path, clip["id"])
+    original_path = client.get("/api/project").json()["path"]
+
+    def reject(name: str, mutate) -> None:
+        body = json.loads(json.dumps(payload))
+        mutate(body)
+        path = tmp_path / f"{name}.crafts.json"
+        path.write_text(json.dumps(body), encoding="utf-8")
+        _reject_open(client, path, clip["id"])
+        assert client.get("/api/project").json()["path"] == original_path
+
+    reject("empty-probe", lambda body: body["clips"][0].__setitem__("probe", {}))
+    for key in ("video", "audio", "data"):
+        reject(f"missing-{key}", lambda body, key=key: body["clips"][0]["probe"].pop(key))
+        reject(f"null-{key}", lambda body, key=key: body["clips"][0]["probe"].__setitem__(key, None))
+        reject(f"type-{key}", lambda body, key=key: body["clips"][0]["probe"].__setitem__(key, {"not": "a list"}))
+    reject("null-video-entry", lambda body: body["clips"][0]["probe"].__setitem__("video", [None]))
+    reject("empty-video", lambda body: body["clips"][0]["probe"].__setitem__("video", []))
+
+    reject(
+        "bad-kind",
+        lambda body: body["jobs"].append(
+            {"id": "bad-kind", "kind": {"export": True}, "status": "paused", "progress": 0, "attempt": 1, "request": {}}
+        ),
+    )
+    reject(
+        "bad-status",
+        lambda body: body["jobs"].append(
+            {"id": "bad-status", "kind": "export", "status": ["paused"], "progress": 0, "attempt": 1, "request": {}}
+        ),
+    )
+    request = {
+        "clip_id": clip["id"],
+        "preset_id": {"id": "h264_mp4"},
+        "in_seconds": 0,
+        "out_seconds": 0.4,
+        "destination_dir": str(tmp_path),
+        "filename": "clip.mp4",
+        "audio": False,
+    }
+    reject(
+        "bad-preset",
+        lambda body: body["jobs"].append(
+            {"id": "bad-preset", "kind": "export", "status": "paused", "progress": 0, "attempt": 1, "request": request}
+        ),
+    )
+    bad_result = {
+        "output_path": {"path": "out.mp4"},
+        "conversion": {"message": {"text": "converted"}},
+        "stabilization": {"label": {"text": "vidstab"}, "mode": "vidstab", "kind": "visual"},
+    }
+    named = dict(request)
+    named["preset_id"] = "h264_mp4"
+    named["filename"] = {"name": "clip.mp4"}
+    reject(
+        "bad-rendered-fields",
+        lambda body: body["jobs"].append(
+            {
+                "id": "bad-rendered",
+                "kind": "export",
+                "status": "succeeded",
+                "progress": 1,
+                "attempt": 1,
+                "request": named,
+                "result": bad_result,
+            }
+        ),
+    )
+
+
 def test_save_refuses_empty_foreign_and_oversize_files(client, tmp_path):
     empty = tmp_path / "empty.crafts.json"
     empty.write_bytes(b"")

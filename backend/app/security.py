@@ -281,7 +281,8 @@ def rename_noreplace(src: Path, dst: Path) -> None:
     if err in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM}:
         raise CraftsError(
             "This filesystem cannot publish a finished file without the risk of replacing "
-            f"an existing one. The staged bytes were left at {src} and were not published.",
+            "an existing one. Nothing was published. The source file was not changed, "
+            "and the staging file for this attempt is removed.",
             code="publish_unsupported",
             status=409,
         )

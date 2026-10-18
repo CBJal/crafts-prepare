@@ -846,13 +846,14 @@ def _validate_probe(probe: dict) -> None:
         if not 0 <= float(duration) <= 86400 * 48:
             raise CraftsError("Clip duration is out of range.", code="bad_project")
     for key in ("video", "audio", "data"):
-        entries = probe.get(key, [])
-        if not isinstance(entries, list):
-            raise CraftsError(f"Clip {key} streams must be a list.", code="bad_project")
-        for entry in entries:
+        if key not in probe or probe[key] is None or not isinstance(probe[key], list):
+            raise CraftsError(f"Clip probe is missing a {key} stream list.", code="bad_project")
+        for entry in probe[key]:
             if not isinstance(entry, dict):
                 raise CraftsError(f"Clip {key} stream entries must be objects.", code="bad_project")
             _validate_stream(entry, kind=key)
+    if not probe["video"]:
+        raise CraftsError("Clip probe has no video stream.", code="bad_project")
     if "tags" in probe and probe["tags"] is not None and not isinstance(probe["tags"], dict):
         raise CraftsError("Clip tags must be an object.", code="bad_project")
     timecode = probe.get("timecode")
@@ -861,12 +862,16 @@ def _validate_probe(probe: dict) -> None:
 
 
 def _validate_stream(entry: dict, *, kind: str) -> None:
-    codec = entry.get("codec")
-    if codec is not None and (not isinstance(codec, str) or len(codec) > 80):
-        raise CraftsError("Stream codec is invalid.", code="bad_project")
-    pix = entry.get("pix_fmt")
-    if pix is not None and (not isinstance(pix, str) or len(pix) > 80):
-        raise CraftsError("Stream pixel format is invalid.", code="bad_project")
+    for text_key in ("codec", "profile", "pix_fmt", "frame_rate", "codec_tag", "color_space", "color_transfer", "color_primaries", "color_range"):
+        if text_key not in entry or entry[text_key] is None:
+            continue
+        if not isinstance(entry[text_key], str) or len(entry[text_key]) > 80:
+            raise CraftsError("Stream text fields must be text.", code="bad_project")
+    if kind == "video":
+        for axis in ("width", "height"):
+            value = entry.get(axis)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 16384:
+                raise CraftsError("A video stream needs integer width and height.", code="bad_project")
     for axis in ("width", "height"):
         if axis not in entry or entry[axis] is None:
             continue
@@ -949,9 +954,10 @@ def _validate_stored_job(job: object, seen: set[str], clip_ids: set[str]) -> dic
         raise CraftsError("Job id is missing or duplicated.", code="bad_project")
     seen.add(job_id)
     kind = job.get("kind")
-    if kind not in {"export", "gyroflow"}:
+    if not isinstance(kind, str) or kind not in {"export", "gyroflow"}:
         raise CraftsError("Job kind is invalid.", code="bad_project")
-    if job.get("status") not in {"queued", "running", "paused", "succeeded", "failed", "cancelled", "interrupted"}:
+    status = job.get("status")
+    if not isinstance(status, str) or status not in {"queued", "running", "paused", "succeeded", "failed", "cancelled", "interrupted"}:
         raise CraftsError("Job status is invalid. It was not queued.", code="bad_project")
     request = job.get("request")
     if not isinstance(request, dict):
@@ -970,9 +976,34 @@ def _validate_stored_job(job: object, seen: set[str], clip_ids: set[str]) -> dic
     for key in ("error", "code"):
         if job.get(key) is not None and not isinstance(job.get(key), str):
             raise CraftsError("Job error text is invalid.", code="bad_project")
-    if job.get("result") is not None and not isinstance(job.get("result"), dict):
-        raise CraftsError("Job result is invalid.", code="bad_project")
+    if job.get("result") is not None:
+        _validate_job_result(job.get("result"))
+    filename = request.get("filename")
+    if filename is not None and not isinstance(filename, str):
+        raise CraftsError("Job filename must be text.", code="bad_project")
     return dict(job)
+
+
+def _validate_job_result(result: object) -> None:
+    if not isinstance(result, dict):
+        raise CraftsError("Job result is invalid.", code="bad_project")
+    output_path = result.get("output_path")
+    if output_path is not None and not isinstance(output_path, str):
+        raise CraftsError("Job output path must be text.", code="bad_project")
+    conversion = result.get("conversion")
+    if conversion is not None:
+        if not isinstance(conversion, dict) or not isinstance(conversion.get("message"), str):
+            raise CraftsError("Job conversion message must be text.", code="bad_project")
+    stabilization = result.get("stabilization")
+    if stabilization is not None:
+        if not isinstance(stabilization, dict):
+            raise CraftsError("Job stabilization record is invalid.", code="bad_project")
+        label = stabilization.get("label")
+        if label is not None and not isinstance(label, str):
+            raise CraftsError("Job stabilization label must be text.", code="bad_project")
+        for key in ("mode", "kind"):
+            if key in stabilization and not isinstance(stabilization.get(key), str):
+                raise CraftsError("Job stabilization fields must be text.", code="bad_project")
 
 
 def _validate_export_request(request: dict, clip_ids: set[str]) -> None:
@@ -981,7 +1012,8 @@ def _validate_export_request(request: dict, clip_ids: set[str]) -> None:
     clip_id = request.get("clip_id")
     if not isinstance(clip_id, str) or clip_id not in clip_ids:
         raise CraftsError("Export job does not reference a clip in this project.", code="bad_project")
-    if request.get("preset_id") not in PRESETS:
+    preset_id = request.get("preset_id")
+    if not isinstance(preset_id, str) or preset_id not in PRESETS:
         raise CraftsError("Export job preset is invalid.", code="bad_project")
     trim_in = _finite_number("Export in", request.get("in_seconds"), code="bad_project")
     trim_out = _finite_number("Export out", request.get("out_seconds"), code="bad_project")
@@ -1037,7 +1069,11 @@ def new_project() -> dict:
 
 
 def public_clip(clip: dict) -> dict:
-    video = (clip["probe"].get("video") or [{}])[0]
+    probe = clip.get("probe") if isinstance(clip.get("probe"), dict) else {}
+    videos = probe.get("video") if isinstance(probe.get("video"), list) else []
+    video = videos[0] if videos and isinstance(videos[0], dict) else {}
+    audios = probe.get("audio") if isinstance(probe.get("audio"), list) else []
+    data = probe.get("data") if isinstance(probe.get("data"), list) else []
     return {
         "id": clip["id"],
         "path": clip["path"],
@@ -1049,19 +1085,19 @@ def public_clip(clip: dict) -> dict:
         "markers": clip.get("markers") or [],
         "trim_in": clip.get("trim_in") or 0,
         "trim_out": clip.get("trim_out") or 0,
-        "browser_playable": browser_playable(clip["probe"]),
-        "probe": clip["probe"],
+        "browser_playable": browser_playable(probe),
+        "probe": probe,
         "summary": {
-            "codec": video.get("codec"),
-            "width": video.get("width"),
-            "height": video.get("height"),
-            "pix_fmt": video.get("pix_fmt"),
-            "bit_depth": video.get("bit_depth"),
-            "frame_rate": video.get("frame_rate"),
-            "duration": clip["probe"].get("duration"),
-            "timecode": clip["probe"].get("timecode"),
-            "audio_codecs": [item.get("codec") for item in clip["probe"].get("audio") or []],
-            "data_streams": len(clip["probe"].get("data") or []),
+            "codec": video.get("codec") if isinstance(video.get("codec"), str) else None,
+            "width": video.get("width") if isinstance(video.get("width"), int) else None,
+            "height": video.get("height") if isinstance(video.get("height"), int) else None,
+            "pix_fmt": video.get("pix_fmt") if isinstance(video.get("pix_fmt"), str) else None,
+            "bit_depth": video.get("bit_depth") if isinstance(video.get("bit_depth"), int) else None,
+            "frame_rate": video.get("frame_rate") if isinstance(video.get("frame_rate"), str) else None,
+            "duration": probe.get("duration") if isinstance(probe.get("duration"), (int, float)) else None,
+            "timecode": probe.get("timecode") if isinstance(probe.get("timecode"), str) else None,
+            "audio_codecs": [item.get("codec") if isinstance(item, dict) and isinstance(item.get("codec"), str) else None for item in audios],
+            "data_streams": len(data),
         },
     }
 

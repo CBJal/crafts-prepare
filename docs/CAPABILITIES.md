@@ -15,7 +15,7 @@ Status below is what this repository implements. "Verified here" means an automa
 | Browser preview for H.264 yuv420p | Implemented | Linux Chrome smoke: import, metadata, play, trim 0–1s, H.264 export succeeded. Output probed as 1.000s, 640×360, yuv420p, 25/1, AAC. Windows UI was not driven |
 | Proxy or still for other codecs | Implemented | Viewing proxy is a `<video>` element, capped at 60 seconds. Stills and export share one filter graph passed as a single `-vf` argument |
 | In/out trim in seconds, rational frame display | Implemented | Export duration checked within one frame |
-| Project JSON with OK/KEEP/NG, notes, markers, queue | Implemented | Nested probe entries, trims, markers, and job requests are checked before the live project is replaced. A failed open leaves the current project usable. Queued work stays paused until Retry |
+| Project JSON with OK/KEEP/NG, notes, markers, queue | Implemented | A saved probe must include video, audio, and data lists and at least one video object. Nested fields the UI renders must be text or numbers. A failed open leaves the current project usable. Queued work stays paused until Retry |
 | H.264 MP4 and ProRes 422 MOV export | Implemented when those encoders exist | Yes on this ffmpeg: trimmed/resized H.264 and trimmed ProRes, then decoded |
 | HEVC Main, HEVC Main10, DNxHR HQ, DNxHR HQX | Offered only if the encoder exists | HEVC 10-bit source was converted to H.264 only after acknowledgement. DNxHR HQ was probed. A DNxHR export preset exists and was not the required export pair |
 | Explicit bit-depth declaration | Implemented | 10-bit to 8-bit is rejected until acknowledged |

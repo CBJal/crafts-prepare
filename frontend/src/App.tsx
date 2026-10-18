@@ -4,6 +4,14 @@ import type { Capabilities, Clip, Job } from "./types";
 
 const FLAGS = ["", "OK", "KEEP", "NG"] as const;
 
+function asText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
 function frameLabel(seconds: number, rate: string | null): string {
   if (!rate || !rate.includes("/")) return seconds.toFixed(3) + " s";
   const [num, den] = rate.split("/").map(Number);
@@ -223,7 +231,13 @@ export function App() {
     setNotice("Auto filled the vidstab numbers. They are sent to vidstabdetect and vidstabtransform.");
   }
 
-  const video = selected?.probe.video[0];
+  const probe = asRecord(selected?.probe);
+  const videoList = Array.isArray(probe?.video) ? probe.video.map(asRecord).filter((item) => item !== null) : [];
+  const video = videoList[0];
+  const dataStreams = Array.isArray(probe?.data) ? probe.data.map(asRecord).filter((item) => item !== null) : [];
+  const audioCodecs = Array.isArray(selected?.summary?.audio_codecs)
+    ? selected.summary.audio_codecs.filter((item): item is string => typeof item === "string")
+    : [];
   const activePreset = caps?.presets.find((item) => item.id === preset);
 
   return (
@@ -371,11 +385,12 @@ export function App() {
               <dd>{formatBytes(selected.size)}</dd>
               <dt>Codec</dt>
               <dd>
-                {video.codec} {video.profile ? `· ${video.profile}` : ""}
+                {asText(video.codec) || "unknown"} {asText(video.profile) ? `· ${asText(video.profile)}` : ""}
               </dd>
               <dt>Frame</dt>
               <dd>
-                {video.width}×{video.height} · {video.pix_fmt} · {video.bit_depth ?? "unknown"}-bit · {video.frame_rate}
+                {typeof video.width === "number" ? video.width : "?"}×{typeof video.height === "number" ? video.height : "?"} · {asText(video.pix_fmt) || "unknown"} ·{" "}
+                {typeof video.bit_depth === "number" ? video.bit_depth : "unknown"}-bit · {asText(video.frame_rate) || "unknown"}
               </dd>
               <dt>Duration</dt>
               <dd>{selected.summary.duration ?? "unknown"} s</dd>
@@ -383,15 +398,15 @@ export function App() {
               <dd>{selected.probe.timecode ?? "none in the probed tags"}</dd>
               <dt>Color</dt>
               <dd>
-                {[video.color_primaries, video.color_transfer, video.color_space, video.color_range].filter(Boolean).join(" · ") || "no color tags"}
+                {[video.color_primaries, video.color_transfer, video.color_space, video.color_range].map(asText).filter(Boolean).join(" · ") || "no color tags"}
               </dd>
               <dt>Audio</dt>
-              <dd>{selected.summary.audio_codecs.filter(Boolean).join(", ") || "none"}</dd>
+              <dd>{audioCodecs.join(", ") || "none"}</dd>
               <dt>Data streams</dt>
               <dd>
-                {selected.probe.data.length === 0
+                {dataStreams.length === 0
                   ? "ffprobe listed none. That is not a claim that gyro metadata is absent."
-                  : selected.probe.data.map((stream) => stream.codec || stream.codec_tag || "data").join(", ")}
+                  : dataStreams.map((stream) => asText(stream.codec) || asText(stream.codec_tag) || "data").join(", ")}
               </dd>
             </dl>
           ) : (
@@ -544,32 +559,44 @@ export function App() {
         {activePreset && <p className="preset-note">{activePreset.reason || `${activePreset.label} declares ${activePreset.pix_fmt}, ${activePreset.bit_depth}-bit.`}</p>}
         <ul className="jobs">
           {jobs.length === 0 && <li className="empty">Queue is empty.</li>}
-          {jobs.map((job) => (
-            <li key={job.id} className={`job job-${job.status}`}>
+          {jobs.map((job) => {
+            const request = asRecord(job.request);
+            const result = asRecord(job.result);
+            const filename = asText(request?.filename);
+            const kind = asText(job.kind) || "job";
+            const status = asText(job.status) || "unknown";
+            const conversion = asText(asRecord(result?.conversion)?.message);
+            const stabLabel = asText(asRecord(result?.stabilization)?.label);
+            const outputPath = asText(result?.output_path);
+            const errorText = asText(job.error);
+            const attempt = typeof job.attempt === "number" ? job.attempt : 0;
+            return (
+            <li key={job.id} className={`job job-${status}`}>
               <div>
-                <strong>{job.request.filename || job.kind}</strong>
+                <strong>{filename || kind}</strong>
                 <span>
-                  {job.status} · attempt {job.attempt} · {Math.round((job.progress || 0) * 100)}%
+                  {status} · attempt {attempt} · {Math.round((Number(job.progress) || 0) * 100)}%
                 </span>
-                {job.result?.conversion?.message && <p>{job.result.conversion.message}</p>}
-                {job.result?.stabilization?.label && <p>{job.result.stabilization.label}</p>}
-                {job.error && <p className="error">{job.error}</p>}
-                {job.result?.output_path && <p className="mono">{job.result.output_path}</p>}
+                {conversion && <p>{conversion}</p>}
+                {stabLabel && <p>{stabLabel}</p>}
+                {errorText && <p className="error">{errorText}</p>}
+                {outputPath && <p className="mono">{outputPath}</p>}
               </div>
               <div className="job-actions">
-                {(job.status === "queued" || job.status === "running") && (
+                {(status === "queued" || status === "running") && (
                   <button className="ghost" onClick={() => api.cancel(job.id).then(refresh)}>
                     Cancel
                   </button>
                 )}
-                {["failed", "cancelled", "interrupted", "paused"].includes(job.status) && (
+                {["failed", "cancelled", "interrupted", "paused"].includes(status) && (
                   <button className="ghost" onClick={() => api.retry(job.id).then(refresh)}>
                     Retry
                   </button>
                 )}
               </div>
             </li>
-          ))}
+            );
+          })}
         </ul>
       </section>
 
