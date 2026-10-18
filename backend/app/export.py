@@ -258,9 +258,10 @@ def run_export(
             pix_fmt=preset["pix_fmt"],
             audio=audio,
         )
-        publish_exclusive(partial, final, source)
+        published = publish_exclusive(partial, final, source)
         return {
             "output_path": str(final),
+            "published_identity": published,
             "validation": checked,
             "conversion": note,
             "stabilization": _stab_label(spec),

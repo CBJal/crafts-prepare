@@ -101,4 +101,4 @@ Point Capabilities at `target/release/crafts-telemetry` (or `crafts-telemetry.ex
 - Requests must use a loopback Host. A foreign Origin is rejected.
 - Subprocess commands are argument lists.
 - Export names are a restricted character set, so a suffix cannot become an ffmpeg filter.
-- Outputs are written to a `.crafts-partial` file, probed, then linked into place. Failures delete the partial. Existing outputs and the source file are not overwritten, including symlink aliases.
+- Outputs are written to a staging file, probed, then published. Publication is a hard link when the filesystem allows it. Otherwise Windows `os.rename` or Linux `renameat2` with `RENAME_NOREPLACE` is used, both of which leave an existing destination untouched. POSIX `os.rename` is not used, and an empty placeholder is never created at the final name. If neither hard links nor a no-replace rename are available, the staged file is kept and nothing is published. A later cleanup deletes a published file only when it is still the same inode this job created.

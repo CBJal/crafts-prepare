@@ -23,7 +23,15 @@ from .presets import PRESETS, conversion_note, preset_availability
 from .preview import PROXY_LIMIT_SECONDS, browser_playable, extract_thumbnail, make_proxy
 from .probe import discover_executable
 from .process import run_captured
-from .security import MAX_PROJECT_BYTES, exclusive_output, resolve_existing, safe_filename, same_file
+from .security import (
+    MAX_PROJECT_BYTES,
+    discard_owned_output,
+    exclusive_output,
+    resolve_existing,
+    safe_filename,
+    safe_suffix,
+    same_file,
+)
 
 SCHEMA = "crafts-prepare.project"
 VERSION = 1
@@ -534,10 +542,9 @@ class Service:
         after = sha256_file(source)
         if after != before:
             output = Path(result.get("output_path") or "")
-            if output.exists() and not same_file(output, source):
-                output.unlink()
+            discard_owned_output(output, result.get("published_identity"), source)
             raise CraftsError(
-                "Source checksum changed during export. Any published output was removed.",
+                "Source checksum changed during export. The published file was removed only if it was still the file this job created.",
                 code="source_changed",
             )
         result["source_sha256_unchanged"] = True
@@ -608,7 +615,11 @@ class Service:
         if size > MAX_PROJECT_BYTES:
             raise CraftsError("Project file is too large.", code="too_large")
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise CraftsError("Project file is not UTF-8.", code="bad_project") from exc
+        try:
+            payload = json.loads(text)
         except json.JSONDecodeError as exc:
             raise CraftsError("Project file is not JSON.", code="bad_project") from exc
         document = validate_project_document(payload)
@@ -744,12 +755,12 @@ class Service:
                 raise CraftsError("Refusing to use a source clip as the project file.", code="source_overwrite")
 
 
-def _finite_number(label: str, value) -> float:
+def _finite_number(label: str, value, *, code: str = "bad_trim") -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise CraftsError(f"{label} must be a number.", code="bad_trim")
+        raise CraftsError(f"{label} must be a number.", code=code)
     number = float(value)
     if not math.isfinite(number):
-        raise CraftsError(f"{label} must be a finite number.", code="bad_trim")
+        raise CraftsError(f"{label} must be a finite number.", code=code)
     return number
 
 
@@ -773,7 +784,7 @@ def validate_project_document(payload: object) -> dict:
     seen_clips: set[str] = set()
     seen_jobs: set[str] = set()
     cleaned_clips = [_validate_stored_clip(clip, seen_clips) for clip in clips]
-    cleaned_jobs = [_validate_stored_job(job, seen_jobs) for job in jobs]
+    cleaned_jobs = [_validate_stored_job(job, seen_jobs, seen_clips) for job in jobs]
     return {
         "schema": SCHEMA,
         "version": VERSION,
@@ -801,44 +812,224 @@ def _validate_stored_clip(clip: object, seen: set[str]) -> dict:
     size = clip.get("size")
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise CraftsError("Clip size is invalid.", code="bad_project")
-    if not isinstance(clip.get("probe"), dict):
+    probe = clip.get("probe")
+    if not isinstance(probe, dict):
         raise CraftsError("Clip probe data is invalid.", code="bad_project")
+    _validate_probe(probe)
+    if "flag" in clip and not isinstance(clip.get("flag"), str):
+        raise CraftsError("Clip flag is invalid.", code="bad_project")
     flag = clip.get("flag") or ""
     if flag not in {"", "OK", "KEEP", "NG"}:
         raise CraftsError("Clip flag is invalid.", code="bad_project")
-    notes = clip.get("notes") or ""
-    if not isinstance(notes, str) or len(notes) > 8000:
+    if "notes" in clip and not isinstance(clip.get("notes"), str):
         raise CraftsError("Clip notes are invalid.", code="bad_project")
-    markers = clip.get("markers") or []
-    if not isinstance(markers, list) or len(markers) > 200:
-        raise CraftsError("Clip markers are invalid.", code="bad_project")
-    _finite_number("Trim in", clip.get("trim_in", 0))
-    _finite_number("Trim out", clip.get("trim_out", 0))
+    notes = clip.get("notes") or ""
+    if len(notes) > 8000:
+        raise CraftsError("Clip notes are invalid.", code="bad_project")
+    markers = _validate_markers(clip.get("markers") or [], probe.get("duration"))
+    trim_in = _finite_number("Trim in", clip.get("trim_in", 0), code="bad_project")
+    trim_out = _finite_number("Trim out", clip.get("trim_out", 0), code="bad_project")
+    _validate_trim(trim_in, trim_out, probe)
     checked = dict(clip)
     checked["flag"] = flag
     checked["notes"] = notes
     checked["markers"] = markers
+    checked["trim_in"] = trim_in
+    checked["trim_out"] = trim_out
     return checked
 
 
-def _validate_stored_job(job: object, seen: set[str]) -> dict:
+def _validate_probe(probe: dict) -> None:
+    duration = probe.get("duration")
+    if duration is not None:
+        _finite_number("Duration", duration, code="bad_project")
+        if not 0 <= float(duration) <= 86400 * 48:
+            raise CraftsError("Clip duration is out of range.", code="bad_project")
+    for key in ("video", "audio", "data"):
+        entries = probe.get(key, [])
+        if not isinstance(entries, list):
+            raise CraftsError(f"Clip {key} streams must be a list.", code="bad_project")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise CraftsError(f"Clip {key} stream entries must be objects.", code="bad_project")
+            _validate_stream(entry, kind=key)
+    if "tags" in probe and probe["tags"] is not None and not isinstance(probe["tags"], dict):
+        raise CraftsError("Clip tags must be an object.", code="bad_project")
+    timecode = probe.get("timecode")
+    if timecode is not None and (not isinstance(timecode, str) or len(timecode) > 64):
+        raise CraftsError("Clip timecode is invalid.", code="bad_project")
+
+
+def _validate_stream(entry: dict, *, kind: str) -> None:
+    codec = entry.get("codec")
+    if codec is not None and (not isinstance(codec, str) or len(codec) > 80):
+        raise CraftsError("Stream codec is invalid.", code="bad_project")
+    pix = entry.get("pix_fmt")
+    if pix is not None and (not isinstance(pix, str) or len(pix) > 80):
+        raise CraftsError("Stream pixel format is invalid.", code="bad_project")
+    for axis in ("width", "height"):
+        if axis not in entry or entry[axis] is None:
+            continue
+        value = entry[axis]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 16384:
+            raise CraftsError("Stream dimensions are invalid.", code="bad_project")
+    depth = entry.get("bit_depth")
+    if depth is not None and (isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 32):
+        raise CraftsError("Stream bit depth is invalid.", code="bad_project")
+    rate = entry.get("frame_rate")
+    if rate is not None:
+        if not isinstance(rate, str) or not re.fullmatch(r"[0-9]+/[0-9]+", rate):
+            raise CraftsError("Stream frame rate is invalid.", code="bad_project")
+        num_s, den_s = rate.split("/", 1)
+        if int(num_s) <= 0 or int(den_s) <= 0:
+            raise CraftsError("Stream frame rate is invalid.", code="bad_project")
+    for key in ("frame_rate_num", "frame_rate_den"):
+        if entry.get(key) is None:
+            continue
+        value = entry[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value > 1_000_000_000:
+            raise CraftsError("Stream frame rate is invalid.", code="bad_project")
+    if kind == "audio":
+        for key, limit in (("sample_rate", 384000), ("channels", 64)):
+            if entry.get(key) is None:
+                continue
+            value = entry[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= limit:
+                raise CraftsError("Audio stream fields are invalid.", code="bad_project")
+
+
+def _validate_markers(markers: object, duration) -> list:
+    if not isinstance(markers, list) or len(markers) > 200:
+        raise CraftsError("Clip markers are invalid.", code="bad_project")
+    cleaned = []
+    for item in markers:
+        if not isinstance(item, dict):
+            raise CraftsError("Each marker must be an object with seconds and a label.", code="bad_project")
+        if "seconds" not in item:
+            raise CraftsError("Each marker needs seconds.", code="bad_project")
+        seconds = _finite_number("Marker time", item.get("seconds"), code="bad_project")
+        if seconds < 0 or seconds > 86400 * 12:
+            raise CraftsError("Marker time is out of range.", code="bad_project")
+        if duration is not None and seconds > float(duration) + 0.05:
+            raise CraftsError("Marker time is past the end of the clip.", code="bad_project")
+        label = item.get("label", "")
+        if not isinstance(label, str) or len(label) > 200:
+            raise CraftsError("Marker labels must be text of at most 200 characters.", code="bad_project")
+        marker_id = item.get("id")
+        if marker_id is not None and (not isinstance(marker_id, str) or not marker_id or len(marker_id) > 80):
+            raise CraftsError("Marker id is invalid.", code="bad_project")
+        cleaned.append({"id": marker_id or str(uuid.uuid4()), "seconds": seconds, "label": label})
+    return cleaned
+
+
+def _validate_trim(trim_in: float, trim_out: float, probe: dict) -> None:
+    if trim_in < 0 or trim_out < 0 or trim_out < trim_in:
+        raise CraftsError("Clip trim is invalid.", code="bad_project")
+    duration = probe.get("duration")
+    if duration is None:
+        if trim_out == trim_in and trim_in != 0:
+            raise CraftsError("Clip trim is invalid.", code="bad_project")
+        return
+    duration = float(duration)
+    if trim_out == trim_in and not (trim_in == 0 and duration == 0):
+        raise CraftsError("Clip trim is invalid.", code="bad_project")
+    slack = 0.05
+    video = (probe.get("video") or [None])[0]
+    if isinstance(video, dict) and video.get("frame_rate_num") and video.get("frame_rate_den"):
+        slack = float(video["frame_rate_den"]) / float(video["frame_rate_num"])
+    if trim_out > duration + slack:
+        raise CraftsError("Clip trim is past the end of the clip.", code="bad_project")
+
+
+def _validate_stored_job(job: object, seen: set[str], clip_ids: set[str]) -> dict:
     if not isinstance(job, dict):
         raise CraftsError("Each job must be an object.", code="bad_project")
     job_id = job.get("id")
     if not isinstance(job_id, str) or not job_id or len(job_id) > 80 or job_id in seen:
         raise CraftsError("Job id is missing or duplicated.", code="bad_project")
     seen.add(job_id)
-    if job.get("kind") not in {"export", "gyroflow"}:
+    kind = job.get("kind")
+    if kind not in {"export", "gyroflow"}:
         raise CraftsError("Job kind is invalid.", code="bad_project")
     if job.get("status") not in {"queued", "running", "paused", "succeeded", "failed", "cancelled", "interrupted"}:
         raise CraftsError("Job status is invalid. It was not queued.", code="bad_project")
-    if not isinstance(job.get("request"), dict):
+    request = job.get("request")
+    if not isinstance(request, dict):
         raise CraftsError("Job request is invalid.", code="bad_project")
-    progress = job.get("progress", 0)
-    number = _finite_number("Job progress", progress)
-    if not 0 <= number <= 1:
+    if kind == "export":
+        _validate_export_request(request, clip_ids)
+    else:
+        _validate_gyro_request(request, clip_ids)
+    if "attempt" in job and job["attempt"] is not None:
+        attempt = job["attempt"]
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= 1000:
+            raise CraftsError("Job attempt is invalid.", code="bad_project")
+    progress = _finite_number("Job progress", job.get("progress", 0), code="bad_project")
+    if not 0 <= progress <= 1:
         raise CraftsError("Job progress is out of range.", code="bad_project")
+    for key in ("error", "code"):
+        if job.get(key) is not None and not isinstance(job.get(key), str):
+            raise CraftsError("Job error text is invalid.", code="bad_project")
+    if job.get("result") is not None and not isinstance(job.get("result"), dict):
+        raise CraftsError("Job result is invalid.", code="bad_project")
     return dict(job)
+
+
+def _validate_export_request(request: dict, clip_ids: set[str]) -> None:
+    if not request:
+        raise CraftsError("Export job request is empty and cannot be resumed.", code="bad_project")
+    clip_id = request.get("clip_id")
+    if not isinstance(clip_id, str) or clip_id not in clip_ids:
+        raise CraftsError("Export job does not reference a clip in this project.", code="bad_project")
+    if request.get("preset_id") not in PRESETS:
+        raise CraftsError("Export job preset is invalid.", code="bad_project")
+    trim_in = _finite_number("Export in", request.get("in_seconds"), code="bad_project")
+    trim_out = _finite_number("Export out", request.get("out_seconds"), code="bad_project")
+    if trim_in < 0 or trim_out <= trim_in or trim_out > 86400 * 48:
+        raise CraftsError("Export trim is invalid.", code="bad_project")
+    destination = request.get("destination_dir")
+    if not isinstance(destination, str) or not destination.strip() or len(destination) > 4096 or "\x00" in destination or "://" in destination:
+        raise CraftsError("Export destination is invalid.", code="bad_project")
+    filename = request.get("filename")
+    if not isinstance(filename, str):
+        raise CraftsError("Export filename is missing.", code="bad_project")
+    safe_filename(filename)
+    if "suffix" in request and request["suffix"] is not None:
+        safe_suffix(request["suffix"])
+    if not isinstance(request.get("audio"), bool):
+        raise CraftsError("Export audio flag is invalid.", code="bad_project")
+    for key in ("acknowledge_bit_depth_conversion", "use_vidstab_auto"):
+        if key in request and not isinstance(request.get(key), bool):
+            raise CraftsError("Export request flags are invalid.", code="bad_project")
+    if "exposure" in request and request["exposure"] is not None:
+        exposure = _finite_number("Exposure", request["exposure"], code="bad_project")
+        if not -1 <= exposure <= 1:
+            raise CraftsError("Export exposure is out of range.", code="bad_project")
+    if "saturation" in request and request["saturation"] is not None:
+        saturation = _finite_number("Saturation", request["saturation"], code="bad_project")
+        if not 0 <= saturation <= 3:
+            raise CraftsError("Export saturation is out of range.", code="bad_project")
+    if request.get("crf") is not None and (
+        isinstance(request.get("crf"), bool) or not isinstance(request.get("crf"), int) or not 0 <= request["crf"] <= 51
+    ):
+        raise CraftsError("Export CRF is invalid.", code="bad_project")
+
+
+def _validate_gyro_request(request: dict, clip_ids: set[str]) -> None:
+    output = request.get("output_path")
+    if not isinstance(output, str) or not output.strip() or len(output) > 4096 or "\x00" in output or "://" in output:
+        raise CraftsError("Gyroflow output path is missing.", code="bad_project")
+    if Path(output).suffix.lower() not in {".mp4", ".mov", ".mxf", ".mkv", ".m2ts", ".mts"}:
+        raise CraftsError("Gyroflow output path needs a media extension.", code="bad_project")
+    clip_id = request.get("clip_id")
+    if clip_id is not None and (not isinstance(clip_id, str) or clip_id not in clip_ids):
+        raise CraftsError("Gyroflow job does not reference a clip in this project.", code="bad_project")
+    for key in ("media_path", "project_path", "gyro_path", "preset_path"):
+        value = request.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip() or len(value) > 4096 or "\x00" in value or "://" in value:
+            raise CraftsError("Gyroflow input path is invalid.", code="bad_project")
 
 
 def new_project() -> dict:

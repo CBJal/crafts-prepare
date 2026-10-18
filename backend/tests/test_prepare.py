@@ -168,17 +168,25 @@ def test_flags_notes_markers_and_project_roundtrip(client, media_dir: Path, tmp_
     assert restored["clips"][0]["flag"] == "KEEP"
     assert restored["clips"][0]["notes"] == "hero take"
     assert restored["clips"][0]["markers"][0]["label"] == "look"
-    payload = json.loads(project.read_text())
-    payload["jobs"].append(
-        {
-            "id": "running-job",
-            "kind": "export",
-            "status": "running",
-            "progress": 0.4,
-            "error": None,
-            "request": {},
-        }
+    require_encoder(client, "libx264")
+    dest = tmp_path / "later"
+    dest.mkdir()
+    queued = client.post(
+        "/api/jobs/export",
+        json={
+            "clip_id": clip["id"],
+            "preset_id": "h264_mp4",
+            "in_seconds": 0,
+            "out_seconds": 0.4,
+            "destination_dir": str(dest),
+            "suffix": "_later",
+            "audio": False,
+        },
     )
+    assert queued.status_code == 200, queued.text
+    assert client.post("/api/project/save", json={"path": str(project)}).status_code == 200
+    payload = json.loads(project.read_text())
+    payload["jobs"][0]["status"] = "running"
     project.write_text(json.dumps(payload))
     interrupted = Service().open_project(str(project))
     assert interrupted["jobs"][0]["status"] == "interrupted"

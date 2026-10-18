@@ -7,6 +7,8 @@ an FFmpeg filter expression or a path segment.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import re
 from pathlib import Path, PurePosixPath
@@ -204,7 +206,27 @@ def partial_path(final: Path, job_id: str) -> Path:
     return final.parent / f".{final.name}.{token}.crafts-partial"
 
 
-def publish_exclusive(partial: Path, final: Path, source: Path) -> None:
+# Hard links are the POSIX no-clobber publish. These errnos mean "try the
+# platform rename that refuses to replace", not "replace it ourselves".
+_LINK_UNSUPPORTED = {
+    errno.EPERM,
+    errno.EOPNOTSUPP,
+    errno.ENOTSUP,
+    errno.EXDEV,
+    errno.ENOSYS,
+    errno.EINVAL,
+}
+
+
+def publish_exclusive(partial: Path, final: Path, source: Path) -> dict:
+    """Publish partial onto final without replacing an existing file.
+
+    Prefer a hard link, which fails if the destination name exists. If this
+    filesystem has no hard links, Windows os.rename refuses to replace an
+    existing file, and Linux renameat2(RENAME_NOREPLACE) does the same.
+    POSIX os.rename is not used: it would replace the destination. An empty
+    placeholder is never created at the final path.
+    """
     reject_source_alias(source, final)
     if final.exists() or final.is_symlink():
         raise CraftsError(
@@ -212,29 +234,90 @@ def publish_exclusive(partial: Path, final: Path, source: Path) -> None:
             code="collision",
             status=409,
         )
+    if not partial.is_file() or partial.stat().st_size <= 0:
+        raise CraftsError("Refusing to publish an empty staging file.", code="invalid_output")
     try:
         os.link(partial, final)
     except FileExistsError as exc:
-        raise CraftsError(
-            f"Output already exists and will not be overwritten: {final}",
-            code="collision",
-            status=409,
-        ) from exc
-    except OSError:
-        # Fall back to an exclusive create plus replace of that empty inode only.
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        raise _collision(final) from exc
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EEXIST:
+            raise _collision(final) from exc
+        if getattr(exc, "errno", None) not in _LINK_UNSUPPORTED:
+            raise
+        rename_noreplace(partial, final)
+    else:
+        partial.unlink(missing_ok=True)
+    return file_identity(final)
+
+
+def rename_noreplace(src: Path, dst: Path) -> None:
+    """Move src onto a name that must not already exist. Leaves src in place on failure."""
+    if os.name == "nt":
         try:
-            fd = os.open(final, flags)
+            os.rename(src, dst)
         except FileExistsError as exc:
-            raise CraftsError(
-                f"Output already exists and will not be overwritten: {final}",
-                code="collision",
-                status=409,
-            ) from exc
-        os.close(fd)
-        os.replace(partial, final)
+            raise _collision(dst) from exc
         return
-    partial.unlink(missing_ok=True)
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    rename_noreplace_flag = 1
+    ctypes.set_errno(0)
+    result = renameat2(at_fdcwd, os.fsencode(src), at_fdcwd, os.fsencode(dst), rename_noreplace_flag)
+    if result == 0:
+        return
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise _collision(dst)
+    if err in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM}:
+        raise CraftsError(
+            "This filesystem cannot publish a finished file without the risk of replacing "
+            f"an existing one. The staged bytes were left at {src} and were not published.",
+            code="publish_unsupported",
+            status=409,
+        )
+    raise OSError(err, os.strerror(err), str(dst))
+
+
+def file_identity(path: Path) -> dict:
+    st = path.lstat()
+    return {"device": st.st_dev, "inode": st.st_ino}
+
+
+def discard_owned_output(path: Path, identity: dict | None, source: Path) -> bool:
+    """Delete path only when it is still the inode we published."""
+    if not identity or not path.exists() and not path.is_symlink():
+        return False
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    if st.st_dev != identity.get("device") or st.st_ino != identity.get("inode"):
+        return False
+    try:
+        if source.exists() and same_file(path, source):
+            return False
+    except OSError:
+        return False
+    path.unlink()
+    return True
+
+
+def _collision(path: Path) -> CraftsError:
+    return CraftsError(
+        f"Output already exists and was left untouched: {path}",
+        code="collision",
+        status=409,
+    )
 
 
 def quote_ffmpeg_filter_path(posix_path: str) -> str:

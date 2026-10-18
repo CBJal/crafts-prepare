@@ -26,6 +26,71 @@ def test_malformed_project_leaves_the_open_one(client, media_dir, tmp_path):
     response = client.post("/api/project/open", json={"path": str(unknown)})
     assert response.status_code == 400
     assert client.get("/api/jobs").json()["jobs"] == []
+    assert client.get("/api/media").json()["clips"][0]["id"] == clip["id"]
+    assert client.get("/api/project").json()["clips"][0]["id"] == clip["id"]
+
+
+def _saved_payload(client, tmp_path, clip_id):
+    path = tmp_path / "baseline.crafts.json"
+    assert client.post("/api/project/save", json={"path": str(path)}).status_code == 200
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def _reject_open(client, path, clip_id):
+    response = client.post("/api/project/open", json={"path": str(path)})
+    assert response.status_code == 400, response.text
+    assert response.json()["code"] == "bad_project"
+    media = client.get("/api/media")
+    project = client.get("/api/project")
+    assert media.status_code == 200
+    assert project.status_code == 200
+    assert media.json()["clips"][0]["id"] == clip_id
+    assert project.json()["clips"][0]["id"] == clip_id
+    assert project.json()["path"]
+
+
+def test_malformed_probe_trim_markers_and_job_do_not_replace_state(client, media_dir, tmp_path):
+    clip = import_clip(client, media_dir / "h264_8.mp4")
+    base, payload = _saved_payload(client, tmp_path, clip["id"])
+    original_path = client.get("/api/project").json()["path"]
+
+    nested = json.loads(json.dumps(payload))
+    nested["clips"][0]["probe"]["video"] = ["invalid-video-entry"]
+    nested["clips"][0]["trim_in"] = -8
+    nested["clips"][0]["trim_out"] = -2
+    bad_probe = tmp_path / "bad-probe.crafts.json"
+    bad_probe.write_text(json.dumps(nested), encoding="utf-8")
+    _reject_open(client, bad_probe, clip["id"])
+
+    bad_markers = json.loads(json.dumps(payload))
+    bad_markers["clips"][0]["markers"] = ["not-a-marker", {"label": "missing time"}]
+    marker_path = tmp_path / "bad-markers.crafts.json"
+    marker_path.write_text(json.dumps(bad_markers), encoding="utf-8")
+    _reject_open(client, marker_path, clip["id"])
+
+    bad_job = json.loads(json.dumps(payload))
+    bad_job["jobs"] = [
+        {
+            "id": "empty-export",
+            "kind": "export",
+            "status": "paused",
+            "progress": 0,
+            "attempt": 1,
+            "request": {},
+        }
+    ]
+    job_path = tmp_path / "bad-job.crafts.json"
+    job_path.write_text(json.dumps(bad_job), encoding="utf-8")
+    _reject_open(client, job_path, clip["id"])
+
+    garbled = tmp_path / "garbled.crafts.json"
+    garbled.write_bytes(b"\xff\xfe not utf-8")
+    response = client.post("/api/project/open", json={"path": str(garbled)})
+    assert response.status_code == 400
+    assert response.json()["code"] == "bad_project"
+    assert client.get("/api/project").json()["path"] == original_path
+    assert client.get("/api/media").json()["clips"][0]["id"] == clip["id"]
+    assert base.is_file()
 
 
 def test_save_refuses_empty_foreign_and_oversize_files(client, tmp_path):
