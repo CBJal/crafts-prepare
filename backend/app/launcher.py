@@ -266,7 +266,7 @@ def _open_browser(port: int) -> None:
 
 def _stop_owned_server(server, thread: threading.Thread | None) -> None:
     try:
-        server.app.state.service.shutdown(timeout=8)
+        server.config.app.state.service.shutdown(timeout=8)
     except Exception:
         logging.exception("Queue shutdown failed")
     server.should_exit = True
