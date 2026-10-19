@@ -15,7 +15,7 @@ _UNUSED = (
     "qtwebview",
     "qtpdf",
 )
-_FOREIGN = ("poppler", "codex-runtimes")
+_FOREIGN = ("poppler",)
 
 
 def bundle_decision(dest_name: str, source_path: str) -> tuple[bool, str]:
