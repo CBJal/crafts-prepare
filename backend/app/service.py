@@ -129,10 +129,10 @@ class Service:
             self._caps_cache = None
             return self.capabilities()
 
-    def capabilities(self) -> dict:
-        if self._caps_cache is not None:
+    def capabilities(self, cancel=None) -> dict:
+        if cancel is None and self._caps_cache is not None:
             return self._caps_cache
-        report = inspect_tools(self.settings)
+        report = inspect_tools(self.settings, cancel=cancel)
         encoders = (report.get("ffmpeg") or {}).get("encoders") or {}
         report["presets"] = [preset_availability(preset, encoders) for preset in PRESETS.values()]
         report["vidstab_auto"] = {
@@ -145,7 +145,8 @@ class Service:
             "gyro_requires_external_gyroflow": True,
             "binaries_bundled": False,
         }
-        self._caps_cache = report
+        if cancel is None or not cancel.is_set():
+            self._caps_cache = report
         return report
 
     def _tools(self) -> tuple[str, str]:
@@ -1039,13 +1040,17 @@ class Service:
             self._persist()
         return self.project_summary()
 
-    def parse_gcsv(self, raw: str) -> dict:
+    def parse_gcsv(self, raw: str, cancel=None) -> dict:
+        from .errors import Cancelled
+
         path = resolve_existing(raw)
         if path.stat().st_size > 64 * 1024 * 1024:
             raise CraftsError("GCSV file exceeds the parse limit.", code="bad_gcsv")
-        return parse_gcsv_file(path).summary()
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        return parse_gcsv_file(path, cancel=cancel).summary()
 
-    def inspect_telemetry(self, clip_id: str) -> dict:
+    def inspect_telemetry(self, clip_id: str, cancel=None) -> dict:
         binary = discover_executable(self.settings.get("telemetry_parser") or "")
         if not binary:
             raise CraftsError(
@@ -1056,7 +1061,7 @@ class Service:
             )
         with self.lock:
             source = Path(self._clip(clip_id)["path"])
-        code, stdout, stderr = run_captured([binary, str(source)], timeout=180)
+        code, stdout, stderr = run_captured([binary, str(source)], timeout=180, cancel=cancel)
         if stdout.strip().startswith("{"):
             try:
                 payload = json.loads(stdout)

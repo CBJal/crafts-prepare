@@ -78,9 +78,12 @@ def make_proxy(
     destination: Path,
     duration: float,
     cancel=None,
+    on_start=None,
 ) -> Path:
     limit = min(duration, PROXY_LIMIT_SECONDS) if duration and duration > 0 else PROXY_LIMIT_SECONDS
-    partial = destination.with_name(destination.name + ".partial")
+    # The staged file must end in .mp4. A suffix of ".mp4.partial" makes FFmpeg
+    # guess a muxer named "partial" and fail before any frames are written.
+    partial = destination.with_name(destination.stem + ".writing.mp4")
     args = [
         ffmpeg,
         "-hide_banner",
@@ -106,10 +109,12 @@ def make_proxy(
         "128k",
         "-movflags",
         "+faststart",
+        "-f",
+        "mp4",
         str(partial),
     ]
     try:
-        code, _stdout, stderr = run_captured(args, timeout=60 * 30, cancel=cancel)
+        code, _stdout, stderr = run_captured(args, timeout=60 * 30, cancel=cancel, on_start=on_start)
     except Exception:
         partial.unlink(missing_ok=True)
         raise

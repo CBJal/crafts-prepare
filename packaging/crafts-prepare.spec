@@ -1,8 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller onedir build for the native Qt app. Run from packaging/build-windows.ps1."""
 
+import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(SPECPATH)))
+from bundle_guard import filter_bundle
 
 spec_dir = Path(SPECPATH)
 root = spec_dir.parent
@@ -50,17 +55,27 @@ a = Analysis(
         "PySide6.QtWebView",
         "PySide6.QtPdf",
         "PySide6.QtPdfWidgets",
+        "PySide6.QtVirtualKeyboard",
     ],
     noarchive=False,
 )
 
-def _keep(entry) -> bool:
-    name = str(entry[0]).lower().replace("\\", "/")
-    blocked = ("webengine", "/webview/", "qtwebview", "qtpdf")
-    return not any(piece in name for piece in blocked)
-
-a.binaries = [entry for entry in a.binaries if _keep(entry)]
-a.datas = [entry for entry in a.datas if _keep(entry)]
+a.binaries, rejected_binaries = filter_bundle(a.binaries)
+a.datas, rejected_datas = filter_bundle(a.datas)
+manifest = {
+    "kept_binaries": [{"name": str(entry[0]), "source": str(entry[1])} for entry in a.binaries],
+    "rejected": rejected_binaries + rejected_datas,
+}
+output_root = os.environ.get("CRAFTS_OUTPUT_ROOT", "").strip()
+manifest_path = Path(output_root) / "dependency-sources.json" if output_root else spec_dir / "dependency-sources.json"
+manifest_path.parent.mkdir(parents=True, exist_ok=True)
+manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+a.datas.append((str(manifest_path), "."))
+foreign = [item for item in manifest["rejected"] if item["reason"] == "ICU from an unrelated directory"]
+if foreign:
+    print("Excluded unrelated ICU libraries:")
+    for item in foreign:
+        print(f"  {item['source']}")
 
 pyz = PYZ(a.pure, a.zipped_data)
 exe = EXE(

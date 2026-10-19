@@ -90,6 +90,7 @@ $versionFile = Join-Path $outRoot "file_version_info.txt"
 Assert-Native "write_version_info.py"
 $env:CRAFTS_LICENSE_DIR = $licenseDir
 $env:CRAFTS_VERSION_FILE = $versionFile
+$env:CRAFTS_OUTPUT_ROOT = $outRoot
 
 & $python -m PyInstaller packaging\crafts-prepare.spec --noconfirm --distpath $dist --workpath $work
 Assert-Native "PyInstaller"

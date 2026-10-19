@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEventLoop, QTimer, QUrl, Qt, Signal
+from PySide6.QtCore import QByteArray, QEventLoop, QSize, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -47,6 +47,42 @@ from .theme import apply_theme
 from .workers import TaskRunner
 
 _ACTIVE = {"queued", "running"}
+
+
+class FitLabel(QLabel):
+    """Show a full frame fitted inside the viewer. The pixmap does not force the layout size."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._source = QPixmap()
+        self.setObjectName("stillLabel")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(120, 80)
+
+    def set_source(self, pixmap: QPixmap) -> None:
+        self._source = pixmap
+        self._refit()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._refit()
+        super().resizeEvent(event)
+
+    def _refit(self) -> None:
+        if self._source.isNull() or self.width() < 2 or self.height() < 2:
+            super().setPixmap(QPixmap())
+            return
+        fitted = self._source.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        super().setPixmap(fitted)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(120, 80)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(640, 360)
 
 
 class MainWindow(QMainWindow):
@@ -97,7 +133,7 @@ class MainWindow(QMainWindow):
         self._refresh_timer.setInterval(700)
         self._refresh_timer.timeout.connect(self.refresh_queue)
         self._refresh_timer.start()
-        self._start(lambda cancel: self.service.capabilities(), self._apply_capabilities, key="caps")
+        self._start(lambda cancel: self.service.capabilities(cancel=cancel), self._apply_capabilities, key="caps")
 
     def _build_player(self) -> None:
         self.player = None
@@ -223,12 +259,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.scrub)
         self.setCentralWidget(center)
 
-    def _still_page(self, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setObjectName("stillLabel")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setMinimumHeight(120)
-        return label
+    def _still_page(self, text: str) -> FitLabel:
+        return FitLabel(text)
 
     def _show_view(self, index: int) -> None:
         self.viewer_stack.setCurrentIndex(index)
@@ -576,7 +608,7 @@ class MainWindow(QMainWindow):
         tools_menu.addAction("External programs…", self.open_settings)
         tools_menu.addAction(
             "Refresh tool report",
-            lambda: self._start(lambda cancel: self.service.capabilities(), self._apply_capabilities, key="caps"),
+            lambda: self._start(lambda cancel: self.service.capabilities(cancel=cancel), self._apply_capabilities, key="caps"),
         )
 
         view_menu = self.menuBar().addMenu("View")
@@ -721,20 +753,32 @@ class MainWindow(QMainWindow):
         generation = self._project_gen
 
         def work(cancel):
+            from ..errors import Cancelled
+
             reports = []
+            errors = []
             for path in items:
                 if cancel.is_set():
-                    from ..errors import Cancelled
-
                     raise Cancelled()
-                reports.append(self.service.import_media(path, cancel=cancel))
-            return generation, reports
+                try:
+                    reports.append(self.service.import_media(path, cancel=cancel))
+                except Cancelled:
+                    raise
+                except CraftsError as exc:
+                    errors.append(f"{path}: {exc.message}")
+            return generation, reports, errors
 
         def done(payload):
-            project_gen, reports = payload
+            project_gen, reports, errors = payload
             if project_gen != self._project_gen:
                 return
-            self._imported(reports)
+            if reports:
+                self._imported(reports)
+            elif self.clips:
+                self.reload_all()
+            if errors:
+                self.last_error = "\n".join(errors)
+                self.statusBar().showMessage(self.last_error, 10000)
 
         self._start(work, done, key="import")
 
@@ -762,14 +806,19 @@ class MainWindow(QMainWindow):
         self.library.setRowCount(len(self.clips))
         for row, clip in enumerate(self.clips):
             check = QTableWidgetItem()
-            check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            shown = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            check.setFlags(shown | Qt.ItemFlag.ItemIsUserCheckable)
             check.setCheckState(Qt.CheckState.Checked if clip["id"] in checks else Qt.CheckState.Unchecked)
             check.setData(Qt.ItemDataRole.UserRole, clip["id"])
             self.library.setItem(row, 0, check)
-            self.library.setItem(row, 1, QTableWidgetItem(clip["name"]))
-            self.library.setItem(row, 2, QTableWidgetItem(clip.get("flag") or ""))
-            duration = clip["summary"].get("duration")
-            self.library.setItem(row, 3, QTableWidgetItem("" if duration is None else f"{float(duration):.2f}s"))
+            for column, text in (
+                (1, clip["name"]),
+                (2, clip.get("flag") or ""),
+                (3, "" if clip["summary"].get("duration") is None else f"{float(clip['summary']['duration']):.2f}s"),
+            ):
+                cell = QTableWidgetItem(text)
+                cell.setFlags(shown)
+                self.library.setItem(row, column, cell)
         self.library.blockSignals(False)
         self._filling = False
         self._update_count()
@@ -838,15 +887,15 @@ class MainWindow(QMainWindow):
             return
         if self._notes_dirty and previous >= 0:
             item = self.library.item(previous, 0)
-            if item is not None:
-                self._commit_notes_to(str(item.data(Qt.ItemDataRole.UserRole)))
+            if item is not None and not self._commit_notes_to(str(item.data(Qt.ItemDataRole.UserRole))):
+                self._filling = True
+                self.library.setCurrentCell(previous, 1)
+                self._filling = False
+                return
         if row < 0:
-            self._clear_viewer()
+            self._invalidate_viewer()
             return
-        self._view_gen += 1
-        self._proxy_fallback = False
-        self.still_path = ""
-        self.playback_result = None
+        self._invalidate_viewer()
         self._fill_focus()
         self.request_playback()
 
@@ -1133,7 +1182,7 @@ class MainWindow(QMainWindow):
         self._start(
             work,
             lambda result: self._show_playback(project_gen, view_gen, result),
-            key=f"proxy:{clip_id}",
+            key="viewer-proxy",
         )
 
     def _show_playback(self, project_gen: int, view_gen: int, result: dict) -> None:
@@ -1178,10 +1227,10 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap(path)
         if pixmap.isNull():
             label.setText(path)
+            label.set_source(QPixmap())
             return
-        label.setPixmap(
-            pixmap.scaled(label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        )
+        label.setText("")
+        label.set_source(pixmap)
         self.viewer_stack.setCurrentIndex(2 if adjusted else 1)
 
     def queue_focused_export(self) -> None:
@@ -1289,7 +1338,7 @@ class MainWindow(QMainWindow):
         if not path:
             self.statusBar().showMessage("Choose a GCSV file first.", 5000)
             return
-        self._start(lambda cancel: self.service.parse_gcsv(path), lambda result: self._show_text("GCSV", result), key="gcsv")
+        self._start(lambda cancel: self.service.parse_gcsv(path, cancel=cancel), lambda result: self._show_text("GCSV", result), key="gcsv")
 
     def inspect_telemetry(self) -> None:
         clip = self.focused_clip()
@@ -1297,7 +1346,7 @@ class MainWindow(QMainWindow):
             return
         clip_id = clip["id"]
         self._start(
-            lambda cancel: self.service.inspect_telemetry(clip_id),
+            lambda cancel: self.service.inspect_telemetry(clip_id, cancel=cancel),
             lambda result: self._show_text("Telemetry", result),
             key="telemetry",
         )
@@ -1329,8 +1378,10 @@ class MainWindow(QMainWindow):
                 f"{float(job.get('progress') or 0):.0%}",
                 str(job.get("error") or ""),
             ]
+            shown = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
+                item.setFlags(shown)
                 item.setData(Qt.ItemDataRole.UserRole, job["id"])
                 self.queue.setItem(row, column, item)
         if self.last_batch_id:
@@ -1424,7 +1475,8 @@ class MainWindow(QMainWindow):
         return "cancel"
 
     def new_project(self, discard: bool = False) -> bool:
-        self.commit_editor()
+        if not self.commit_editor():
+            return False
         if self.is_unsaved() and not discard:
             choice = self._prompt_unsaved()
             if choice == "cancel":
@@ -1454,7 +1506,8 @@ class MainWindow(QMainWindow):
             self.open_project_path(path)
 
     def open_project_path(self, path: str) -> bool:
-        self.commit_editor()
+        if not self.commit_editor():
+            return False
         if self.is_unsaved():
             choice = self._prompt_unsaved()
             if choice == "cancel":
@@ -1490,23 +1543,30 @@ class MainWindow(QMainWindow):
         self._clear_viewer()
         self.reload_all(keep_checks=False, keep_focus=False)
 
-    def _clear_viewer(self) -> None:
+    def _invalidate_viewer(self) -> None:
+        self._view_gen += 1
+        self._still_seq += 1
+        self._proxy_fallback = False
         self.still_path = ""
         self.playback_result = None
-        self.playback_note.setText("No clip.")
-        self.still_original.setPixmap(QPixmap())
+        self.still_original.set_source(QPixmap())
         self.still_original.setText("Original still")
-        self.still_adjusted.setPixmap(QPixmap())
+        self.still_adjusted.set_source(QPixmap())
         self.still_adjusted.setText("Adjusted still")
         if self.player is not None:
             self.player.stop()
             self.player.setSource(QUrl())
         self.scrub.setRange(0, 0)
         self.time_label.setText("0:00.0 / 0:00.0")
+
+    def _clear_viewer(self) -> None:
+        self._invalidate_viewer()
+        self.playback_note.setText("No clip.")
         self.viewer_stack.setCurrentIndex(0)
 
     def save_project_interactive(self) -> bool:
-        self.commit_editor()
+        if not self.commit_editor():
+            return False
         if self.service.project_path is None:
             return self.save_project_as()
         try:
@@ -1526,7 +1586,8 @@ class MainWindow(QMainWindow):
         return self.save_project_to(path)
 
     def save_project_to(self, path: str) -> bool:
-        self.commit_editor()
+        if not self.commit_editor():
+            return False
         try:
             self.service.save_project(path)
         except CraftsError as exc:
@@ -1553,7 +1614,7 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.service, self)
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
-            self._start(lambda cancel: self.service.capabilities(), self._apply_capabilities, key="caps")
+            self._start(lambda cancel: self.service.capabilities(cancel=cancel), self._apply_capabilities, key="caps")
 
     def _apply_capabilities(self, report: dict) -> None:
         self.capabilities = report
@@ -1613,7 +1674,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("A background task was still stopping.", 8000)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        self.commit_editor()
+        if not self.commit_editor():
+            event.ignore()
+            return
         if self.is_unsaved() and not self.force_close:
             choice = self._prompt_unsaved()
             if choice == "cancel":
@@ -1622,16 +1685,31 @@ class MainWindow(QMainWindow):
             if choice == "save" and not self.save_project_interactive():
                 event.ignore()
                 return
+        if not self._runner.settle(timeout=8):
+            self.statusBar().showMessage("A background tool is still stopping. The window stays open.", 8000)
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start()
+            event.ignore()
+            return
         self._refresh_timer.stop()
         if self.player is not None:
             self.player.stop()
             self.player.setVideoOutput(None)
             self.player.setSource(QUrl())
-        self.shutdown_owned()
-        self._persist_window()
-        if self._runner.isRunning():
+        for job in self.service.jobs():
+            if job["status"] in _ACTIVE:
+                try:
+                    self.service.cancel(job["id"])
+                except CraftsError:
+                    pass
+        self.service.shutdown(timeout=8)
+        if not self._runner.shutdown(timeout=4):
+            self.statusBar().showMessage("A background tool is still stopping. The window stays open.", 8000)
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start()
             event.ignore()
             return
+        self._persist_window()
         event.accept()
 
     def _start(self, fn, on_ok, *, key: str | None = None) -> None:

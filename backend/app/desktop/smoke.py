@@ -6,6 +6,7 @@ records what those objects actually did. A missing required export fails the run
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import threading
@@ -50,7 +51,7 @@ def run_smoke(
     window.show()
     app.processEvents()
     shots: list[dict] = []
-    before = {str(path): path.stat().st_size if path.is_file() else None for path in paths}
+    before = {str(path): _sha256(path) for path in paths if path.is_file()}
 
     def grab(name: str) -> None:
         app.processEvents()
@@ -155,22 +156,24 @@ def run_smoke(
         export_ok = [item for item in jobs if item["kind"] == "export" and item["status"] == "succeeded" and item["honest"]]
         gyro_rows = [item for item in jobs if item["kind"] == "gyroflow"]
         gyro_expect = (settings.get("gyro") or {}).get("expect")
-        gyro_ok = True
+        gyro_good = [item for item in gyro_rows if item["status"] == "succeeded" and item["honest"]]
+        min_export = int(expectations.get("min_export_succeeded", len(paths)))
         if gyro_expect == "succeeded":
-            gyro_ok = any(item["status"] == "succeeded" and item["honest"] for item in gyro_rows)
+            min_gyro = int(expectations.get("min_gyro_succeeded", len(paths)))
+            gyro_ok = len(gyro_good) >= min_gyro and len(gyro_rows) >= min_gyro
         elif gyro_expect == "failed":
             gyro_ok = bool(gyro_rows) and all(item["status"] == "failed" for item in gyro_rows)
-        min_export = int(expectations.get("min_export_succeeded", 1))
+        else:
+            gyro_ok = True
         queue_ok = bool(jobs) and len(export_ok) >= min_export and all(item["honest"] for item in jobs) and gyro_ok
         grab("queue")
         proof["steps"].append({"step": "queue", "ok": queue_ok, "jobs": jobs, "export_succeeded": len(export_ok)})
-        if not queue_ok or not playback["advanced"]:
-            code = 2
-        after = {str(path): path.stat().st_size if path.is_file() else None for path in paths}
-        proof["source_bytes_before"] = before
-        proof["source_bytes_after"] = after
+        after = {str(path): _sha256(path) for path in paths if path.is_file()}
+        proof["source_sha256_before"] = before
+        proof["source_sha256_after"] = after
         proof["sources_unchanged"] = before == after
-        if before != after:
+        proof["steps"].append({"step": "sources", "ok": before == after})
+        if not queue_ok or not playback["advanced"] or before != after:
             code = 2
         window.force_close = True
         window.close()
@@ -178,7 +181,7 @@ def run_smoke(
         proof["threads"] = [thread.name for thread in threading.enumerate()]
         proof["http_server_started"] = "crafts-http" in proof["threads"]
         proof["webbrowser_loaded"] = "webbrowser" in sys.modules
-        if proof["http_server_started"]:
+        if proof["http_server_started"] or any(not step.get("ok") for step in proof["steps"]):
             code = 2
     finally:
         proof["webbrowser_loaded"] = "webbrowser" in sys.modules
@@ -189,6 +192,17 @@ def run_smoke(
             window.force_close = True
             window.close()
     return code
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _apply_export(window, settings: dict) -> None:
@@ -210,6 +224,22 @@ def _apply_export(window, settings: dict) -> None:
     if settings.get("height"):
         window.out_height.setValue(int(settings["height"]))
     window.suffix.setText(str(settings.get("suffix") or "_export"))
+    trim_in = settings.get("trim_in")
+    trim_out = settings.get("trim_out")
+    if trim_in is None and trim_out is None:
+        return
+    for clip in list(window.clips):
+        window.focus_clip(clip["id"])
+        if trim_in is not None:
+            window.trim_in.setValue(float(trim_in))
+        if trim_out is not None:
+            window.trim_out.setValue(float(trim_out))
+        window.save_trim()
+        updated = next(item for item in window.service.clips() if item["id"] == clip["id"])
+        if trim_in is not None and abs(float(updated["trim_in"]) - float(trim_in)) > 0.05:
+            raise RuntimeError(f"Trim in was not stored for {clip['name']}.")
+        if trim_out is not None and abs(float(updated["trim_out"]) - float(trim_out)) > 0.05:
+            raise RuntimeError(f"Trim out was not stored for {clip['name']}.")
 
 
 def _apply_gyro(window, settings: dict) -> None:

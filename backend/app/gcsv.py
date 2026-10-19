@@ -293,12 +293,25 @@ def parse_gcsv_text(text: str) -> GcsvLog:
     )
 
 
-def parse_gcsv_file(path: Path) -> GcsvLog:
+def parse_gcsv_file(path: Path, cancel=None) -> GcsvLog:
+    from .errors import Cancelled
+
     size = path.stat().st_size
     if size > MAX_GCSV_BYTES:
         _fail("GCSV file exceeds the parse limit.")
+    chunks: list[str] = []
     try:
-        text = path.read_text(encoding="utf-8")
+        with path.open("r", encoding="utf-8") as handle:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                block = handle.read(1024 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+        text = "".join(chunks)
     except UnicodeError as exc:
         raise CraftsError("GCSV file is not UTF-8 text.", code="bad_gcsv") from exc
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
     return parse_gcsv_text(text)

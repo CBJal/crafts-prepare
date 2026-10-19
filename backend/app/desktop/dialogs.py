@@ -24,13 +24,16 @@ class SettingsDialog(QDialog):
         self.service = service
         self.setWindowTitle("Tools")
         self.setObjectName("settingsDialog")
+        self.setMinimumWidth(420)
+        self.setMaximumWidth(720)
+        self.resize(560, 280)
         layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel(
-                "These are the external programs Crafts Prepare runs for export, proxies, stills, and gyro. "
-                "They are not the playback libraries inside Qt."
-            )
+        intro = QLabel(
+            "These paths are the external programs used for export, proxies, stills, and gyro. "
+            "They are separate from Qt playback."
         )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
         form = QFormLayout()
         self.fields: dict[str, QLineEdit] = {}
         for key, label in (
@@ -41,6 +44,7 @@ class SettingsDialog(QDialog):
         ):
             edit = QLineEdit(service.settings.get(key) or "")
             edit.setObjectName(f"tool-{key}")
+            edit.setMinimumWidth(180)
             browse = QPushButton("Browse")
             browse.clicked.connect(lambda _checked=False, box=edit: self._browse(box))
             row = QHBoxLayout()
@@ -86,19 +90,21 @@ class AboutDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"About {APP_NAME}")
+        self.setMinimumWidth(420)
+        self.setMaximumWidth(640)
+        self.resize(520, 240)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(f"{APP_NAME} {APP_VERSION}"))
-        layout.addWidget(
-            QLabel(
-                "Independent desktop application for local video preparation.\n"
-                "It is not Sony Catalyst Prepare. It does not use Sony artwork, Sony code, "
-                "or a Sony activation check, and it does not claim the same color science "
-                "or the same feature set.\n\n"
-                "FFmpeg, ffprobe, and Gyroflow stay separate programs you install. "
-                "Qt may play a viewing proxy with its own multimedia libraries. "
-                "Those libraries are not the export tools."
-            )
+        title = QLabel(f"{APP_NAME} {APP_VERSION}")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        body = QLabel(
+            "Independent desktop application for local video preparation. "
+            "It is not Sony Catalyst Prepare, and it does not claim the same color science or feature set. "
+            "FFmpeg, ffprobe, and Gyroflow stay separate programs. "
+            "Qt playback libraries are not those export tools."
         )
+        body.setWordWrap(True)
+        layout.addWidget(body)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)

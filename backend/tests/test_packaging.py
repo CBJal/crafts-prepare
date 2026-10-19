@@ -15,6 +15,30 @@ def _load(name: str, relative: str):
     return module
 
 
+def test_bundle_guard_drops_foreign_icu_and_virtual_keyboard():
+    import importlib.util
+
+    path = ROOT / "packaging" / "bundle_guard.py"
+    spec = importlib.util.spec_from_file_location("bundle_guard", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    entries = [
+        ("icuuc.dll", r"C:\Users\me\codex-runtimes\poppler\Library\bin\icuuc.dll", "BINARY"),
+        ("Qt6Core.dll", r"C:\py\Lib\site-packages\PySide6\Qt6Core.dll", "BINARY"),
+        ("Qt6VirtualKeyboard.dll", r"C:\py\Lib\site-packages\PySide6\Qt6VirtualKeyboard.dll", "BINARY"),
+        ("qml/QtQuick/VirtualKeyboard/qmldir", r"C:\py\Lib\site-packages\PySide6\qml\QtQuick\VirtualKeyboard\qmldir", "DATA"),
+        ("ffmpeg.exe", r"C:\Tools\ffmpeg\bin\ffmpeg.exe", "BINARY"),
+    ]
+    kept, rejected = module.filter_bundle(entries)
+    names = [item[0] for item in kept]
+    assert "Qt6Core.dll" in names
+    assert "ffmpeg.exe" in names
+    assert "icuuc.dll" not in names
+    assert "Qt6VirtualKeyboard.dll" not in names
+    assert all("VirtualKeyboard" not in item[0] for item in kept)
+    assert any(item["reason"] == "ICU from an unrelated directory" for item in rejected)
+
+
 def test_inno_script_has_no_pascal_comment_and_keeps_user_data():
     text = (ROOT / "packaging" / "crafts-prepare.iss").read_text(encoding="utf-8")
     assert "[Code]" not in text

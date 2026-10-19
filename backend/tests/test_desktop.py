@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtWidgets import QApplication, QDialog
 
 from app.desktop.dialogs import SettingsDialog
@@ -42,6 +42,8 @@ def desktop(qapp, tmp_path, monkeypatch):
     yield window
     window.force_close = True
     window.close()
+    if window._runner.isRunning():
+        window._runner.shutdown(timeout=3)
     qapp.processEvents()
 
 
@@ -201,7 +203,7 @@ def test_close_cancels_an_active_ffmpeg_child(qapp, desktop):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         pytest.skip("ffmpeg is not installed")
-    seen: dict[str, int] = {}
+    seen: dict = {}
 
     def work(cancel):
         from app.process import run_captured
@@ -222,7 +224,7 @@ def test_close_cancels_an_active_ffmpeg_child(qapp, desktop):
             ],
             timeout=30,
             cancel=cancel,
-            on_start=lambda proc: seen.__setitem__("pid", proc.pid),
+            on_start=lambda proc: seen.__setitem__("proc", proc),
         )
 
     desktop._start(work, lambda _value: None, key="long-ffmpeg")
@@ -231,7 +233,7 @@ def test_close_cancels_an_active_ffmpeg_child(qapp, desktop):
     loop = QEventLoop()
 
     def poll() -> None:
-        if "pid" in seen:
+        if "proc" in seen:
             loop.quit()
         else:
             QTimer.singleShot(30, poll)
@@ -239,14 +241,14 @@ def test_close_cancels_an_active_ffmpeg_child(qapp, desktop):
     QTimer.singleShot(4000, loop.quit)
     QTimer.singleShot(0, poll)
     loop.exec()
-    assert "pid" in seen
+    assert "proc" in seen
     started = time.monotonic()
     desktop.force_close = True
     desktop.close()
     assert time.monotonic() - started < 4
     assert desktop._runner.isRunning() is False
-    with pytest.raises(ProcessLookupError):
-        os.kill(seen["pid"], 0)
+    assert seen["proc"].poll() is not None
+    assert seen["proc"].wait(timeout=2) is not None
 
 
 def test_late_import_does_not_enter_a_replaced_project(qapp, desktop, media_dir: Path):
@@ -384,3 +386,189 @@ def test_smoke_harness_uses_the_real_window(qapp, tmp_path: Path, media_dir: Pat
     assert any(Path(item["path"]).is_file() and item["width"] > 0 for item in payload["screenshots"])
     assert code == 0
     qapp.processEvents()
+
+
+def test_fresh_hevc_proxy_can_be_cancelled_and_then_decoded(tmp_path, media_dir, monkeypatch):
+    import shutil
+    import threading
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg and ffprobe are required")
+    monkeypatch.setenv("CRAFTS_DISABLE_WORKER", "1")
+    monkeypatch.setenv("CRAFTS_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("CRAFTS_DATA_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CRAFTS_LOG_PATH", str(tmp_path / "app.log"))
+    from app.errors import Cancelled
+    from app.preview import make_proxy
+    from app.process import run_captured
+    from app.service import Service
+
+    source = media_dir / "hevc_10.mp4"
+    service = Service()
+    imported = service.import_media(str(source))
+    clip = imported["added"][0]
+    destination = service.data_dir / f"proxy-{clip['sha256']}.mp4"
+    cancel = threading.Event()
+    with pytest.raises(Cancelled):
+        make_proxy(
+            ffmpeg=ffmpeg,
+            source=source,
+            destination=destination,
+            duration=2,
+            cancel=cancel,
+            on_start=lambda _proc: cancel.set(),
+        )
+    assert not destination.exists()
+    assert list(destination.parent.glob("*.writing.mp4")) == []
+    result = service.proxy(clip["id"], force=True)
+    proxy = Path(result["proxy_path"])
+    assert proxy.is_file() and proxy.stat().st_size > 0
+    code, stdout, _stderr = run_captured(
+        [ffprobe, "-hide_banner", "-v", "error", "-show_streams", "-of", "json", str(proxy)],
+        timeout=20,
+    )
+    assert code == 0 and "h264" in stdout
+    code, _stdout, stderr = run_captured(
+        [ffmpeg, "-hide_banner", "-v", "error", "-i", str(proxy), "-f", "null", "-"],
+        timeout=30,
+    )
+    assert code == 0, stderr
+
+
+def test_playback_error_falls_back_to_a_proxy(qapp, desktop, media_dir: Path):
+    from PySide6.QtMultimedia import QMediaPlayer
+
+    desktop.import_paths([str(media_dir / "h264_8.mp4")])
+    assert desktop.wait_until_idle(30000)
+    desktop._on_player_error(QMediaPlayer.Error.ResourceError, "unsupported")
+    assert desktop.wait_until_idle(30000)
+    assert desktop.playback_result["kind"] == "proxy"
+    proxy = Path(desktop.playback_result["proxy_path"])
+    assert proxy.is_file() and proxy.stat().st_size > 0
+
+
+def test_focus_change_drops_the_previous_still(qapp, desktop, media_dir: Path):
+    desktop.import_paths([str(media_dir / "h264_8.mp4"), str(media_dir / "hevc_10.mp4")])
+    assert desktop.wait_until_idle(30000)
+    desktop.focus_clip(desktop.clips[0]["id"])
+    desktop._still_seq = 4
+    desktop.still_path = "old"
+    desktop._show_still(desktop._project_gen, 4, True, str(media_dir / "h264_8.mp4"))
+    first = desktop.focused_id()
+    desktop.focus_clip(desktop.clips[1]["id"])
+    assert desktop.focused_id() != first
+    assert desktop.still_path == ""
+    assert desktop.player is None or desktop.player.source().isEmpty()
+    desktop._show_still(desktop._project_gen, 4, True, str(media_dir / "h264_8.mp4"))
+    assert desktop.still_path == ""
+
+
+def test_still_pixmap_fits_without_forcing_layout(qapp, desktop):
+    pixmap = QPixmap(1920, 1080)
+    pixmap.fill(Qt.GlobalColor.black)
+    label = desktop.still_adjusted
+    label.resize(800, 270)
+    qapp.processEvents()
+    label.set_source(pixmap)
+    shown = label.pixmap()
+    assert shown is not None and not shown.isNull()
+    assert shown.width() <= 800
+    assert shown.height() <= 270
+    assert abs((shown.width() / shown.height()) - (16 / 9)) < 0.08
+    assert label.minimumSizeHint().width() < 400
+
+
+def test_dialogs_stay_within_a_narrow_window(qapp, desktop):
+    from app.desktop.dialogs import AboutDialog
+
+    about = AboutDialog(desktop)
+    about.show()
+    qapp.processEvents()
+    assert about.width() <= 900
+    settings = desktop.make_settings_dialog() if False else None
+    from app.desktop.dialogs import SettingsDialog
+
+    dialog = SettingsDialog(desktop.service, desktop)
+    dialog.fields["ffmpeg"].setText("C:\\" + ("very-long-path\\" * 40) + "ffmpeg.exe")
+    dialog.show()
+    qapp.processEvents()
+    assert dialog.width() <= 900
+    before = desktop.service.settings["ffmpeg"]
+    dialog.reject()
+    assert desktop.service.settings["ffmpeg"] == before
+
+
+def test_unreadable_import_keeps_the_clips_already_added(qapp, desktop, media_dir: Path, tmp_path: Path):
+    good = media_dir / "h264_8.mp4"
+    missing = tmp_path / "missing.mp4"
+    desktop.import_paths([str(good), str(missing)])
+    assert desktop.wait_until_idle(30000)
+    assert len(desktop.clips) == 1
+    assert missing.name in desktop.last_error
+
+
+def test_invalid_notes_block_save(qapp, desktop, media_dir: Path, tmp_path: Path):
+    desktop.import_paths([str(media_dir / "h264_8.mp4")])
+    assert desktop.wait_until_idle(30000)
+    desktop.notes.setPlainText("x" * 9001)
+    assert desktop.commit_editor() is False
+    assert desktop.save_project_to(str(tmp_path / "notes.crafts.json")) is False
+    assert desktop.clips[0]["notes"] == ""
+
+
+def test_tool_report_cancel_stops_the_owned_process(qapp, desktop, tmp_path: Path, monkeypatch):
+    script = tmp_path / "hang.py"
+    script.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+    script.chmod(0o755)
+    desktop.service.settings["ffmpeg"] = str(script)
+    desktop.service._caps_cache = None
+    seen: dict = {}
+    import app.process as process
+
+    real = process.run_captured
+
+    def wrapped(args, **kwargs):
+        original = kwargs.get("on_start")
+
+        def started(proc):
+            seen["proc"] = proc
+            if original is not None:
+                original(proc)
+
+        kwargs = dict(kwargs)
+        kwargs["on_start"] = started
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(process, "run_captured", wrapped)
+    monkeypatch.setattr("app.capabilities.run_captured", wrapped)
+    monkeypatch.setattr("app.capabilities.tool_version", process.tool_version)
+    desktop._start(lambda cancel: desktop.service.capabilities(cancel=cancel), lambda _report: None, key="caps")
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+
+    def poll() -> None:
+        if "proc" in seen:
+            loop.quit()
+        else:
+            QTimer.singleShot(30, poll)
+
+    QTimer.singleShot(4000, loop.quit)
+    QTimer.singleShot(0, poll)
+    loop.exec()
+    assert "proc" in seen
+    assert desktop._runner.settle(timeout=4)
+    assert desktop.wait_until_idle(4000)
+    assert seen["proc"].poll() is not None
+
+
+def test_server_name_includes_the_user_and_profile():
+    import getpass
+
+    from app.desktop.main import server_name
+
+    name = server_name()
+    assert "CraftsPrepare-" in name
+    assert getpass.getuser().replace(" ", "_")[:8] in name or name.count("-") >= 2

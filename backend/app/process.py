@@ -190,9 +190,11 @@ def run_captured(
     return code, stdout, stderr
 
 
-def tool_version(args: list[str], timeout: float = 15) -> tuple[bool, str]:
+def tool_version(args: list[str], timeout: float = 15, cancel=None, on_start=None) -> tuple[bool, str]:
     try:
-        code, stdout, stderr = run_captured(args, timeout=timeout)
+        code, stdout, stderr = run_captured(args, timeout=timeout, cancel=cancel, on_start=on_start)
+    except Cancelled:
+        raise
     except (OSError, CraftsError) as exc:
         return False, str(exc)
     text = (stdout or stderr).strip()

@@ -55,11 +55,30 @@ Example `smoke.json` for 10-bit sources that need an acknowledged ProRes export:
 
 ```json
 {
-  "export": {"preset": "prores_422", "audio": false, "fit": "resize", "width": 640, "height": 360, "acknowledge": true, "suffix": "_export"},
-  "gyro": {"format": "prores_422", "audio": false, "width": 640, "height": 360, "suffix": "_gyro", "expect": "succeeded"},
-  "expect": {"min_export_succeeded": 2}
+  "export": {
+    "preset": "prores_422",
+    "audio": false,
+    "fit": "resize",
+    "width": 640,
+    "height": 360,
+    "acknowledge": true,
+    "suffix": "_export",
+    "trim_in": 0.2,
+    "trim_out": 1.2
+  },
+  "gyro": {
+    "format": "prores_422",
+    "audio": false,
+    "width": 640,
+    "height": 360,
+    "suffix": "_gyro",
+    "expect": "succeeded"
+  },
+  "expect": {"min_export_succeeded": 2, "min_gyro_succeeded": 2}
 }
 ```
+
+`trim_in` and `trim_out` are applied with the trim controls on every selected clip before the ordinary export. Gyro jobs use each clip's full stored range only when those trim fields are omitted; with the values above, the ordinary export is 0.2–1.2 seconds and the gyro job still uses the trim that was just saved. Set gyro `expect` to `failed` only for an explicit negative control. The run exits nonzero unless every required export and gyro job publishes a file, the viewer records frames and a position, and the source SHA-256 values are unchanged.
 
 A normal double-click does not show that diagnostic mode. A second launch focuses the window that is already open.
 

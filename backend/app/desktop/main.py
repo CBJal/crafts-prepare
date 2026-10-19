@@ -43,7 +43,11 @@ def configure_logging(path: Path) -> None:
 
 
 def server_name() -> str:
-    return f"CraftsPrepare-{profile_name()}"
+    import getpass
+    import re
+
+    user = re.sub(r"[^A-Za-z0-9_-]", "_", getpass.getuser())[:32] or "user"
+    return f"CraftsPrepare-{user}-{profile_name()}"
 
 
 def notify_running(name: str | None = None, timeout_ms: int = 2000) -> bool:
