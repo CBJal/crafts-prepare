@@ -26,6 +26,7 @@ a = Analysis(
     pathex=[str(root / "backend")],
     binaries=[],
     datas=[
+        (str(root / "LICENSE"), "."),
         (str(root / "THIRD_PARTY_NOTICES.md"), "."),
         (str(spec_dir / "PREREQUISITES.txt"), "."),
         (str(license_dir), "licenses"),

@@ -1,5 +1,7 @@
 # Crafts Prepare
 
+Open-source local video preparation for Windows and development platforms. The application is [MIT licensed](LICENSE); [contributions](CONTRIBUTING.md) are welcome.
+
 <img src="docs/ui/app-icon.png" alt="Crafts Prepare" width="64" height="64">
 
 Crafts Prepare is a local video-preparation bench for inspecting, trimming, adjusting, visually stabilizing, and batch-exporting footage. It runs on your machine. It does not upload media, create an account, or charge for its own features.
@@ -8,6 +10,12 @@ Crafts Prepare is a local video-preparation bench for inspecting, trimming, adju
 ![Dark workspace](docs/ui/workspace-dark.png)
 
 It is an independent app. Sony Catalyst Prepare is a separate product. Public Catalyst help pages were used as a feature checklist only. This repository does not contain Sony code, Sony artwork, or camera footage.
+
+## License and community
+
+The application's own source, documentation and original project artwork are covered by the [MIT license](LICENSE). Third-party libraries and tools retain their own terms; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the bundled notices. The optional telemetry helper retains its declared MIT OR Apache-2.0 license, with both texts in `tools/telemetry-inspect`.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) to report ordinary bugs or submit changes. Use [SECURITY.md](SECURITY.md) for private vulnerability reports. This is an independent development app; the limitations below remain applicable.
 
 ## What you need
 
