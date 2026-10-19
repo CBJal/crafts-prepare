@@ -27,8 +27,9 @@ def test_build_script_does_not_delete_previous_outputs():
     text = (ROOT / "packaging" / "build-windows.ps1").read_text(encoding="utf-8")
     assert "Remove-Item" not in text
     assert "Refusing to overwrite" in text
-    assert '/DSourceDir=`"$bundle`"' in text
-    assert '/DOutputDir=`"$installerOut`"' in text
+    assert '"/DSourceDir=$bundle"' in text
+    assert '"/DOutputDir=$installerOut"' in text
+    assert '`"' not in text
     assert "pyinstaller==6.22.3" in (ROOT / "packaging" / "requirements-build.txt").read_text(encoding="utf-8")
     pins = (ROOT / "packaging" / "requirements-build.txt").read_text(encoding="utf-8")
     for pin in (

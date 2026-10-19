@@ -128,8 +128,8 @@ Set-Content -Path $infoPath -Value $info -Encoding utf8
 $iscc = Find-Iscc
 & $iscc @(
     "/DAppVersion=$appVersion",
-    "/DSourceDir=`"$bundle`"",
-    "/DOutputDir=`"$installerOut`"",
+    "/DSourceDir=$bundle",
+    "/DOutputDir=$installerOut",
     (Join-Path $Root "packaging\crafts-prepare.iss")
 )
 Assert-Native "ISCC"
