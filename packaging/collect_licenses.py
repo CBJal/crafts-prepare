@@ -1,7 +1,7 @@
 """Copy the license texts that a Windows build actually bundles.
 
-Run this with the build virtualenv after pip install and npm ci. It does not
-download anything. FFmpeg, Gyroflow, and font files are not collected.
+Run this with the build virtualenv after pip install. It does not download
+anything. The external ffmpeg program and Gyroflow are not collected.
 """
 
 from __future__ import annotations
@@ -25,6 +25,9 @@ RUNTIME_DISTRIBUTIONS = (
     "typing-extensions",
     "typing-inspection",
     "uvicorn",
+    "PySide6-Essentials",
+    "PySide6-Addons",
+    "shiboken6",
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,11 +136,30 @@ def collect_react_licenses(output: Path) -> list[str]:
     return copied
 
 
+def collect_qt_notices(output: Path) -> list[str]:
+    source = ROOT / "packaging" / "third-party-licenses"
+    folder = output / "Qt"
+    folder.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    notice = ROOT / "packaging" / "QT_NOTICES.txt"
+    if not notice.is_file():
+        raise SystemExit("packaging/QT_NOTICES.txt is missing.")
+    shutil.copyfile(notice, folder / "QT_NOTICES.txt")
+    copied.append("Qt/QT_NOTICES.txt")
+    for path in sorted(source.glob("*.txt")):
+        shutil.copyfile(path, folder / path.name)
+        copied.append(f"Qt/{path.name}")
+    if not any(name.endswith("LGPL-3.0.txt") for name in copied):
+        raise SystemExit("The LGPL-3.0 text was not copied.")
+    return copied
+
+
 def collect_runtime_licenses(output: Path) -> list[str]:
     output.mkdir(parents=True, exist_ok=True)
     copied = [collect_python_license(output)]
     for name in RUNTIME_DISTRIBUTIONS:
         copied.extend(collect_distribution(name, output))
+    copied.extend(collect_qt_notices(output))
     return copied
 
 
@@ -145,15 +167,15 @@ def collect_all(output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     copied = collect_runtime_licenses(output)
     copied.append(collect_pyinstaller_bootloader(output))
-    copied.extend(collect_react_licenses(output))
     notice = ROOT / "THIRD_PARTY_NOTICES.md"
     if notice.is_file():
         shutil.copyfile(notice, output / "THIRD_PARTY_NOTICES.md")
         copied.append("THIRD_PARTY_NOTICES.md")
     lines = [
         "License texts collected for the Crafts Prepare Windows build.",
-        "FFmpeg, Gyroflow, and font files are not bundled.",
-        "Fraunces and Outfit remain in frontend/package.json and are not imported by the UI.",
+        "The external ffmpeg, ffprobe, and Gyroflow programs are not bundled.",
+        "Qt Multimedia may include its own playback libraries. Those are not the external ffmpeg program.",
+        "Qt WebEngine is not bundled. The optional web UI is not bundled.",
         "",
         *copied,
         "",

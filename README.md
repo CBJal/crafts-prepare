@@ -20,26 +20,38 @@ Crafts Prepare does not download or redistribute those tools. A missing tool is 
 
 ## Windows installer
 
-The development start script still needs Python and Node. The installer does not. On a Windows x64 build machine that already has Python 3.12–3.14, Node.js with npm, and Inno Setup 6:
+Version 0.2.0 is a native Qt desktop application. It does not open a browser and it does not start the loopback web server. `python -m app` is still the optional development web UI and still needs Node the first time you build `frontend/dist`.
+
+On a Windows x64 build machine that already has Python 3.12–3.14 and Inno Setup 6:
 
 ```
 powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
 ```
 
-The script does not download those tools, FFmpeg, or Gyroflow. It does not delete earlier build folders. Each run writes a new directory:
+The script does not download Python, Inno Setup, FFmpeg, or Gyroflow, and it does not need Node. It does not delete earlier build folders. Each run writes a new directory:
 
-- `packaging\output\<yyyyMMdd-HHmmss>\dist\CraftsPrepare\CraftsPrepare.exe` — the windowed app
-- `packaging\output\<yyyyMMdd-HHmmss>\work\` — PyInstaller work files
-- `packaging\output\<yyyyMMdd-HHmmss>\licenses\` — Python, dependency, PyInstaller, and React license texts copied into the app
-- `packaging\output\<yyyyMMdd-HHmmss>\installer\CraftsPrepare-Setup-0.1.0.exe` — the per-user installer
-- `packaging\output\<yyyyMMdd-HHmmss>\installer\SHA256SUMS.txt` — SHA-256 of the installer and `CraftsPrepare.exe`
-- `packaging\output\<yyyyMMdd-HHmmss>\installer\build-info.json` — version and the git SHA that was built
+- `packaging\output\<yyyyMMdd-HHmmss>\dist\CraftsPrepare\CraftsPrepare.exe`
+- `packaging\output\<yyyyMMdd-HHmmss>\work\`
+- `packaging\output\<yyyyMMdd-HHmmss>\licenses\` — Python, Qt/LGPL, PySide6, and PyInstaller license texts
+- `packaging\output\<yyyyMMdd-HHmmss>\installer\CraftsPrepare-Setup-0.2.0.exe`
+- `packaging\output\<yyyyMMdd-HHmmss>\installer\SHA256SUMS.txt`
+- `packaging\output\<yyyyMMdd-HHmmss>\installer\build-info.json`
 
-Pass `-OutputRoot` to choose that directory. If it already exists, the script stops and leaves it in place. `CraftsPrepare.exe` carries FileVersion and ProductVersion `0.1.0`. The build is unsigned. Windows may show a SmartScreen prompt until you sign the installer yourself.
+Pass `-OutputRoot` to choose that directory. If it already exists, the script stops and leaves it in place. `CraftsPrepare.exe` carries FileVersion and ProductVersion `0.2.0`. The build is unsigned. Windows may show a SmartScreen prompt until you sign the installer yourself.
 
-Install for the current user. Shortcuts go on the Start menu, and a desktop shortcut is optional. Uninstall removes the program files only. Settings, cache, logs, and projects stay in `%LOCALAPPDATA%\CraftsPrepare` and wherever you saved projects. The installed app ignores `CRAFTS_HOST`, `CRAFTS_PORT`, `CRAFTS_SETTINGS_PATH`, `CRAFTS_DATA_DIR`, `CRAFTS_LOG_PATH`, and `CRAFTS_DISABLE_WORKER`. Development still honors those. A separate frozen profile for QA is `%LOCALAPPDATA%\CraftsPrepare-<token>` when you start the exe with `--profile <token>` or set `CRAFTS_PROFILE` to a short token such as `qa`.
+The installer uses the same AppId as 0.1.0, so it upgrades `%LOCALAPPDATA%\Programs\Crafts Prepare` and leaves `%LOCALAPPDATA%\CraftsPrepare` settings in place. Uninstall removes program files only. Saved projects stay where you put them.
 
-FFmpeg, ffprobe, and Gyroflow stay separate programs. The app looks on PATH and in common install locations, or uses the paths you set in Capabilities. If they are missing, the window still opens and says so.
+The installed app ignores `CRAFTS_HOST`, `CRAFTS_PORT`, `CRAFTS_SETTINGS_PATH`, `CRAFTS_DATA_DIR`, `CRAFTS_LOG_PATH`, and `CRAFTS_DISABLE_WORKER`. Development still honors those. `--profile qa` uses `%LOCALAPPDATA%\CraftsPrepare-qa`. A second launch focuses the existing window.
+
+FFmpeg, ffprobe, and Gyroflow stay separate programs. Qt may include its own playback libraries. Those are not the export tools. If the export tools are missing, the window still opens and says so.
+
+An installed smoke test is off unless you pass `--smoke`. It drives the real window with paths you choose:
+
+```
+& "$env:LOCALAPPDATA\Programs\Crafts Prepare\CraftsPrepare.exe" --smoke --sample C:\clips\sample.mp4 --output C:\clips\out --report C:\clips\out\smoke.json --screenshots C:\clips\out\shots
+```
+
+A normal double-click does not show that diagnostic mode.
 
 ## Windows development
 

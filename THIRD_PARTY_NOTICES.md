@@ -10,7 +10,9 @@ The optional Windows installer does bundle a Python runtime and the PyInstaller 
 
 The Windows build also copies the license files of the Python packages it bundles (FastAPI, Uvicorn, Pydantic, Starlette, and their runtime dependencies) and the React and react-dom `LICENSE` files. FFmpeg and Gyroflow binaries are not in the package.
 
-**tkinter / Tcl/Tk.** Used for the installed app's Open/Quit window. The Windows python.org builds ship Tcl/Tk under their own license, which PyInstaller collects. Not used by the development server.
+**PySide6 / Qt 6.12 / shiboken6.** The installed desktop application. LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only. Pins: `PySide6-Essentials`, `PySide6-Addons`, and `shiboken6` 6.12.0. The PySide6 metapackage is not used, because it depends on Qt WebEngine. Qt WebEngine is not part of this app. The libraries are separate shared modules in the onedir folder. See `packaging/QT_NOTICES.txt` for source links and how to replace those modules. Qt Multimedia may ship its own FFmpeg playback libraries (`avcodec`, `avformat`, `swscale`, `swresample`, and the ffmpeg media plugin). Those are not the ffmpeg.exe you configure for export, proxies, stills, or gyro.
+
+**tkinter / Tcl/Tk.** No longer used by the installed app. The optional development server does not use it either.
 
 ## Application dependencies
 

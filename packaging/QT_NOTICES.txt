@@ -1,0 +1,56 @@
+Qt, PySide6, and the playback libraries
+======================================
+
+Crafts Prepare 0.2.0 links to Qt 6 through PySide6. The packages are
+PySide6-Essentials, PySide6-Addons, and shiboken6, pinned in
+backend/requirements.txt. Qt WebEngine is not installed and is not part of
+this application. There is no embedded browser.
+
+License
+-------
+
+PySide6, Qt, and shiboken6 are available under LGPL-3.0-only OR GPL-2.0-only
+OR GPL-3.0-only. The full texts are in this folder:
+
+- LGPL-3.0.txt
+- GPL-2.0.txt
+- GPL-3.0.txt
+
+Source
+------
+
+- PySide6 / shiboken6: https://code.qt.io/cgit/pyside/pyside-setup.git/
+- Release downloads: https://download.qt.io/official_releases/QtForPython/
+- Qt archives: https://download.qt.io/archive/qt/
+
+This build uses Qt 6.12.0.
+
+Dynamic linking and relinking
+-----------------------------
+
+The Windows installer is a PyInstaller onedir folder. Qt, shiboken, and the
+Qt Multimedia libraries are separate shared libraries next to
+CraftsPrepare.exe. They are not compiled into that executable.
+
+You may replace those shared libraries with compatible builds you produce
+from the corresponding source, or rebuild this application against another
+PySide6 build. Replacing a library does not require Crafts Prepare's own
+source to be relicensed.
+
+Qt Multimedia is not the FFmpeg you configure
+---------------------------------------------
+
+Playback can use Qt Multimedia's FFmpeg plugin. That plugin loads separate
+shared libraries such as avcodec, avformat, swscale, and swresample that ship
+inside the Qt build, together with the ffmpegmediaplugin. Those files are
+only the playback backend.
+
+They are not ffmpeg.exe, ffprobe.exe, or Gyroflow. Export, proxies, stills,
+and gyro stabilization call the programs you install and set under Tools.
+If those programs are missing, the job fails and is not reported as success.
+A missing playback codec does not change that.
+
+The Qt playback libraries are their own FFmpeg build. Their source is the
+FFmpeg revision Qt used for Qt 6.12, published with the Qt sources above.
+Crafts Prepare does not grant any extra right to redistribute a separately
+downloaded FFmpeg or Gyroflow.

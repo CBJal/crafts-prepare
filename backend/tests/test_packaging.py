@@ -30,6 +30,11 @@ def test_build_script_does_not_delete_previous_outputs():
     assert '"/DSourceDir=$bundle"' in text
     assert '"/DOutputDir=$installerOut"' in text
     assert '`"' not in text
+    assert "npm ci" not in text
+    spec = (ROOT / "packaging" / "crafts-prepare.spec").read_text(encoding="utf-8")
+    assert "frontend/dist" not in spec
+    assert "QtWebEngine" in spec
+    assert "PySide6.QtWebView" in spec
     assert "pyinstaller==6.22.3" in (ROOT / "packaging" / "requirements-build.txt").read_text(encoding="utf-8")
     pins = (ROOT / "packaging" / "requirements-build.txt").read_text(encoding="utf-8")
     for pin in (
@@ -46,15 +51,15 @@ def test_build_script_does_not_delete_previous_outputs():
 def test_version_resource_matches_the_app_version(tmp_path: Path):
     module = _load("write_version_info", "packaging/write_version_info.py")
     destination = tmp_path / "file_version_info.txt"
-    assert module.write_version_info(destination) == "0.1.0"
+    assert module.write_version_info(destination) == "0.2.0"
     text = destination.read_text(encoding="utf-8")
-    assert "filevers=(0, 1, 0, 0)" in text
-    assert "prodvers=(0, 1, 0, 0)" in text
-    assert "FileVersion" in text and "0.1.0" in text
+    assert "filevers=(0, 2, 0, 0)" in text
+    assert "prodvers=(0, 2, 0, 0)" in text
+    assert "FileVersion" in text and "0.2.0" in text
     assert "ProductVersion" in text
     assert "InternalName" in text and "CraftsPrepare" in text
     committed = (ROOT / "packaging" / "file_version_info.txt").read_text(encoding="utf-8")
-    assert "FileVersion" in committed and "0.1.0" in committed
+    assert "FileVersion" in committed and "0.2.0" in committed
 
 
 def test_runtime_license_texts_are_copied(tmp_path: Path):
@@ -66,4 +71,7 @@ def test_runtime_license_texts_are_copied(tmp_path: Path):
     fastapi_files = list((output / "fastapi").rglob("*"))
     assert any(path.is_file() and path.stat().st_size > 0 for path in fastapi_files)
     assert any(item.startswith("Python/") for item in copied)
-    assert "FFmpeg" not in " ".join(path.name for path in output.rglob("*"))
+    notice = (output / "Qt" / "QT_NOTICES.txt").read_text(encoding="utf-8")
+    lgpl = (output / "Qt" / "LGPL-3.0.txt").read_text(encoding="utf-8")
+    assert "Qt WebEngine is not installed" in notice
+    assert "GNU LESSER GENERAL PUBLIC LICENSE" in lgpl

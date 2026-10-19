@@ -1,5 +1,6 @@
 # Build a per-user Crafts Prepare installer on Windows x64.
-# Does not download Python, Node, Inno Setup, FFmpeg, or Gyroflow.
+# Does not download Python, Inno Setup, FFmpeg, or Gyroflow.
+# The native app does not need Node, and this script does not build the optional web UI.
 # Does not delete previous build folders. Each run writes a new output directory.
 param(
     [string]$OutputRoot
@@ -37,10 +38,6 @@ Assert-Native "Reading the Python version"
 if ($LASTEXITCODE -ne 0) {
     throw "Python $versionText is outside 3.12-3.14. Crafts Prepare does not install another interpreter."
 }
-if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-    throw "npm is required to build the web UI. This script does not install Node.js."
-}
-
 $appVersion = (& python -c @'
 import pathlib, re, sys
 text = pathlib.Path("backend/app/version.py").read_text(encoding="utf-8")
@@ -66,16 +63,6 @@ if (-not (Test-Path $python)) {
 }
 & $python -m pip install -r backend\requirements.lock -r packaging\requirements-build.txt
 Assert-Native "pip install build dependencies"
-
-Push-Location frontend
-& npm ci
-Assert-Native "npm ci"
-& npm run build
-Assert-Native "npm run build"
-Pop-Location
-if (-not (Test-Path "frontend\dist\index.html")) {
-    throw "frontend\dist\index.html is missing after npm run build."
-}
 
 & $python packaging\make_icon.py
 Assert-Native "make_icon.py"

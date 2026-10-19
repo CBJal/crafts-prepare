@@ -35,7 +35,8 @@ Status below is what this repository implements. "Verified here" means an automa
 | Light, Dark, and System themes | Implemented | Neutral slate and white surfaces with a blue accent. The choice is stored locally. Footage is not recolored |
 | Queue cancel, retry, collision, failed ffmpeg | Implemented | Yes |
 | Windows process-tree kill | Code path uses `taskkill /F /T` with `CREATE_NO_WINDOW` | Not executed on Windows. Linux process-group kill was tested |
-| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup. The build script keeps each attempt in its own output directory and does not delete older ones. This Linux session did not run PyInstaller or Inno Setup. FFmpeg and Gyroflow are not inside the package |
+| Native desktop | PySide6 Qt Widgets | Library, viewer, inspector, and queue. No embedded browser and no loopback UI server in the installed app. The optional web UI remains available with `python -m app` |
+| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup, version 0.2.0, same install id as 0.1.0. This Linux session did not run PyInstaller or Inno Setup. FFmpeg and Gyroflow programs are not inside the package. Qt playback libraries, when the wheel includes them, are separate from those programs |
 | Accounts, payments, cloud upload | Not implemented | |
 
 Preset pixel formats:

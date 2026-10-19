@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller onedir build. Run from packaging/build-windows.ps1."""
+"""PyInstaller onedir build for the native Qt app. Run from packaging/build-windows.ps1."""
 
 import os
 from pathlib import Path
@@ -21,39 +21,47 @@ a = Analysis(
     pathex=[str(root / "backend")],
     binaries=[],
     datas=[
-        (str(root / "frontend" / "dist"), "frontend/dist"),
         (str(root / "THIRD_PARTY_NOTICES.md"), "."),
         (str(spec_dir / "PREREQUISITES.txt"), "."),
         (str(license_dir), "licenses"),
     ],
     hiddenimports=[
         "app",
-        "app.launcher",
-        "app.main",
+        "app.desktop",
+        "app.desktop.main",
+        "app.desktop.window",
+        "app.desktop.smoke",
+        "app.service",
         "app.runtime",
         "app.version",
-        "app.service",
-        "h11",
-        "uvicorn",
-        "uvicorn.logging",
-        "uvicorn.loops",
-        "uvicorn.loops.auto",
-        "uvicorn.protocols",
-        "uvicorn.protocols.http",
-        "uvicorn.protocols.http.auto",
-        "uvicorn.protocols.http.h11_impl",
-        "uvicorn.protocols.websockets",
-        "uvicorn.protocols.websockets.auto",
-        "uvicorn.lifespan",
-        "uvicorn.lifespan.on",
-        "uvicorn.lifespan.off",
+        "PySide6.QtMultimedia",
+        "PySide6.QtMultimediaWidgets",
+        "PySide6.QtNetwork",
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "pyinstaller"],
+    excludes=[
+        "pytest",
+        "pyinstaller",
+        "PySide6.QtWebEngine",
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebView",
+        "PySide6.QtPdf",
+        "PySide6.QtPdfWidgets",
+    ],
     noarchive=False,
 )
+
+def _keep(entry) -> bool:
+    name = str(entry[0]).lower().replace("\\", "/")
+    blocked = ("webengine", "/webview/", "qtwebview", "qtpdf")
+    return not any(piece in name for piece in blocked)
+
+a.binaries = [entry for entry in a.binaries if _keep(entry)]
+a.datas = [entry for entry in a.datas if _keep(entry)]
+
 pyz = PYZ(a.pure, a.zipped_data)
 exe = EXE(
     pyz,

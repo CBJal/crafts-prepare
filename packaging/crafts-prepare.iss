@@ -1,6 +1,6 @@
 ; Per-user Windows x64 installer. No admin, service, firewall, or autostart.
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "dist\CraftsPrepare"
