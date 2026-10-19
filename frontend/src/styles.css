@@ -1,42 +1,42 @@
 :root,
 [data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0f1419;
-  --panel: #171d25;
-  --panel-2: #1e2631;
-  --line: #2e3a48;
-  --ink: #e7edf4;
+  --bg: #12161c;
+  --panel: #171c23;
+  --panel-2: #222a34;
+  --line: #313a46;
+  --ink: #e8eef4;
   --muted: #9aa8b8;
   --disabled: #7d8b9b;
-  --accent: #4c8dff;
-  --accent-ink: #061018;
+  --accent: #d5dde6;
+  --accent-ink: #12161c;
   --ok: #8fce9a;
   --keep: #8eb4d4;
   --ng: #e7a394;
   --danger: #ffb4ab;
   --stage: #0b0e12;
   --input: #12181f;
-  --shadow: 0 0 0 1px rgba(76, 141, 255, 0.45);
+  --shadow: 0 0 0 1px rgba(213, 221, 230, 0.45);
 }
 
 [data-theme="light"] {
   color-scheme: light;
-  --bg: #f3f6fa;
-  --panel: #ffffff;
-  --panel-2: #f7f9fc;
-  --line: #d5dee8;
-  --ink: #1c2430;
+  --bg: #e8ecef;
+  --panel: #f7f8fa;
+  --panel-2: #ffffff;
+  --line: #d5dbe2;
+  --ink: #1a2028;
   --muted: #5c6b7c;
   --disabled: #6d7c8d;
-  --accent: #1d5bbf;
-  --accent-ink: #ffffff;
+  --accent: #2a3340;
+  --accent-ink: #f4f7f8;
   --ok: #1f7a45;
   --keep: #1d5bbf;
   --ng: #9d2c2c;
   --danger: #9d2c2c;
   --stage: #e7eef6;
   --input: #ffffff;
-  --shadow: 0 0 0 1px rgba(29, 91, 191, 0.45);
+  --shadow: 0 0 0 1px rgba(42, 51, 64, 0.35);
 }
 
 * { box-sizing: border-box; }
@@ -52,6 +52,9 @@ body {
 button, input, select, textarea { font: inherit; color: inherit; }
 
 button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
   background: var(--accent);
   color: var(--accent-ink);
   border: 1px solid transparent;
@@ -60,6 +63,8 @@ button {
   font-weight: 600;
   cursor: pointer;
 }
+
+.icon { width: 16px; height: 16px; flex: 0 0 auto; }
 
 button:disabled {
   background: var(--panel-2);
@@ -109,18 +114,8 @@ p { color: var(--muted); }
   width: 36px;
   height: 36px;
   border-radius: 8px;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  position: relative;
-}
-.mark::before {
-  content: "";
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  top: 16px;
-  height: 3px;
-  background: var(--accent);
+  display: block;
+  object-fit: cover;
 }
 .project-name, .theme-choice { min-width: 160px; }
 .chip { border-radius: 999px; padding: 0.15rem 0.5rem; border: 1px solid var(--line); font-size: 0.8rem; color: var(--muted); }

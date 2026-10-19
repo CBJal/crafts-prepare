@@ -20,7 +20,7 @@ Crafts Prepare does not download or redistribute those tools. A missing tool is 
 
 ## Windows installer
 
-Version 0.2.0 is a native Qt desktop application. It does not open a browser and it does not start the loopback web server. `python -m app` is still the optional development web UI and still needs Node the first time you build `frontend/dist`.
+Version 0.2.1 is a native Qt desktop application. The approved silver C mark is `assets/brand/app-icon.png` and `assets/brand/app-icon.ico`. `packaging/make_icon.py` copies that ICO into `packaging/icon.ico`. It does not draw a substitute. See `docs/BRANDING.md`. It does not open a browser and it does not start the loopback web server. `python -m app` is still the optional development web UI and still needs Node the first time you build `frontend/dist`.
 
 On a Windows x64 build machine that already has Python 3.12–3.14 and Inno Setup 6:
 
@@ -33,11 +33,11 @@ The script does not download Python, Inno Setup, FFmpeg, or Gyroflow, and it doe
 - `packaging\output\<yyyyMMdd-HHmmss>\dist\CraftsPrepare\CraftsPrepare.exe`
 - `packaging\output\<yyyyMMdd-HHmmss>\work\`
 - `packaging\output\<yyyyMMdd-HHmmss>\licenses\` — Python, Qt/LGPL, PySide6, and PyInstaller license texts
-- `packaging\output\<yyyyMMdd-HHmmss>\installer\CraftsPrepare-Setup-0.2.0.exe`
+- `packaging\output\<yyyyMMdd-HHmmss>\installer\CraftsPrepare-Setup-0.2.1.exe`
 - `packaging\output\<yyyyMMdd-HHmmss>\installer\SHA256SUMS.txt`
 - `packaging\output\<yyyyMMdd-HHmmss>\installer\build-info.json`
 
-Pass `-OutputRoot` to choose that directory. If it already exists, the script stops and leaves it in place. `CraftsPrepare.exe` carries FileVersion and ProductVersion `0.2.0`. The build is unsigned. Windows may show a SmartScreen prompt until you sign the installer yourself.
+Pass `-OutputRoot` to choose that directory. If it already exists, the script stops and leaves it in place. `CraftsPrepare.exe` carries FileVersion and ProductVersion `0.2.1`. The build is unsigned. Windows may show a SmartScreen prompt until you sign the installer yourself.
 
 The installer uses the same AppId as 0.1.0, so it upgrades `%LOCALAPPDATA%\Programs\Crafts Prepare` and leaves `%LOCALAPPDATA%\CraftsPrepare` settings in place. Uninstall removes program files only. Saved projects stay where you put them.
 

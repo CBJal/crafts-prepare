@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -47,6 +48,57 @@ from .theme import apply_theme
 from .workers import TaskRunner
 
 _ACTIVE = {"queued", "running"}
+
+_ICON_FOR_LABEL = {
+    "New": "new",
+    "Open…": "open",
+    "Save": "save",
+    "Save as…": "save-as",
+    "Import files…": "import",
+    "Import folder…": "import-folder",
+    "Select all": "select",
+    "Select all for batch": "select",
+    "Clear": "clear",
+    "Clear batch checks": "clear",
+    "Playback": "playback",
+    "Original": "still",
+    "Adjusted": "adjusted",
+    "Play": "play",
+    "Pause": "pause",
+    "Frame −": "frame-back",
+    "Frame +": "frame-forward",
+    "Set in": "mark-in",
+    "Set out": "mark-out",
+    "Save notes": "save",
+    "Add marker at playhead": "marker",
+    "Remove marker": "clear",
+    "LUT…": "browse",
+    "Folder…": "browse",
+    "Preset…": "browse",
+    "Browse": "browse",
+    "Export focused clip": "export",
+    "Export checked clips": "export",
+    "Gyro checked clips": "gyro",
+    "Parse GCSV": "log",
+    "Inspect telemetry": "tools",
+    "Queue manual gyro": "gyro",
+    "Copy path": "copy",
+    "Technical details": "about",
+    "Cancel job": "cancel",
+    "Retry job": "retry",
+    "Cancel batch": "cancel",
+    "Retry failed": "retry",
+    "External programs…": "tools",
+    "Refresh tool report": "retry",
+    "Light": "sun",
+    "Dark": "moon",
+    "System": "system",
+    "Reset layout": "layout",
+    "About": "about",
+    "Preview limits": "help",
+    "Log folder": "log",
+    "Licenses": "about",
+}
 
 
 class FitLabel(QLabel):
@@ -177,6 +229,10 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.batch_count)
         layout.addLayout(controls)
         self.library = QTableWidget(0, 4)
+        self.library_empty = QLabel("No clips yet. Import files or a folder.")
+        self.library_empty.setObjectName("libraryEmpty")
+        self.library_empty.setWordWrap(True)
+        layout.addWidget(self.library_empty)
         self.library.setObjectName("libraryTable")
         self.library.setHorizontalHeaderLabels(["Batch", "Clip", "Flag", "Duration"])
         self.library.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -201,6 +257,21 @@ class MainWindow(QMainWindow):
 
         center = QWidget()
         layout = QVBoxLayout(center)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+        header = QHBoxLayout()
+        self.brand_mark = QLabel()
+        self.brand_mark.setObjectName("brandMark")
+        self.brand_mark.setFixedSize(28, 28)
+        self.brand_title = QLabel(APP_NAME)
+        self.brand_title.setObjectName("brandTitle")
+        self.project_chip = QLabel("New project")
+        self.project_chip.setObjectName("projectChip")
+        header.addWidget(self.brand_mark)
+        header.addWidget(self.brand_title)
+        header.addWidget(self.project_chip)
+        header.addStretch(1)
+        layout.addLayout(header)
         self.playback_note = QLabel("No clip.")
         self.playback_note.setObjectName("playbackNote")
         self.playback_note.setWordWrap(True)
@@ -248,11 +319,29 @@ class MainWindow(QMainWindow):
         mark_out.clicked.connect(lambda: self.set_trim_from_player("out"))
         self.time_label = QLabel("0:00.0 / 0:00.0")
         self.time_label.setObjectName("timeLabel")
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
         for button in (self.play_button, self.pause_button, back, forward, mark_in, mark_out):
+            button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
             transport.addWidget(button)
-        transport.addWidget(self.time_label)
         transport.addStretch(1)
-        layout.addLayout(transport)
+        transport_host = QWidget()
+        transport_host.setObjectName("transportHost")
+        transport_host.setLayout(transport)
+        transport_scroll = QScrollArea()
+        transport_scroll.setObjectName("transportScroll")
+        transport_scroll.setWidget(transport_host)
+        transport_scroll.setWidgetResizable(True)
+        transport_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        transport_host.setAutoFillBackground(False)
+        transport_scroll.viewport().setAutoFillBackground(False)
+        transport_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        transport_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        transport_scroll.setMinimumHeight(44)
+        self.time_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        transport_row = QHBoxLayout()
+        transport_row.addWidget(transport_scroll, 1)
+        transport_row.addWidget(self.time_label)
+        layout.addLayout(transport_row)
         self.scrub = QSlider(Qt.Orientation.Horizontal)
         self.scrub.setObjectName("scrubSlider")
         self.scrub.setRange(0, 0)
@@ -508,12 +597,17 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.setObjectName("inspectorTabs")
         tabs.setDocumentMode(True)
+        tabs.tabBar().setUsesScrollButtons(True)
+        tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
 
         def page(*widgets: QWidget) -> QScrollArea:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
             host = QWidget()
+            host.setAutoFillBackground(False)
+            scroll.viewport().setAutoFillBackground(False)
             column = QVBoxLayout(host)
             for widget in widgets:
                 column.addWidget(widget)
@@ -523,7 +617,16 @@ class MainWindow(QMainWindow):
 
         copy = QPushButton("Copy path")
         copy.clicked.connect(self.copy_clip_path)
-        tabs.addTab(page(self.meta, copy, self._clip_group), "Clip")
+        self.meta_toggle = QPushButton("Technical details")
+        self.meta_toggle.setCheckable(True)
+        self.meta_toggle.setToolTip("Path, checksum, and color details")
+        self.meta_details = QPlainTextEdit()
+        self.meta_details.setObjectName("metadataDetails")
+        self.meta_details.setReadOnly(True)
+        self.meta_details.setVisible(False)
+        self.meta_details.setMinimumHeight(96)
+        self.meta_toggle.toggled.connect(self.meta_details.setVisible)
+        tabs.addTab(page(self.meta, self.meta_toggle, self.meta_details, copy, self._clip_group), "Clip")
         tabs.addTab(page(self._grade_group), "Adjust")
         tabs.addTab(page(self._export_group), "Export")
         tabs.addTab(page(self._gyro_group, self._manual_group), "Gyro")
@@ -544,6 +647,9 @@ class MainWindow(QMainWindow):
         queue_header.setSectionResizeMode(4, queue_header.ResizeMode.Stretch)
         self.queue.verticalHeader().setVisible(False)
         self.queue.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.queue_empty = QLabel("The queue is empty.")
+        self.queue_empty.setObjectName("queueEmpty")
+        layout.addWidget(self.queue_empty)
         layout.addWidget(self.queue)
         self.batch_errors = QPlainTextEdit()
         self.batch_errors.setObjectName("batchErrors")
@@ -572,6 +678,9 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("File")
         toolbar = QToolBar("Main")
         toolbar.setObjectName("mainToolBar")
+        toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
         actions = [
             ("New", self.new_project, "Ctrl+N"),
@@ -665,6 +774,7 @@ class MainWindow(QMainWindow):
     def set_theme(self, choice: str) -> str:
         choice = choice if choice in {"light", "dark", "system"} else "system"
         resolved = apply_theme(self, choice)
+        self._paint_icons(resolved)
         self.state["theme"] = choice
         save_state(self.state, self.state_path)
         if not self._scheme_connected:
@@ -676,7 +786,48 @@ class MainWindow(QMainWindow):
 
     def _on_system_scheme(self, *_args) -> None:
         if self.state.get("theme") == "system":
-            apply_theme(self, "system")
+            self.set_theme("system")
+
+    def _paint_icons(self, theme: str) -> None:
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import QApplication
+
+        from .brand import load_app_icon
+        from .icons import action_icon
+
+        icon = load_app_icon()
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None and not icon.isNull():
+            app.setWindowIcon(icon)
+        mark = icon.pixmap(28, 28)
+        if not mark.isNull():
+            self.brand_mark.setPixmap(mark)
+        self._tint_scrolls(theme)
+        for widget in self.findChildren(QPushButton) + self.findChildren(QAction):
+            key = _ICON_FOR_LABEL.get(widget.text())
+            if not key:
+                continue
+            widget.setIcon(action_icon(key, theme))
+            if isinstance(widget, QPushButton):
+                widget.setIconSize(QSize(16, 16))
+            if isinstance(widget, QAction) and widget.shortcut():
+                widget.setToolTip(f"{widget.text()} ({widget.shortcut().toString()})")
+            elif not widget.toolTip():
+                widget.setToolTip(widget.text())
+        del QPixmap
+
+    def _tint_scrolls(self, theme: str) -> None:
+        from PySide6.QtGui import QColor, QPalette
+
+        color = QColor("#171c23" if theme == "dark" else "#f6f7f8")
+        for scroll in self.findChildren(QScrollArea):
+            viewport = scroll.viewport()
+            viewport.setAutoFillBackground(True)
+            palette = viewport.palette()
+            palette.setColor(QPalette.ColorRole.Window, color)
+            palette.setColor(QPalette.ColorRole.Base, color)
+            viewport.setPalette(palette)
 
     def reset_layout(self) -> None:
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.library_dock)
@@ -686,7 +837,7 @@ class MainWindow(QMainWindow):
         self.inspector_dock.show()
         self.queue_dock.show()
         self.resizeDocks([self.queue_dock], [180], Qt.Orientation.Vertical)
-        self.resizeDocks([self.library_dock, self.inspector_dock], [280, 360], Qt.Orientation.Horizontal)
+        self.resizeDocks([self.library_dock, self.inspector_dock], [240, 300], Qt.Orientation.Horizontal)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -792,6 +943,11 @@ class MainWindow(QMainWindow):
 
     def reload_all(self, *, keep_checks: bool = True, keep_focus: bool = True) -> None:
         self.clips = self.service.clips()
+        self.library_empty.setVisible(not self.clips)
+        name = self.service.project.get("name") or "Untitled"
+        path = self.service.project_path
+        state = "Unsaved" if path is None else path.name
+        self.project_chip.setText(f"{name}  ·  {state}")
         self._fill_library(keep_checks=keep_checks, keep_focus=keep_focus)
         self.refresh_queue()
         self._fill_focus()
@@ -905,20 +1061,30 @@ class MainWindow(QMainWindow):
         self._filling = True
         if clip is None:
             self.meta.setText("No clip selected.")
+            self.meta_details.setPlainText("")
             self._filling = False
             return
         summary = clip["summary"]
         video = (clip["probe"].get("video") or [{}])[0] or {}
         audio = ", ".join(str(item) for item in summary.get("audio_codecs") or []) or "none"
         data = summary.get("data_streams")
+        duration = summary.get("duration")
+        duration_text = "" if duration is None else f"{float(duration):.2f}s"
         self.meta.setText(
             "\n".join(
                 [
                     clip["name"],
-                    self._break_long(clip["path"]),
-                    "SHA-256 " + self._break_long(clip["sha256"], 32),
-                    f"Codec {summary.get('codec')}  {summary.get('width')}×{summary.get('height')}  {summary.get('pix_fmt')}  {summary.get('bit_depth')}-bit",
-                    f"Rate {summary.get('frame_rate')}  duration {summary.get('duration')}  timecode {summary.get('timecode')}",
+                    f"{summary.get('width')}×{summary.get('height')}   {summary.get('frame_rate')}   {duration_text}",
+                    f"{summary.get('codec')}   {summary.get('pix_fmt')}   {summary.get('bit_depth')}-bit",
+                ]
+            )
+        )
+        self.meta_details.setPlainText(
+            "\n".join(
+                [
+                    clip["path"],
+                    "SHA-256 " + clip["sha256"],
+                    f"Timecode {summary.get('timecode')}",
                     f"Color {video.get('color_space')} / {video.get('color_transfer')} / {video.get('color_primaries')} / {video.get('color_range')}",
                     f"Audio {audio}",
                     f"Data streams {data}. {clip['probe'].get('motion_metadata', {}).get('note', '')}",
@@ -1376,6 +1542,7 @@ class MainWindow(QMainWindow):
 
     def refresh_queue(self) -> None:
         jobs = self.service.jobs()
+        self.queue_empty.setVisible(not jobs)
         self.queue.setRowCount(len(jobs))
         for row, job in enumerate(jobs):
             request = job.get("request") or {}

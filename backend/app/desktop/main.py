@@ -159,14 +159,30 @@ def main(argv: list[str] | None = None) -> int:
     prepare_standard_streams(log_file)
     logging.info("Starting %s desktop profile %s", APP_NAME, profile_name())
 
+    from PySide6.QtGui import QFont
     from PySide6.QtWidgets import QApplication
 
     from ..runtime import InstanceLock
+    from .brand import load_app_icon
     from .smoke import run_smoke
 
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CraftsPrepare.Desktop")
+        except (AttributeError, OSError):
+            pass
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(True)
+    app.setStyle("Fusion")
+    font = QFont("Segoe UI", 10)
+    font.setStyleHint(QFont.StyleHint.SansSerif)
+    app.setFont(font)
+    icon = load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     lock = InstanceLock()
     if not lock.acquire():
         if args.smoke:

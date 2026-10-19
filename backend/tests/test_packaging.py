@@ -59,6 +59,8 @@ def test_build_script_does_not_delete_previous_outputs():
     assert "npm ci" not in text
     spec = (ROOT / "packaging" / "crafts-prepare.spec").read_text(encoding="utf-8")
     assert "frontend/dist" not in spec
+    assert 'assets" / "brand"' in spec or "assets/brand" in spec
+    assert "PySide6.QtSvg" in spec
     assert "ICU is supplied by Windows at runtime" in (ROOT / "packaging" / "bundle_guard.py").read_text(encoding="utf-8")
     assert '"ICU" in item["reason"]' in spec
     assert "QtWebEngine" in spec
@@ -76,18 +78,33 @@ def test_build_script_does_not_delete_previous_outputs():
         assert pin in pins
 
 
+def test_make_icon_copies_the_approved_artwork(tmp_path: Path):
+    import hashlib
+
+    module = _load("make_icon", "packaging/make_icon.py")
+    source = ROOT / "assets" / "brand" / "app-icon.ico"
+    destination = tmp_path / "icon.ico"
+    module.write_icon(destination)
+    assert destination.read_bytes() == source.read_bytes()
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert hashlib.sha256((ROOT / "packaging" / "icon.ico").read_bytes()).hexdigest() == digest
+    text = (ROOT / "packaging" / "make_icon.py").read_text(encoding="utf-8")
+    assert "blue bar" not in text.lower()
+    assert "_pixel" not in text
+
+
 def test_version_resource_matches_the_app_version(tmp_path: Path):
     module = _load("write_version_info", "packaging/write_version_info.py")
     destination = tmp_path / "file_version_info.txt"
-    assert module.write_version_info(destination) == "0.2.0"
+    assert module.write_version_info(destination) == "0.2.1"
     text = destination.read_text(encoding="utf-8")
-    assert "filevers=(0, 2, 0, 0)" in text
-    assert "prodvers=(0, 2, 0, 0)" in text
-    assert "FileVersion" in text and "0.2.0" in text
+    assert "filevers=(0, 2, 1, 0)" in text
+    assert "prodvers=(0, 2, 1, 0)" in text
+    assert "FileVersion" in text and "0.2.1" in text
     assert "ProductVersion" in text
     assert "InternalName" in text and "CraftsPrepare" in text
     committed = (ROOT / "packaging" / "file_version_info.txt").read_text(encoding="utf-8")
-    assert "FileVersion" in committed and "0.2.0" in committed
+    assert "FileVersion" in committed and "0.2.1" in committed
 
 
 def test_runtime_license_texts_are_copied(tmp_path: Path):

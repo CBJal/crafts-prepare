@@ -46,6 +46,13 @@ class SettingsDialog(QDialog):
             edit.setObjectName(f"tool-{key}")
             edit.setMinimumWidth(180)
             browse = QPushButton("Browse")
+            browse.setToolTip("Browse for this program")
+            theme = "dark"
+            if parent is not None and parent.property("theme") in {"light", "dark"}:
+                theme = str(parent.property("theme"))
+            from .icons import action_icon
+
+            browse.setIcon(action_icon("browse", theme))
             browse.clicked.connect(lambda _checked=False, box=edit: self._browse(box))
             row = QHBoxLayout()
             row.addWidget(edit)
@@ -94,6 +101,13 @@ class AboutDialog(QDialog):
         self.setMaximumWidth(640)
         self.resize(520, 240)
         layout = QVBoxLayout(self)
+        from .brand import load_app_icon
+
+        mark = QLabel()
+        pixmap = load_app_icon().pixmap(48, 48)
+        if not pixmap.isNull():
+            mark.setPixmap(pixmap)
+        layout.addWidget(mark)
         title = QLabel(f"{APP_NAME} {APP_VERSION}")
         title.setWordWrap(True)
         layout.addWidget(title)

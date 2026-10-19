@@ -5,4 +5,4 @@ Install those programs yourself if you want export, preview, or gyro stabilizati
 FFmpeg and ffprobe: https://ffmpeg.org/download.html
 Gyroflow: https://gyroflow.xyz/download
 
-Crafts Prepare 0.2.0 is a native desktop application. It does not open a browser and it does not start a background web server. The installer does not add a Windows service, a firewall rule, or a sign-in at startup. Uninstall removes the program files only. Your projects, settings, cache, and logs stay in %LOCALAPPDATA%\CraftsPrepare. A short --profile token uses %LOCALAPPDATA%\CraftsPrepare-<token> instead. That token is not a folder path. Upgrading from 0.1.0 keeps that settings folder.
+Crafts Prepare 0.2.1 is a native desktop application. It does not open a browser and it does not start a background web server. The installer does not add a Windows service, a firewall rule, or a sign-in at startup. Uninstall removes the program files only. Your projects, settings, cache, and logs stay in %LOCALAPPDATA%\CraftsPrepare. A short --profile token uses %LOCALAPPDATA%\CraftsPrepare-<token> instead. That token is not a folder path. Upgrading from 0.1.0 keeps that settings folder.

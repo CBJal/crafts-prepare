@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
+import { Icon } from "./icons";
 import { nextChecked } from "./selection";
 import type { Capabilities, Clip, Job } from "./types";
 
@@ -346,9 +347,9 @@ export function App() {
     <div className="shell">
       <header className="top">
         <div className="brand">
-          <span className="mark" aria-hidden="true" />
+          <img className="mark" src="/favicon.png" alt="" />
           <div>
-            <p className="eyebrow">Local bench</p>
+            <p className="eyebrow">Local preparation</p>
             <h1>Crafts Prepare</h1>
           </div>
         </div>
@@ -371,7 +372,7 @@ export function App() {
           <Chip ok={!!caps?.ffmpeg.filters?.vidstabdetect} label="vidstab" />
         </div>
         <button className="ghost" onClick={() => setShowSettings((value) => !value)}>
-          Capabilities
+          <Icon name="tools" /> Capabilities
         </button>
       </header>
 
@@ -391,15 +392,15 @@ export function App() {
               onChange={(event) => setImportPath(event.target.value)}
             />
             <button onClick={onImport} disabled={busy || !importPath}>
-              Import
+              <Icon name="import" /> Import
             </button>
           </div>
           <div className="select-row">
             <button type="button" className="ghost" onClick={() => setChecked(clips.map((clip) => clip.id))} disabled={!clips.length}>
-              Select all
+              <Icon name="select" /> Select all
             </button>
             <button type="button" className="ghost" onClick={() => setChecked([])} disabled={!checked.length}>
-              Clear selection
+              <Icon name="clear" /> Clear selection
             </button>
             <span>{checkedClips.length} selected</span>
           </div>
@@ -687,7 +688,7 @@ export function App() {
             <input type="checkbox" checked={ack} onChange={(event) => setAck(event.target.checked)} /> Acknowledge bit-depth conversion
           </label>
           <button onClick={onExport} disabled={busy || !selected || !destination}>
-            Queue export
+            <Icon name="export" /> Queue export
           </button>
         </div>
         {activePreset && <p className="preset-note">{activePreset.reason || `${activePreset.label} declares ${activePreset.pix_fmt}, ${activePreset.bit_depth}-bit.`}</p>}
@@ -815,12 +816,12 @@ export function App() {
               <div className="job-actions">
                 {(status === "queued" || status === "running") && (
                   <button className="ghost" onClick={() => api.cancel(job.id).then(refresh)}>
-                    Cancel
+                    <Icon name="cancel" /> Cancel
                   </button>
                 )}
                 {["failed", "cancelled", "interrupted", "paused"].includes(status) && (
                   <button className="ghost" onClick={() => api.retry(job.id).then(refresh)}>
-                    Retry
+                    <Icon name="retry" /> Retry
                   </button>
                 )}
               </div>
@@ -872,7 +873,7 @@ export function App() {
             }}
             disabled={!gyroOutput.trim()}
           >
-            Queue gyro
+            <Icon name="gyro" /> Queue gyro
           </button>
           <button
             className="ghost"
@@ -950,10 +951,10 @@ export function App() {
           <input aria-label="Project file path" value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder="bench.crafts.json" />
           <div className="job-actions">
             <button className="ghost" onClick={() => api.saveProject(projectPath).then(refresh).catch((error: Error) => setNotice(error.message))}>
-              Save
+              <Icon name="save" /> Save
             </button>
             <button className="ghost" onClick={() => api.openProject(projectPath).then(refresh).catch((error: Error) => setNotice(error.message))}>
-              Open
+              <Icon name="open" /> Open
             </button>
           </div>
           {selected && !selected.browser_playable && (

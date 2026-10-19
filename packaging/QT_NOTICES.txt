@@ -1,7 +1,7 @@
 Qt, PySide6, and the playback libraries
 ======================================
 
-Crafts Prepare 0.2.0 links to Qt 6 through PySide6. The packages are
+Crafts Prepare 0.2.1 links to Qt 6 through PySide6. The packages are
 PySide6-Essentials, PySide6-Addons, and shiboken6, pinned in
 backend/requirements.txt. Qt WebEngine is not installed and is not part of
 this application. There is no embedded browser.

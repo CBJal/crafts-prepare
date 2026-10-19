@@ -375,7 +375,7 @@ def test_smoke_harness_uses_the_real_window(qapp, tmp_path: Path, media_dir: Pat
     )
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["http_server_started"] is False
-    assert payload["version"] == "0.2.0"
+    assert payload["version"] == "0.2.1"
     steps = {item["step"]: item for item in payload["steps"]}
     assert steps["import"]["ok"] is True
     assert steps["project"]["ok"] is True

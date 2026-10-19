@@ -29,6 +29,7 @@ a = Analysis(
         (str(root / "THIRD_PARTY_NOTICES.md"), "."),
         (str(spec_dir / "PREREQUISITES.txt"), "."),
         (str(license_dir), "licenses"),
+        (str(root / "assets" / "brand"), "assets/brand"),
     ],
     hiddenimports=[
         "app",
@@ -42,6 +43,7 @@ a = Analysis(
         "PySide6.QtMultimedia",
         "PySide6.QtMultimediaWidgets",
         "PySide6.QtNetwork",
+        "PySide6.QtSvg",
     ],
     hookspath=[],
     hooksconfig={},
