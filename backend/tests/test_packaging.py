@@ -36,7 +36,7 @@ def test_bundle_guard_drops_foreign_icu_and_virtual_keyboard():
     assert "icuuc.dll" not in names
     assert "Qt6VirtualKeyboard.dll" not in names
     assert all("VirtualKeyboard" not in item[0] for item in kept)
-    assert any(item["reason"] == "ICU from an unrelated directory" for item in rejected)
+    assert any("ICU" in item["reason"] for item in rejected)
 
 
 def test_inno_script_has_no_pascal_comment_and_keeps_user_data():

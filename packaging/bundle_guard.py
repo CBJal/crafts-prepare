@@ -27,9 +27,9 @@ def bundle_decision(dest_name: str, source_path: str) -> tuple[bool, str]:
     if "/qml/" in dest or "/qml/" in source:
         return False, "unused Qt Quick payload"
     if base.startswith("icu") and base.endswith(".dll"):
-        if "/windows/system32/" in source or "/pyside6/" in source or "/shiboken6/" in source:
-            return True, "icu from Qt or Windows"
-        return False, "ICU from an unrelated directory"
+        # Qt6Core on Windows loads the system ICU. Freezing whichever icuuc.dll
+        # appears first on PATH, including a copy taken from System32, breaks that.
+        return False, "ICU is supplied by Windows at runtime"
     if any(piece in source for piece in _FOREIGN):
         return False, "library from an unrelated install"
     return True, "kept"
