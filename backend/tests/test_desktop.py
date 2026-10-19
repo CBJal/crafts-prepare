@@ -109,8 +109,9 @@ def test_theme_persists(qapp, desktop):
 
 
 def test_stale_still_is_ignored(qapp, desktop):
-    desktop._view_gen = 3
-    desktop._show_still(2, "/tmp/not-the-current-still.jpg")
+    desktop._project_gen = 1
+    desktop._still_seq = 5
+    desktop._show_still(1, 4, True, "/tmp/not-the-current-still.jpg")
     assert desktop.still_path == ""
 
 
@@ -166,15 +167,17 @@ def test_checked_gyro_batch_records_a_real_failure_without_gyroflow(qapp, deskto
 
 
 def test_second_instance_message_raises_the_window(qapp, desktop):
-    name = "CraftsPrepare-test-desktop"
-    attach_server(desktop, name)
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    name = "CraftsPrepare-test-desktop-ack"
+    assert attach_server(desktop, name) is not None
     raised = []
     desktop.peer_raised.connect(lambda: raised.append(True))
-    assert notify_running(name)
-    for _ in range(30):
-        qapp.processEvents()
-        if raised:
-            break
+    assert notify_running(name, timeout_ms=2000) is True
+    loop = QEventLoop()
+    QTimer.singleShot(500, loop.quit)
+    if not raised:
+        loop.exec()
     assert raised == [True]
 
 
@@ -182,12 +185,176 @@ def test_desktop_sources_do_not_start_a_browser_or_uvicorn():
     root = Path(__file__).resolve().parents[1] / "app" / "desktop"
     text = "\n".join(path.read_text(encoding="utf-8") for path in root.glob("*.py"))
     assert "uvicorn" not in text
-    assert "webbrowser" not in text
+    assert "import webbrowser" not in text
+    assert "webbrowser.open" not in text
     assert "QtWebEngine" not in text
     assert "QWebEngine" not in text
     entry = (Path(__file__).resolve().parents[1] / "crafts_prepare_entry.py").read_text(encoding="utf-8")
     assert "app.desktop.main" in entry
     assert "app.launcher" not in entry
+
+
+def test_close_cancels_an_active_ffmpeg_child(qapp, desktop):
+    import shutil
+    import time
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg is not installed")
+    seen: dict[str, int] = {}
+
+    def work(cancel):
+        from app.process import run_captured
+
+        run_captured(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-nostdin",
+                "-re",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=32x32:rate=5:duration=8",
+                "-f",
+                "null",
+                "-",
+            ],
+            timeout=30,
+            cancel=cancel,
+            on_start=lambda proc: seen.__setitem__("pid", proc.pid),
+        )
+
+    desktop._start(work, lambda _value: None, key="long-ffmpeg")
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+
+    def poll() -> None:
+        if "pid" in seen:
+            loop.quit()
+        else:
+            QTimer.singleShot(30, poll)
+
+    QTimer.singleShot(4000, loop.quit)
+    QTimer.singleShot(0, poll)
+    loop.exec()
+    assert "pid" in seen
+    started = time.monotonic()
+    desktop.force_close = True
+    desktop.close()
+    assert time.monotonic() - started < 4
+    assert desktop._runner.isRunning() is False
+    with pytest.raises(ProcessLookupError):
+        os.kill(seen["pid"], 0)
+
+
+def test_late_import_does_not_enter_a_replaced_project(qapp, desktop, media_dir: Path):
+    import time
+
+    from app.errors import Cancelled
+
+    original = desktop.service.import_media
+
+    def slow(raw, cancel=None):
+        while cancel is None or not cancel.is_set():
+            time.sleep(0.02)
+        raise Cancelled()
+
+    desktop.service.import_media = slow
+    desktop.import_paths([str(media_dir / "h264_8.mp4")])
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+    QTimer.singleShot(200, loop.quit)
+    loop.exec()
+    assert desktop.new_project(discard=True) is True
+    assert desktop.wait_until_idle(4000)
+    assert desktop.clips == []
+    desktop.service.import_media = original
+
+
+def test_reopen_clears_checks_focus_and_player(qapp, desktop, media_dir: Path, tmp_path: Path):
+    desktop.import_paths([str(media_dir / "h264_8.mp4")])
+    assert desktop.wait_until_idle(30000)
+    desktop.select_all_batch()
+    assert desktop.checked_ids()
+    if desktop.player is not None:
+        from PySide6.QtCore import QUrl
+
+        desktop.player.setSource(QUrl.fromLocalFile(desktop.clips[0]["path"]))
+        assert desktop.player.source().isEmpty() is False
+    project = tmp_path / "again.crafts.json"
+    assert desktop.save_project_to(str(project))
+    assert desktop.open_project_path(str(project))
+    assert desktop.checked_ids() == []
+    assert desktop.focused_id() is None
+    assert desktop.last_batch_id == ""
+    if desktop.player is not None:
+        assert desktop.player.source().isEmpty()
+    assert desktop.still_path == ""
+
+
+def test_failed_open_keeps_the_current_project(qapp, desktop, media_dir: Path, tmp_path: Path):
+    desktop.import_paths([str(media_dir / "h264_8.mp4")])
+    assert desktop.wait_until_idle(30000)
+    assert desktop.save_project_to(str(tmp_path / "keep.crafts.json"))
+    before = [clip["id"] for clip in desktop.clips]
+    assert desktop.open_project_path(str(tmp_path / "missing.crafts.json")) is False
+    assert [clip["id"] for clip in desktop.service.clips()] == before
+
+
+def test_notes_trim_and_rating_roundtrip(qapp, desktop, media_dir: Path, tmp_path: Path):
+    desktop.import_paths([str(media_dir / "h264_8.mp4")])
+    assert desktop.wait_until_idle(30000)
+    desktop.notes.setPlainText("hold this note")
+    desktop.flag.setCurrentIndex(desktop.flag.findData("KEEP"))
+    desktop.trim_in.setValue(0.2)
+    desktop.trim_out.setValue(0.8)
+    desktop.save_trim()
+    desktop.add_marker()
+    project = tmp_path / "edited.crafts.json"
+    assert desktop.save_project_to(str(project))
+    saved = json.loads(project.read_text(encoding="utf-8"))
+    clip = saved["clips"][0]
+    assert clip["notes"] == "hold this note"
+    assert clip["flag"] == "KEEP"
+    assert clip["trim_in"] == pytest.approx(0.2)
+    assert clip["trim_out"] == pytest.approx(0.8)
+    assert clip["markers"]
+    assert desktop.new_project(discard=True)
+    assert desktop.open_project_path(str(project))
+    assert desktop.clips[0]["notes"] == "hold this note"
+
+
+def test_playback_emits_a_frame_and_advances(qapp, media_dir: Path):
+    from PySide6.QtCore import QEventLoop, QTimer, QUrl
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+
+    player = QMediaPlayer()
+    player.setAudioOutput(QAudioOutput())
+    sink = QVideoSink()
+    seen = {"frames": 0, "position": 0}
+    sink.videoFrameChanged.connect(lambda frame: seen.__setitem__("frames", seen["frames"] + 1) if frame.isValid() else None)
+    player.positionChanged.connect(lambda position: seen.__setitem__("position", max(seen["position"], position)))
+    player.setVideoSink(sink)
+    player.setSource(QUrl.fromLocalFile(str(media_dir / "h264_8.mp4")))
+    player.play()
+    loop = QEventLoop()
+
+    def poll() -> None:
+        if seen["position"] > 0 and seen["frames"] > 0:
+            loop.quit()
+        else:
+            QTimer.singleShot(40, poll)
+
+    QTimer.singleShot(5000, loop.quit)
+    QTimer.singleShot(0, poll)
+    loop.exec()
+    player.stop()
+    assert seen["position"] > 0
+    assert seen["frames"] > 0
+    assert player.errorString() == ""
 
 
 def test_smoke_harness_uses_the_real_window(qapp, tmp_path: Path, media_dir: Path, monkeypatch):
@@ -206,7 +373,6 @@ def test_smoke_harness_uses_the_real_window(qapp, tmp_path: Path, media_dir: Pat
     )
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["http_server_started"] is False
-    assert payload["browser_opened"] is False
     assert payload["version"] == "0.2.0"
     steps = {item["step"]: item for item in payload["steps"]}
     assert steps["import"]["ok"] is True

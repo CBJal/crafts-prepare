@@ -1,0 +1,38 @@
+Qt Multimedia FFmpeg playback libraries
+========================================
+
+Qt 6.12.0's multimedia FFmpeg plugin reports:
+
+    FFmpeg version 9.0.1 LGPL version 2.1 or later
+
+That line is printed by this Qt build at playback time
+(`qt.multimedia.ffmpeg`). It identifies the FFmpeg sources as the 9.0.1
+release, licensed under the GNU Lesser General Public License, version 2.1
+or, at the licensee's option, any later version. The LGPL-2.1 text is
+LGPL-2.1.txt in this folder. FFmpeg's own copyright notices and the exact
+`configure` line are in the corresponding source tarball, not rewritten here.
+
+Source for that FFmpeg release:
+
+- https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
+- https://github.com/FFmpeg/FFmpeg/releases/tag/n9.0.1
+
+The Windows installer observed by review ships these as separate DLLs used by
+the playback plugin, including avcodec-63. That Windows build was reported as
+a shared MSVC build with zlib. Those configure details describe that Windows
+DLL. They are not a guess applied to every operating system. A Linux wheel
+prints the same FFmpeg 9.0.1 / LGPL 2.1 line and ships libavcodec.so,
+libavformat.so, libswscale.so, libswresample.so, and
+libffmpegmediaplugin.so beside Qt.
+
+These libraries are dynamically linked. They are not compiled into
+CraftsPrepare.exe. Replacing them means substituting a compatible LGPL build
+of the same libraries, or rebuilding Qt Multimedia's FFmpeg plugin from the
+Qt 6.12.0 sources against that FFmpeg release:
+
+- https://download.qt.io/official_releases/qt/6.12/6.12.0/submodules/qtmultimedia-everywhere-src-6.12.0.tar.xz
+- https://code.qt.io/cgit/qt/qtmultimedia.git/
+
+They are not ffmpeg.exe, ffprobe.exe, or Gyroflow. Export, proxies, stills,
+and gyro stabilization call the external programs set under Tools. Qt
+WebEngine is not part of this application.

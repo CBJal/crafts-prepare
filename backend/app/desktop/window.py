@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QByteArray, QEventLoop, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDockWidget,
@@ -43,7 +44,7 @@ from ..version import APP_NAME
 from .dialogs import AboutDialog, SettingsDialog, TextDialog
 from .prefs import load_state, remember_project, save_state
 from .theme import apply_theme
-from .workers import TaskThread
+from .workers import TaskRunner
 
 _ACTIVE = {"queued", "running"}
 
@@ -62,8 +63,17 @@ class MainWindow(QMainWindow):
         self._token = 0
         self._inflight = 0
         self._view_gen = 0
+        self._project_gen = 0
+        self._still_seq = 0
+        self._notes_dirty = False
+        self._proxy_fallback = False
+        self._scheme_connected = False
+        self._laid_out = False
         self._callbacks: dict[int, object] = {}
-        self._tasks: list[TaskThread] = []
+        self._runner = TaskRunner()
+        self._runner.succeeded.connect(self._task_ok)
+        self._runner.failed.connect(self._task_fail)
+        self._runner.start()
         self._filling = False
         self.still_path = ""
         self.playback_result: dict | None = None
@@ -87,7 +97,7 @@ class MainWindow(QMainWindow):
         self._refresh_timer.setInterval(700)
         self._refresh_timer.timeout.connect(self.refresh_queue)
         self._refresh_timer.start()
-        self._start(self.service.capabilities, self._apply_capabilities)
+        self._start(lambda cancel: self.service.capabilities(), self._apply_capabilities, key="caps")
 
     def _build_player(self) -> None:
         self.player = None
@@ -105,6 +115,7 @@ class MainWindow(QMainWindow):
             self.player.setVideoOutput(self.video)
             self.player.positionChanged.connect(self._on_position)
             self.player.durationChanged.connect(self._on_duration)
+            self.player.errorOccurred.connect(self._on_player_error)
         except Exception as exc:  # noqa: BLE001 — stills still work without a playback device
             self.player_error = str(exc)
         else:
@@ -133,7 +144,15 @@ class MainWindow(QMainWindow):
         self.library.setHorizontalHeaderLabels(["Batch", "Clip", "Flag", "Duration"])
         self.library.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.library.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.library.setWordWrap(False)
+        self.library.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.library.verticalHeader().setVisible(False)
+        header = self.library.horizontalHeader()
+        header.setSectionResizeMode(0, header.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, header.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, header.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, header.ResizeMode.ResizeToContents)
+        self.library_dock = dock
         self.library.currentCellChanged.connect(self._focus_changed)
         self.library.itemChanged.connect(self._check_changed)
         layout.addWidget(self.library)
@@ -141,28 +160,41 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
 
     def _build_viewer(self) -> None:
+        from PySide6.QtWidgets import QStackedWidget
+
         center = QWidget()
         layout = QVBoxLayout(center)
-        self.playback_note = QLabel(
-            f"Playback is a viewing aid. A proxy is H.264, about 640px wide, and at most {int(PROXY_LIMIT_SECONDS)} seconds. "
-            "Adjustments are not baked into the player. Stills use the export filter graph without vidstab or deshake."
-        )
+        self.playback_note = QLabel("No clip.")
         self.playback_note.setObjectName("playbackNote")
         self.playback_note.setWordWrap(True)
         layout.addWidget(self.playback_note)
-        split = QSplitter(Qt.Orientation.Vertical)
+        modes = QHBoxLayout()
+        self.view_playback = QPushButton("Playback")
+        self.view_original = QPushButton("Original")
+        self.view_adjusted = QPushButton("Adjusted")
+        self.view_adjusted.setObjectName("adjustedStillButton")
+        self.view_playback.clicked.connect(lambda: self._show_view(0))
+        self.view_original.clicked.connect(lambda: self._show_view(1))
+        self.view_adjusted.clicked.connect(lambda: self._show_view(2))
+        for button in (self.view_playback, self.view_original, self.view_adjusted):
+            modes.addWidget(button)
+        modes.addStretch(1)
+        layout.addLayout(modes)
+        self.viewer_stack = QStackedWidget()
+        self.viewer_stack.setObjectName("viewerStack")
         if self.video is not None:
-            split.addWidget(self.video)
+            self.viewer_stack.addWidget(self.video)
         else:
             missing = QLabel(self.player_error or "Playback is unavailable on this machine.")
             missing.setObjectName("videoWidget")
-            split.addWidget(missing)
-        self.still_label = QLabel("Original and adjusted stills appear here.")
-        self.still_label.setObjectName("stillLabel")
-        self.still_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.still_label.setMinimumHeight(160)
-        split.addWidget(self.still_label)
-        layout.addWidget(split, 1)
+            missing.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.viewer_stack.addWidget(missing)
+        self.still_original = self._still_page("Original still")
+        self.still_adjusted = self._still_page("Adjusted still")
+        self.still_label = self.still_adjusted
+        self.viewer_stack.addWidget(self.still_original)
+        self.viewer_stack.addWidget(self.still_adjusted)
+        layout.addWidget(self.viewer_stack, 1)
         transport = QHBoxLayout()
         self.play_button = QPushButton("Play")
         self.play_button.setObjectName("playButton")
@@ -177,19 +209,33 @@ class MainWindow(QMainWindow):
         mark_in.clicked.connect(lambda: self.set_trim_from_player("in"))
         mark_out = QPushButton("Set out")
         mark_out.clicked.connect(lambda: self.set_trim_from_player("out"))
-        original = QPushButton("Original still")
-        original.clicked.connect(lambda: self.request_still(False))
-        adjusted = QPushButton("Adjusted still")
-        adjusted.setObjectName("adjustedStillButton")
-        adjusted.clicked.connect(lambda: self.request_still(True))
-        for button in (self.play_button, self.pause_button, back, forward, mark_in, mark_out, original, adjusted):
+        self.time_label = QLabel("0:00.0 / 0:00.0")
+        self.time_label.setObjectName("timeLabel")
+        for button in (self.play_button, self.pause_button, back, forward, mark_in, mark_out):
             transport.addWidget(button)
+        transport.addWidget(self.time_label)
+        transport.addStretch(1)
         layout.addLayout(transport)
         self.scrub = QSlider(Qt.Orientation.Horizontal)
         self.scrub.setObjectName("scrubSlider")
+        self.scrub.setRange(0, 0)
         self.scrub.sliderMoved.connect(self._seek)
         layout.addWidget(self.scrub)
         self.setCentralWidget(center)
+
+    def _still_page(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("stillLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setMinimumHeight(120)
+        return label
+
+    def _show_view(self, index: int) -> None:
+        self.viewer_stack.setCurrentIndex(index)
+        if index == 1:
+            self.request_still(False)
+        elif index == 2:
+            self.request_still(True)
 
     def _build_inspector(self) -> None:
         dock = QDockWidget("Inspector", self)
@@ -202,8 +248,6 @@ class MainWindow(QMainWindow):
         self.meta.setObjectName("metadataLabel")
         self.meta.setWordWrap(True)
         self.meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.meta)
-
         details = QGroupBox("Clip")
         form = QFormLayout(details)
         self.flag = QComboBox()
@@ -240,7 +284,7 @@ class MainWindow(QMainWindow):
         form.addRow("Markers", self.markers)
         form.addRow("", add_marker)
         form.addRow("", remove_marker)
-        layout.addWidget(details)
+        self._clip_group = details
 
         grade = QGroupBox("Adjustments")
         grade_form = QFormLayout(grade)
@@ -320,7 +364,7 @@ class MainWindow(QMainWindow):
         note.setObjectName("muted")
         note.setWordWrap(True)
         grade_form.addRow(note)
-        layout.addWidget(grade)
+        self._grade_group = grade
 
         export = QGroupBox("Export")
         export_form = QFormLayout(export)
@@ -359,7 +403,7 @@ class MainWindow(QMainWindow):
         export_form.addRow("Suffix", self.suffix)
         export_form.addRow(export_one)
         export_form.addRow(export_batch)
-        layout.addWidget(export)
+        self._export_group = export
 
         gyro = QGroupBox("Gyro batch")
         gyro_form = QFormLayout(gyro)
@@ -396,7 +440,7 @@ class MainWindow(QMainWindow):
         gyro_form.addRow("", self.gyro_audio)
         gyro_form.addRow("Shared preset", preset_row)
         gyro_form.addRow(gyro_button)
-        layout.addWidget(gyro)
+        self._gyro_group = gyro
 
         manual = QGroupBox("Advanced manual gyro")
         manual_form = QFormLayout(manual)
@@ -418,12 +462,39 @@ class MainWindow(QMainWindow):
         manual_form.addRow(parse_gcsv)
         manual_form.addRow(telemetry)
         manual_form.addRow(manual_queue)
-        layout.addWidget(manual)
-        layout.addStretch(1)
-        scroll.setWidget(body)
-        dock.setWidget(scroll)
+        self._manual_group = manual
+        tabs = self._inspector_tabs()
+        dock.setWidget(tabs)
+        self.inspector_dock = dock
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self._fit_changed()
+
+    def _inspector_tabs(self):
+        from PySide6.QtWidgets import QTabWidget
+
+        tabs = QTabWidget()
+        tabs.setObjectName("inspectorTabs")
+        tabs.setDocumentMode(True)
+
+        def page(*widgets: QWidget) -> QScrollArea:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            host = QWidget()
+            column = QVBoxLayout(host)
+            for widget in widgets:
+                column.addWidget(widget)
+            column.addStretch(1)
+            scroll.setWidget(host)
+            return scroll
+
+        copy = QPushButton("Copy path")
+        copy.clicked.connect(self.copy_clip_path)
+        tabs.addTab(page(self.meta, copy, self._clip_group), "Clip")
+        tabs.addTab(page(self._grade_group), "Adjust")
+        tabs.addTab(page(self._export_group), "Export")
+        tabs.addTab(page(self._gyro_group, self._manual_group), "Gyro")
+        return tabs
 
     def _build_queue(self) -> None:
         dock = QDockWidget("Queue", self)
@@ -433,13 +504,18 @@ class MainWindow(QMainWindow):
         self.queue = QTableWidget(0, 5)
         self.queue.setObjectName("queueTable")
         self.queue.setHorizontalHeaderLabels(["File", "Kind", "Status", "Progress", "Error"])
+        self.queue.setWordWrap(False)
+        self.queue.setTextElideMode(Qt.TextElideMode.ElideRight)
+        queue_header = self.queue.horizontalHeader()
+        queue_header.setSectionResizeMode(0, queue_header.ResizeMode.Stretch)
+        queue_header.setSectionResizeMode(4, queue_header.ResizeMode.Stretch)
         self.queue.verticalHeader().setVisible(False)
         self.queue.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.queue)
         self.batch_errors = QPlainTextEdit()
         self.batch_errors.setObjectName("batchErrors")
         self.batch_errors.setReadOnly(True)
-        self.batch_errors.setFixedHeight(72)
+        self.batch_errors.setFixedHeight(44)
         layout.addWidget(self.batch_errors)
         buttons = QHBoxLayout()
         cancel = QPushButton("Cancel job")
@@ -456,6 +532,7 @@ class MainWindow(QMainWindow):
             buttons.addWidget(button)
         layout.addLayout(buttons)
         dock.setWidget(body)
+        self.queue_dock = dock
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
 
     def _build_actions(self) -> None:
@@ -497,7 +574,10 @@ class MainWindow(QMainWindow):
 
         tools_menu = self.menuBar().addMenu("Tools")
         tools_menu.addAction("External programs…", self.open_settings)
-        tools_menu.addAction("Refresh tool report", lambda: self._start(self.service.capabilities, self._apply_capabilities))
+        tools_menu.addAction(
+            "Refresh tool report",
+            lambda: self._start(lambda cancel: self.service.capabilities(), self._apply_capabilities, key="caps"),
+        )
 
         view_menu = self.menuBar().addMenu("View")
         for label, choice in (("Light", "light"), ("Dark", "dark"), ("System", "system")):
@@ -505,9 +585,15 @@ class MainWindow(QMainWindow):
             action.setObjectName(f"theme-{choice}")
             action.triggered.connect(lambda _checked=False, value=choice: self.set_theme(value))
             view_menu.addAction(action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.library_dock.toggleViewAction())
+        view_menu.addAction(self.inspector_dock.toggleViewAction())
+        view_menu.addAction(self.queue_dock.toggleViewAction())
+        view_menu.addAction("Reset layout", self.reset_layout)
 
         help_menu = self.menuBar().addMenu("Help")
         help_menu.addAction("About", self.show_about)
+        help_menu.addAction("Preview limits", self.show_preview_help)
         help_menu.addAction("Log folder", self.show_log)
         help_menu.addAction("Licenses", self.show_licenses)
 
@@ -544,10 +630,57 @@ class MainWindow(QMainWindow):
             edit.setText(chosen)
 
     def set_theme(self, choice: str) -> str:
+        choice = choice if choice in {"light", "dark", "system"} else "system"
         resolved = apply_theme(self, choice)
-        self.state["theme"] = choice if choice in {"light", "dark", "system"} else "system"
+        self.state["theme"] = choice
         save_state(self.state, self.state_path)
+        if not self._scheme_connected:
+            from PySide6.QtGui import QGuiApplication
+
+            QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_system_scheme)
+            self._scheme_connected = True
         return resolved
+
+    def _on_system_scheme(self, *_args) -> None:
+        if self.state.get("theme") == "system":
+            apply_theme(self, "system")
+
+    def reset_layout(self) -> None:
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.library_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.queue_dock)
+        self.library_dock.show()
+        self.inspector_dock.show()
+        self.queue_dock.show()
+        self.resizeDocks([self.queue_dock], [180], Qt.Orientation.Vertical)
+        self.resizeDocks([self.library_dock, self.inspector_dock], [280, 360], Qt.Orientation.Horizontal)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if not self._laid_out:
+            self._laid_out = True
+            if not self.state.get("window_state"):
+                self.reset_layout()
+
+    def copy_clip_path(self) -> None:
+        clip = self.focused_clip()
+        if clip is None:
+            return
+        QApplication.clipboard().setText(clip["path"])
+        self.statusBar().showMessage("Path copied.", 3000)
+
+    def show_preview_help(self) -> None:
+        TextDialog(
+            "Preview limits",
+            (
+                f"Playback prefers the source when it is 8-bit H.264. Anything else, or a source the player "
+                f"cannot decode, uses an H.264 proxy about 640 pixels wide and at most {int(PROXY_LIMIT_SECONDS)} seconds. "
+                "The proxy is not the export. Adjustments are not baked into playback. "
+                "Original and Adjusted stills use the same filter graph as export, without vidstab or deshake. "
+                "Those stabilizers run only when an export is queued. The source file is not modified."
+            ),
+            self,
+        ).exec()
 
     def _restore_window(self) -> None:
         geometry = self.state.get("geometry") or ""
@@ -585,12 +718,25 @@ class MainWindow(QMainWindow):
         items = [path for path in paths if path]
         if not items:
             return
+        generation = self._project_gen
 
-        def work():
-            reports = [self.service.import_media(path) for path in items]
-            return reports
+        def work(cancel):
+            reports = []
+            for path in items:
+                if cancel.is_set():
+                    from ..errors import Cancelled
 
-        self._start(work, self._imported)
+                    raise Cancelled()
+                reports.append(self.service.import_media(path, cancel=cancel))
+            return generation, reports
+
+        def done(payload):
+            project_gen, reports = payload
+            if project_gen != self._project_gen:
+                return
+            self._imported(reports)
+
+        self._start(work, done, key="import")
 
     def _imported(self, reports) -> None:
         added = sum(len(item.get("added") or []) for item in reports)
@@ -599,18 +745,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Imported {added}. Duplicates {duplicates}. Skipped {skipped}.", 8000)
         self.reload_all()
 
-    def reload_all(self) -> None:
+    def reload_all(self, *, keep_checks: bool = True, keep_focus: bool = True) -> None:
         self.clips = self.service.clips()
-        self._fill_library()
+        self._fill_library(keep_checks=keep_checks, keep_focus=keep_focus)
         self.refresh_queue()
         self._fill_focus()
         title = self.service.project.get("name") or "Untitled"
         path = self.service.project_path
         self.setWindowTitle(f"{APP_NAME} — {title}" + ("" if path is None else f" — {path.name}"))
 
-    def _fill_library(self) -> None:
-        previous = self.focused_id()
-        checks = set(self.checked_ids())
+    def _fill_library(self, *, keep_checks: bool = True, keep_focus: bool = True) -> None:
+        previous = self.focused_id() if keep_focus else None
+        checks = set(self.checked_ids()) if keep_checks else set()
         self._filling = True
         self.library.blockSignals(True)
         self.library.setRowCount(len(self.clips))
@@ -629,8 +775,10 @@ class MainWindow(QMainWindow):
         self._update_count()
         if previous:
             self.focus_clip(previous)
-        elif self.clips:
+        elif keep_focus and self.clips:
             self.library.setCurrentCell(0, 1)
+        elif not keep_focus:
+            self.library.setCurrentCell(-1, -1)
 
     def _check_changed(self, _item) -> None:
         if not self._filling:
@@ -685,10 +833,18 @@ class MainWindow(QMainWindow):
         self.library.blockSignals(False)
         self._update_count()
 
-    def _focus_changed(self, row, _column, _previous, _previous_column) -> None:
-        if self._filling or row < 0:
+    def _focus_changed(self, row, _column, previous, _previous_column) -> None:
+        if self._filling:
+            return
+        if self._notes_dirty and previous >= 0:
+            item = self.library.item(previous, 0)
+            if item is not None:
+                self._commit_notes_to(str(item.data(Qt.ItemDataRole.UserRole)))
+        if row < 0:
+            self._clear_viewer()
             return
         self._view_gen += 1
+        self._proxy_fallback = False
         self.still_path = ""
         self.playback_result = None
         self._fill_focus()
@@ -709,8 +865,8 @@ class MainWindow(QMainWindow):
             "\n".join(
                 [
                     clip["name"],
-                    clip["path"],
-                    f"SHA-256 {clip['sha256']}",
+                    self._break_long(clip["path"]),
+                    "SHA-256 " + self._break_long(clip["sha256"], 32),
                     f"Codec {summary.get('codec')}  {summary.get('width')}×{summary.get('height')}  {summary.get('pix_fmt')}  {summary.get('bit_depth')}-bit",
                     f"Rate {summary.get('frame_rate')}  duration {summary.get('duration')}  timecode {summary.get('timecode')}",
                     f"Color {video.get('color_space')} / {video.get('color_transfer')} / {video.get('color_primaries')} / {video.get('color_range')}",
@@ -734,6 +890,7 @@ class MainWindow(QMainWindow):
     def _save_flag(self) -> None:
         if self._filling:
             return
+        self.commit_editor()
         clip = self.focused_clip()
         if clip is None:
             return
@@ -744,23 +901,36 @@ class MainWindow(QMainWindow):
         self.reload_all()
 
     def _notes_edited(self) -> None:
-        return
+        if not self._filling:
+            self._notes_dirty = True
 
-    def save_notes(self) -> None:
-        clip = self.focused_clip()
-        if clip is None:
-            return
+    def _commit_notes_to(self, clip_id: str) -> bool:
+        if not self._notes_dirty:
+            return True
         try:
-            self.service.update_clip(clip["id"], {"notes": self.notes.toPlainText()})
+            self.service.update_clip(clip_id, {"notes": self.notes.toPlainText()})
         except CraftsError as exc:
             self.statusBar().showMessage(exc.message, 8000)
-            return
+            return False
+        self._notes_dirty = False
         self.clips = self.service.clips()
-        self.statusBar().showMessage("Notes stored in the project. The source file was not changed.", 5000)
+        return True
+
+    def commit_editor(self) -> bool:
+        clip_id = self.focused_id()
+        if clip_id is None:
+            self._notes_dirty = False
+            return True
+        return self._commit_notes_to(clip_id)
+
+    def save_notes(self) -> None:
+        if self.commit_editor():
+            self.statusBar().showMessage("Notes stored in the project. The source file was not changed.", 5000)
 
     def save_trim(self) -> None:
         if self._filling:
             return
+        self.commit_editor()
         clip = self.focused_clip()
         if clip is None:
             return
@@ -774,6 +944,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Trim stored in the project. The source file was not cut.", 5000)
 
     def add_marker(self) -> None:
+        self.commit_editor()
         clip = self.focused_clip()
         if clip is None:
             return
@@ -789,6 +960,7 @@ class MainWindow(QMainWindow):
         self._fill_focus()
 
     def remove_marker(self) -> None:
+        self.commit_editor()
         clip = self.focused_clip()
         row = self.markers.currentRow()
         if clip is None or row < 0:
@@ -906,12 +1078,32 @@ class MainWindow(QMainWindow):
         if self.player:
             self.player.setPosition(position)
 
+    def _break_long(self, text: str, size: int = 42) -> str:
+        if len(text) <= size:
+            return text
+        return "\n".join(text[index : index + size] for index in range(0, len(text), size))
+
+    def _format_time(self, ms: int) -> str:
+        seconds = max(0, ms) / 1000
+        return f"{int(seconds // 60)}:{seconds % 60:04.1f}"
+
     def _on_position(self, position: int) -> None:
         if not self.scrub.isSliderDown():
             self.scrub.setValue(position)
+        self.time_label.setText(f"{self._format_time(position)} / {self._format_time(self.scrub.maximum())}")
 
     def _on_duration(self, duration: int) -> None:
         self.scrub.setRange(0, max(0, duration))
+        self.time_label.setText(f"{self._format_time(self.player.position() if self.player else 0)} / {self._format_time(duration)}")
+
+    def _on_player_error(self, error, message: str) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        if error == QMediaPlayer.Error.NoError or self._proxy_fallback:
+            return
+        self.playback_note.setText(f"Playback failed ({message}). Building a viewing proxy.")
+        self._proxy_fallback = True
+        self._request_proxy(force=True)
 
     def set_trim_from_player(self, edge: str) -> None:
         clip = self.focused_clip()
@@ -925,29 +1117,35 @@ class MainWindow(QMainWindow):
         self.save_trim()
 
     def request_playback(self) -> None:
+        self._request_proxy(force=False)
+
+    def _request_proxy(self, force: bool) -> None:
         clip = self.focused_clip()
         if clip is None:
             return
-        generation = self._view_gen
+        project_gen = self._project_gen
+        view_gen = self._view_gen
         clip_id = clip["id"]
 
-        def work():
-            return self.service.proxy(clip_id)
+        def work(cancel):
+            return self.service.proxy(clip_id, cancel=cancel, force=force)
 
-        self._start(work, lambda result: self._show_playback(generation, result))
+        self._start(
+            work,
+            lambda result: self._show_playback(project_gen, view_gen, result),
+            key=f"proxy:{clip_id}",
+        )
 
-    def _show_playback(self, generation: int, result: dict) -> None:
-        if generation != self._view_gen:
+    def _show_playback(self, project_gen: int, view_gen: int, result: dict) -> None:
+        if project_gen != self._project_gen or view_gen != self._view_gen:
             return
         self.playback_result = result
         note = result.get("note") or ""
         if result.get("limited"):
-            note += f" Limit {int(PROXY_LIMIT_SECONDS)} seconds."
+            note = f"Proxy, at most {int(PROXY_LIMIT_SECONDS)}s. {note}"
         self.playback_note.setText(note)
-        path = result.get("proxy_path")
-        if result.get("kind") == "source":
-            clip = self.focused_clip()
-            path = clip["path"] if clip else None
+        self.playback_note.setToolTip(result.get("note") or "")
+        path = result.get("proxy_path") or result.get("path")
         if path and self.player:
             self.player.setSource(QUrl.fromLocalFile(str(path)))
 
@@ -955,29 +1153,39 @@ class MainWindow(QMainWindow):
         clip = self.focused_clip()
         if clip is None:
             return
-        generation = self._view_gen
+        project_gen = self._project_gen
+        self._still_seq += 1
+        sequence = self._still_seq
         seconds = (self.player.position() / 1000.0) if self.player else 0.0
         spec = self.filter_spec(adjusted)
         clip_id = clip["id"]
 
-        def work():
-            return str(self.service.thumbnail(clip_id, seconds, spec))
+        def work(cancel):
+            return str(self.service.thumbnail(clip_id, seconds, spec, cancel=cancel))
 
-        self._start(work, lambda path: self._show_still(generation, path))
-
-    def _show_still(self, generation: int, path: str) -> None:
-        if generation != self._view_gen:
-            return
-        self.still_path = path
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            self.still_label.setText(path)
-            return
-        self.still_label.setPixmap(
-            pixmap.scaled(self.still_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self._start(
+            work,
+            lambda path: self._show_still(project_gen, sequence, adjusted, path),
+            key="still",
         )
 
+    def _show_still(self, project_gen: int, sequence: int, adjusted: bool, path: str) -> None:
+        if project_gen != self._project_gen or sequence != self._still_seq:
+            return
+        self.still_path = path
+        label = self.still_adjusted if adjusted else self.still_original
+        self.still_label = label
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            label.setText(path)
+            return
+        label.setPixmap(
+            pixmap.scaled(label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        )
+        self.viewer_stack.setCurrentIndex(2 if adjusted else 1)
+
     def queue_focused_export(self) -> None:
+        self.commit_editor()
         clip = self.focused_clip()
         if clip is None:
             self.statusBar().showMessage("Select a clip first.", 5000)
@@ -1006,6 +1214,7 @@ class MainWindow(QMainWindow):
         self.refresh_queue()
 
     def queue_checked_batch(self, operation: str) -> None:
+        self.commit_editor()
         clip_ids = self.checked_ids()
         if not clip_ids:
             self.statusBar().showMessage("Check at least one clip. Focus and batch selection are separate.", 6000)
@@ -1080,14 +1289,18 @@ class MainWindow(QMainWindow):
         if not path:
             self.statusBar().showMessage("Choose a GCSV file first.", 5000)
             return
-        self._start(lambda: self.service.parse_gcsv(path), lambda result: self._show_text("GCSV", result))
+        self._start(lambda cancel: self.service.parse_gcsv(path), lambda result: self._show_text("GCSV", result), key="gcsv")
 
     def inspect_telemetry(self) -> None:
         clip = self.focused_clip()
         if clip is None:
             return
         clip_id = clip["id"]
-        self._start(lambda: self.service.inspect_telemetry(clip_id), lambda result: self._show_text("Telemetry", result))
+        self._start(
+            lambda cancel: self.service.inspect_telemetry(clip_id),
+            lambda result: self._show_text("Telemetry", result),
+            key="telemetry",
+        )
 
     def _show_text(self, title: str, result) -> None:
         import json
@@ -1183,6 +1396,8 @@ class MainWindow(QMainWindow):
         self.refresh_queue()
 
     def is_unsaved(self) -> bool:
+        if self._notes_dirty:
+            return True
         if self.service.project_path is not None:
             return False
         project = self.service.project
@@ -1209,6 +1424,7 @@ class MainWindow(QMainWindow):
         return "cancel"
 
     def new_project(self, discard: bool = False) -> bool:
+        self.commit_editor()
         if self.is_unsaved() and not discard:
             choice = self._prompt_unsaved()
             if choice == "cancel":
@@ -1217,10 +1433,13 @@ class MainWindow(QMainWindow):
                 return False
         if self._busy_queue():
             return False
+        if not self._runner.settle():
+            self.statusBar().showMessage("Background work did not stop. The project was not replaced.", 8000)
+            return False
         with self.service.lock:
             self.service.project = new_project()
             self.service.project_path = None
-        self.reload_all()
+        self._reset_workspace()
         return True
 
     def _busy_queue(self) -> bool:
@@ -1235,12 +1454,18 @@ class MainWindow(QMainWindow):
             self.open_project_path(path)
 
     def open_project_path(self, path: str) -> bool:
+        self.commit_editor()
         if self.is_unsaved():
             choice = self._prompt_unsaved()
             if choice == "cancel":
                 return False
             if choice == "save" and not self.save_project_interactive():
                 return False
+        if self._busy_queue():
+            return False
+        if not self._runner.settle():
+            self.statusBar().showMessage("Background work did not stop. The current project was kept.", 8000)
+            return False
         try:
             self.service.open_project(path)
         except CraftsError as exc:
@@ -1250,11 +1475,38 @@ class MainWindow(QMainWindow):
         remember_project(self.state, str(self.service.project_path))
         save_state(self.state, self.state_path)
         self._rebuild_recent()
-        self.reload_all()
+        self._reset_workspace()
         self.statusBar().showMessage("Opened. Saved queued exports stay paused until you retry them.", 8000)
         return True
 
+    def _reset_workspace(self) -> None:
+        self._project_gen += 1
+        self._view_gen += 1
+        self._still_seq += 1
+        self._notes_dirty = False
+        self._proxy_fallback = False
+        self.last_batch_id = ""
+        self.batch_errors.setPlainText("")
+        self._clear_viewer()
+        self.reload_all(keep_checks=False, keep_focus=False)
+
+    def _clear_viewer(self) -> None:
+        self.still_path = ""
+        self.playback_result = None
+        self.playback_note.setText("No clip.")
+        self.still_original.setPixmap(QPixmap())
+        self.still_original.setText("Original still")
+        self.still_adjusted.setPixmap(QPixmap())
+        self.still_adjusted.setText("Adjusted still")
+        if self.player is not None:
+            self.player.stop()
+            self.player.setSource(QUrl())
+        self.scrub.setRange(0, 0)
+        self.time_label.setText("0:00.0 / 0:00.0")
+        self.viewer_stack.setCurrentIndex(0)
+
     def save_project_interactive(self) -> bool:
+        self.commit_editor()
         if self.service.project_path is None:
             return self.save_project_as()
         try:
@@ -1274,6 +1526,7 @@ class MainWindow(QMainWindow):
         return self.save_project_to(path)
 
     def save_project_to(self, path: str) -> bool:
+        self.commit_editor()
         try:
             self.service.save_project(path)
         except CraftsError as exc:
@@ -1300,7 +1553,7 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.service, self)
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
-            self._start(self.service.capabilities, self._apply_capabilities)
+            self._start(lambda cancel: self.service.capabilities(), self._apply_capabilities, key="caps")
 
     def _apply_capabilities(self, report: dict) -> None:
         self.capabilities = report
@@ -1356,10 +1609,11 @@ class MainWindow(QMainWindow):
                 except CraftsError:
                     pass
         self.service.shutdown(timeout=8)
-        for task in self._tasks:
-            task.wait(2000)
+        if not self._runner.shutdown(timeout=8):
+            self.statusBar().showMessage("A background task was still stopping.", 8000)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self.commit_editor()
         if self.is_unsaved() and not self.force_close:
             choice = self._prompt_unsaved()
             if choice == "cancel":
@@ -1375,32 +1629,32 @@ class MainWindow(QMainWindow):
             self.player.setSource(QUrl())
         self.shutdown_owned()
         self._persist_window()
+        if self._runner.isRunning():
+            event.ignore()
+            return
         event.accept()
 
-    def _start(self, fn, on_ok) -> None:
+    def _start(self, fn, on_ok, *, key: str | None = None) -> None:
         token = self._token
         self._token += 1
         self._inflight += 1
-        task = TaskThread(token, fn)
         self._callbacks[token] = on_ok
-        task.succeeded.connect(self._task_ok)
-        task.failed.connect(self._task_fail)
-        task.finished.connect(lambda tok=token: self._task_finished(tok))
-        self._tasks.append(task)
-        task.start()
+        self._runner.submit(token, fn, key)
 
     def _task_ok(self, token: int, value) -> None:
         callback = self._callbacks.pop(token, None)
         if callback:
             callback(value)
+        self._note_finished()
 
     def _task_fail(self, token: int, message: str) -> None:
         self._callbacks.pop(token, None)
-        self.last_error = message
-        self.statusBar().showMessage(message, 10000)
+        if message != "cancelled":
+            self.last_error = message
+            self.statusBar().showMessage(message, 10000)
+        self._note_finished()
 
-    def _task_finished(self, token: int) -> None:
-        self._callbacks.pop(token, None)
+    def _note_finished(self) -> None:
         self._inflight = max(0, self._inflight - 1)
         if self._inflight == 0:
             self.idle.emit()
@@ -1412,8 +1666,16 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             return True
         loop = QEventLoop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
         self.idle.connect(loop.quit)
-        QTimer.singleShot(timeout_ms, loop.quit)
+        timer.start(timeout_ms)
         loop.exec()
+        timer.stop()
+        try:
+            self.idle.disconnect(loop.quit)
+        except RuntimeError:
+            pass
         QApplication.processEvents()
         return self._inflight == 0

@@ -50,7 +50,11 @@ and gyro stabilization call the programs you install and set under Tools.
 If those programs are missing, the job fails and is not reported as success.
 A missing playback codec does not change that.
 
-The Qt playback libraries are their own FFmpeg build. Their source is the
-FFmpeg revision Qt used for Qt 6.12, published with the Qt sources above.
-Crafts Prepare does not grant any extra right to redistribute a separately
-downloaded FFmpeg or Gyroflow.
+The playback plugin reports FFmpeg 9.0.1 under LGPL-2.1-or-later. See
+FFMPEG-QT.txt and LGPL-2.1.txt. That is the FFmpeg release Qt 6.12.0's
+multimedia module was built with. The Windows avcodec-63 DLL reviewed with
+this app was a shared MSVC build with zlib. That configure line is the
+Windows DLL's, and it is not reused as a description of any other build.
+The corresponding FFmpeg source is https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
+and the Qt Multimedia sources are the qtmultimedia 6.12.0 submodule. Those
+libraries stay separate files and can be replaced with a compatible build.

@@ -136,9 +136,12 @@ def run_captured(
     timeout: float,
     cancel: threading.Event | None = None,
     on_stdout: Callable[[str], None] | None = None,
+    on_start: Callable[[subprocess.Popen], None] | None = None,
     cwd: str | None = None,
 ) -> tuple[int, str, str]:
     proc = spawn(args, cwd=cwd)
+    if on_start is not None:
+        on_start(proc)
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     stdout_lock = threading.Lock()

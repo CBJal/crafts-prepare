@@ -302,12 +302,18 @@ class Service:
         }
         return {"kind": "gyroflow", "filename": filename, "output": str(final), "request": request}
 
-    def import_media(self, raw: str) -> dict:
+    def import_media(self, raw: str, cancel=None) -> dict:
+        from .errors import Cancelled
+
         _ffmpeg, ffprobe = self._tools()
-        result = import_path(raw, ffprobe)
+        result = import_path(raw, ffprobe, cancel=cancel)
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
         added = []
         duplicates = []
         with self.lock:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
             for clip in result["clips"]:
                 existing = self._find_duplicate(clip)
                 if existing:
@@ -376,7 +382,7 @@ class Service:
             self._persist()
             return public_clip(clip)
 
-    def thumbnail(self, clip_id: str, seconds: float, spec: FilterSpec) -> Path:
+    def thumbnail(self, clip_id: str, seconds: float, spec: FilterSpec, cancel=None) -> Path:
         ffmpeg, _ffprobe = self._tools()
         with self.lock:
             clip = self._clip(clip_id)
@@ -390,6 +396,7 @@ class Service:
             destination=destination,
             spec=spec,
             duration=duration,
+            cancel=cancel,
         )
 
     def stream_path(self, clip_id: str) -> Path:
@@ -397,7 +404,7 @@ class Service:
             clip = self._clip(clip_id)
             return Path(clip["path"])
 
-    def proxy(self, clip_id: str) -> dict:
+    def proxy(self, clip_id: str, cancel=None, force: bool = False) -> dict:
         ffmpeg, _ffprobe = self._tools()
         with self.lock:
             clip = self._clip(clip_id)
@@ -406,18 +413,19 @@ class Service:
             duration = float(clip["probe"].get("duration") or 0)
             playable = browser_playable(clip["probe"])
         limit = min(duration, PROXY_LIMIT_SECONDS) if duration and duration > 0 else PROXY_LIMIT_SECONDS
-        if playable:
+        if playable and not force:
             return {
                 "kind": "source",
+                "path": str(source),
                 "url": f"/api/media/{clip_id}/file",
                 "duration_limit_seconds": None,
                 "source_duration": duration,
                 "limited": False,
-                "note": "Browser playback uses the source file. Adjustments are not baked into this player.",
+                "note": "Playback is using the source file.",
             }
         destination = self.data_dir / f"proxy-{digest}.mp4"
-        if not destination.exists():
-            make_proxy(ffmpeg=ffmpeg, source=source, destination=destination, duration=duration)
+        if not (destination.is_file() and destination.stat().st_size > 0):
+            make_proxy(ffmpeg=ffmpeg, source=source, destination=destination, duration=duration, cancel=cancel)
         return {
             "kind": "proxy",
             "url": f"/api/media/{clip_id}/proxy-file",

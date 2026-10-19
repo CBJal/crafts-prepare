@@ -6,7 +6,6 @@ import argparse
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 
 from ..runtime import is_frozen, log_path, profile_name, strip_developer_overrides, user_root
@@ -47,44 +46,88 @@ def server_name() -> str:
     return f"CraftsPrepare-{profile_name()}"
 
 
-def notify_running(name: str | None = None) -> bool:
+def notify_running(name: str | None = None, timeout_ms: int = 2000) -> bool:
+    """Ask the running instance to focus. Uses the Qt event loop, not a sleep."""
+    from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtNetwork import QLocalSocket
 
     chosen = name or server_name()
-    deadline = time.monotonic() + 2
-    while True:
-        socket = QLocalSocket()
-        socket.connectToServer(chosen)
-        if socket.waitForConnected(300):
-            socket.write(b"raise\n")
-            socket.flush()
-            socket.waitForBytesWritten(1000)
-            socket.disconnectFromServer()
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
+    socket = QLocalSocket()
+    loop = QEventLoop()
+    result = {"ok": False, "buffer": bytearray()}
+
+    def finish(ok: bool) -> None:
+        result["ok"] = ok
+        if loop.isRunning():
+            loop.quit()
+
+    def send() -> None:
+        socket.write(b"raise\n")
+        socket.flush()
+
+    def read() -> None:
+        result["buffer"].extend(bytes(socket.readAll()))
+        if b"ok\n" in result["buffer"]:
+            finish(True)
+
+    socket.connected.connect(send)
+    socket.readyRead.connect(read)
+    socket.errorOccurred.connect(lambda *_args: finish(False))
+    QTimer.singleShot(timeout_ms, lambda: finish(False))
+    socket.connectToServer(chosen)
+    loop.exec()
+    if socket.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+        socket.disconnectFromServer()
+    socket.deleteLater()
+    return result["ok"]
 
 
 def attach_server(window, name: str | None = None):
-    from PySide6.QtNetwork import QLocalServer
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
     chosen = name or server_name()
     QLocalServer.removeServer(chosen)
     server = QLocalServer(window)
-    server.listen(chosen)
+    if not server.listen(chosen):
+        logging.error("Local server failed: %s", server.errorString())
+        return None
+    peers: list[QLocalSocket] = []
 
-    def accept() -> None:
-        socket = server.nextPendingConnection()
-        if socket is None:
-            return
+    def take(socket: QLocalSocket) -> None:
+        buffer = bytearray(bytes(socket.readAll()))
+
+        def finish() -> None:
+            if socket in peers:
+                peers.remove(socket)
+            socket.deleteLater()
 
         def read() -> None:
-            window.handle_peer(bytes(socket.readAll()))
+            buffer.extend(bytes(socket.readAll()))
+            if b"\n" not in buffer:
+                return
+            line = bytes(buffer).split(b"\n", 1)[0].strip()
+            if line == b"raise":
+                window.handle_peer(b"raise\n")
+                socket.write(b"ok\n")
+                socket.flush()
+            socket.disconnectFromServer()
 
         socket.readyRead.connect(read)
+        socket.disconnected.connect(finish)
+        socket.errorOccurred.connect(lambda *_args: finish())
+        peers.append(socket)
+        if buffer:
+            read()
+
+    def accept() -> None:
+        while True:
+            socket = server.nextPendingConnection()
+            if socket is None:
+                return
+            take(socket)
 
     server.newConnection.connect(accept)
+    server._peers = peers
     return server
 
 
@@ -92,7 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="crafts-prepare", add_help=True)
     parser.add_argument("--profile", default=None)
     parser.add_argument("--smoke", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--sample", default=None)
+    parser.add_argument("--sample", action="append", default=None)
+    parser.add_argument("--config", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--report", default=None)
     parser.add_argument("--screenshots", default=None)
@@ -128,14 +172,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         if args.smoke:
-            if not args.sample or not args.output or not args.report or not args.screenshots:
-                logging.error("Smoke needs --sample, --output, --report, and --screenshots.")
+            if not args.output or not args.report or not args.screenshots or not (args.sample or args.config):
+                logging.error("Smoke needs --output, --report, --screenshots, and --sample or --config.")
                 return 2
             return run_smoke(
-                sample=Path(args.sample),
+                samples=[Path(item) for item in (args.sample or [])],
                 output=Path(args.output),
                 report=Path(args.report),
                 screenshots=Path(args.screenshots),
+                config_path=Path(args.config) if args.config else None,
             )
         from ..service import Service
         from .window import MainWindow

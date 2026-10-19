@@ -45,13 +45,23 @@ The installed app ignores `CRAFTS_HOST`, `CRAFTS_PORT`, `CRAFTS_SETTINGS_PATH`, 
 
 FFmpeg, ffprobe, and Gyroflow stay separate programs. Qt may include its own playback libraries. Those are not the export tools. If the export tools are missing, the window still opens and says so.
 
-An installed smoke test is off unless you pass `--smoke`. It drives the real window with paths you choose:
+An installed smoke test is off unless you pass `--smoke`. It drives the real window. Repeat `--sample` for each clip, or pass `--config` with a JSON file of samples, export, and gyro settings. A required export that does not succeed fails the run. Set `"gyro": {"expect": "failed"}` only when that failure is the control you want.
 
 ```
-& "$env:LOCALAPPDATA\Programs\Crafts Prepare\CraftsPrepare.exe" --smoke --sample C:\clips\sample.mp4 --output C:\clips\out --report C:\clips\out\smoke.json --screenshots C:\clips\out\shots
+& "$env:LOCALAPPDATA\Programs\Crafts Prepare\CraftsPrepare.exe" --smoke --sample C:\clips\a.mp4 --sample C:\clips\b.mp4 --output C:\clips\out --report C:\clips\out\smoke.json --screenshots C:\clips\out\shots --config C:\clips\smoke.json
 ```
 
-A normal double-click does not show that diagnostic mode.
+Example `smoke.json` for 10-bit sources that need an acknowledged ProRes export:
+
+```json
+{
+  "export": {"preset": "prores_422", "audio": false, "fit": "resize", "width": 640, "height": 360, "acknowledge": true, "suffix": "_export"},
+  "gyro": {"format": "prores_422", "audio": false, "width": 640, "height": 360, "suffix": "_gyro", "expect": "succeeded"},
+  "expect": {"min_export_succeeded": 2}
+}
+```
+
+A normal double-click does not show that diagnostic mode. A second launch focuses the window that is already open.
 
 ## Windows development
 

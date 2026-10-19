@@ -87,7 +87,7 @@ def discover_executable(configured: str) -> str | None:
     return discover_tool(configured, which=shutil.which)
 
 
-def probe_file(ffprobe: str, path: Path, *, timeout: float = 60) -> dict:
+def probe_file(ffprobe: str, path: Path, *, timeout: float = 60, cancel=None) -> dict:
     code, stdout, stderr = run_captured(
         [
             ffprobe,
@@ -101,6 +101,7 @@ def probe_file(ffprobe: str, path: Path, *, timeout: float = 60) -> dict:
             str(path),
         ],
         timeout=timeout,
+        cancel=cancel,
     )
     if code != 0 or not stdout.strip():
         detail = (stderr or stdout or "ffprobe failed").strip()

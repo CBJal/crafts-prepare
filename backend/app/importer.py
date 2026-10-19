@@ -7,7 +7,7 @@ import os
 import uuid
 from pathlib import Path
 
-from .errors import CraftsError
+from .errors import Cancelled, CraftsError
 from .probe import probe_file
 from .security import MAX_HASH_BYTES, is_within, resolve_existing
 
@@ -16,11 +16,17 @@ MAX_FOLDER_FILES = 500
 MAX_DEPTH = 8
 
 
-def sha256_file(path: Path) -> str:
+def _cancelled(cancel) -> None:
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+
+
+def sha256_file(path: Path, cancel=None) -> str:
     digest = hashlib.sha256()
     total = 0
     with path.open("rb") as handle:
         while True:
+            _cancelled(cancel)
             block = handle.read(1024 * 1024)
             if not block:
                 break
@@ -31,13 +37,14 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def file_record(path: Path, ffprobe: str) -> dict:
+def file_record(path: Path, ffprobe: str, cancel=None) -> dict:
+    _cancelled(cancel)
     resolved = path.resolve(strict=True)
     if not resolved.is_file():
         raise CraftsError("Path is not a file.", code="bad_path")
-    digest = sha256_file(resolved)
+    digest = sha256_file(resolved, cancel=cancel)
     stat = resolved.stat()
-    probed = probe_file(ffprobe, resolved)
+    probed = probe_file(ffprobe, resolved, cancel=cancel)
     if not probed.get("video"):
         raise CraftsError("ffprobe found no video stream.", code="unreadable_media")
     return {
@@ -58,16 +65,16 @@ def file_record(path: Path, ffprobe: str) -> dict:
     }
 
 
-def import_path(raw: str, ffprobe: str) -> dict:
+def import_path(raw: str, ffprobe: str, cancel=None) -> dict:
     resolved = resolve_existing(raw)
     if resolved.is_dir():
-        return import_folder(resolved, ffprobe)
+        return import_folder(resolved, ffprobe, cancel=cancel)
     if resolved.is_file():
-        return {"clips": [file_record(resolved, ffprobe)], "skipped": [], "root": str(resolved.parent)}
+        return {"clips": [file_record(resolved, ffprobe, cancel=cancel)], "skipped": [], "root": str(resolved.parent)}
     raise CraftsError("Path is neither a file nor a folder.", code="bad_path")
 
 
-def import_folder(root: Path, ffprobe: str) -> dict:
+def import_folder(root: Path, ffprobe: str, cancel=None) -> dict:
     root = root.resolve(strict=True)
     if not root.is_dir():
         raise CraftsError("Folder import needs a directory.", code="bad_path")
@@ -117,7 +124,10 @@ def import_folder(root: Path, ffprobe: str) -> dict:
                     skipped.append({"path": str(candidate), "reason": "path escapes the selected folder"})
                     continue
             try:
-                clips.append(file_record(probe_path, ffprobe))
+                _cancelled(cancel)
+                clips.append(file_record(probe_path, ffprobe, cancel=cancel))
+            except Cancelled:
+                raise
             except CraftsError as exc:
                 skipped.append({"path": str(probe_path), "reason": exc.message})
     return {"clips": clips, "skipped": skipped, "root": str(root)}

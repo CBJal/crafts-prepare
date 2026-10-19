@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -21,6 +22,7 @@ def extract_thumbnail(
     destination: Path,
     spec: FilterSpec,
     duration: float,
+    cancel=None,
 ) -> Path:
     if seconds < 0 or (duration and seconds > duration + 0.05):
         raise CraftsError("Thumbnail time is outside the clip.", code="bad_trim")
@@ -47,7 +49,7 @@ def extract_thumbnail(
         if chain:
             args.extend(["-vf", chain])
         args.extend(["-q:v", "3", str(destination)])
-        code, _stdout, stderr = run_captured(args, timeout=120, cwd=str(work))
+        code, _stdout, stderr = run_captured(args, timeout=120, cwd=str(work), cancel=cancel)
     if code != 0 or not destination.exists():
         raise CraftsError("Thumbnail failed. " + (stderr or "")[-500:], code="ffmpeg_failed")
     return destination
@@ -75,8 +77,10 @@ def make_proxy(
     source: Path,
     destination: Path,
     duration: float,
+    cancel=None,
 ) -> Path:
     limit = min(duration, PROXY_LIMIT_SECONDS) if duration and duration > 0 else PROXY_LIMIT_SECONDS
+    partial = destination.with_name(destination.name + ".partial")
     args = [
         ffmpeg,
         "-hide_banner",
@@ -102,9 +106,20 @@ def make_proxy(
         "128k",
         "-movflags",
         "+faststart",
-        str(destination),
+        str(partial),
     ]
-    code, _stdout, stderr = run_captured(args, timeout=60 * 30)
-    if code != 0 or not destination.exists():
+    try:
+        code, _stdout, stderr = run_captured(args, timeout=60 * 30, cancel=cancel)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    if cancel is not None and cancel.is_set():
+        partial.unlink(missing_ok=True)
+        from .errors import Cancelled
+
+        raise Cancelled()
+    if code != 0 or not partial.is_file() or partial.stat().st_size == 0:
+        partial.unlink(missing_ok=True)
         raise CraftsError("Proxy failed. " + (stderr or "")[-500:], code="ffmpeg_failed")
+    os.replace(partial, destination)
     return destination
