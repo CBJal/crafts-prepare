@@ -42,10 +42,3 @@ Name: "{autodesktop}\Crafts Prepare"; Filename: "{app}\CraftsPrepare.exe"; Tasks
 
 [Run]
 Filename: "{app}\CraftsPrepare.exe"; Description: "Launch Crafts Prepare"; Flags: nowait postinstall skipifsilent
-
-[Code]
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-begin
-  { Projects, settings, cache, and logs live in {%LOCALAPPDATA}\CraftsPrepare.
-    This uninstaller does not delete that folder. }
-end;

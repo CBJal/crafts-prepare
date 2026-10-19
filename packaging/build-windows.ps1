@@ -1,5 +1,9 @@
 # Build a per-user Crafts Prepare installer on Windows x64.
 # Does not download Python, Node, Inno Setup, FFmpeg, or Gyroflow.
+# Does not delete previous build folders. Each run writes a new output directory.
+param(
+    [string]$OutputRoot
+)
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
@@ -76,14 +80,36 @@ if (-not (Test-Path "frontend\dist\index.html")) {
 & $python packaging\make_icon.py
 Assert-Native "make_icon.py"
 
-$dist = Join-Path $Root "packaging\dist"
-$work = Join-Path $Root "packaging\build"
-if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+if ($OutputRoot) {
+    $outRoot = $OutputRoot
+} else {
+    $outRoot = Join-Path $Root "packaging\output\$stamp"
+}
+if (Test-Path $outRoot) {
+    throw "Refusing to overwrite $outRoot. Previous build attempts are kept, and this script does not delete them."
+}
+New-Item -ItemType Directory -Path $outRoot | Out-Null
+$dist = Join-Path $outRoot "dist"
+$work = Join-Path $outRoot "work"
+$licenseDir = Join-Path $outRoot "licenses"
+$installerOut = Join-Path $outRoot "installer"
+New-Item -ItemType Directory -Path $dist, $work, $installerOut | Out-Null
+
+& $python packaging\collect_licenses.py --output $licenseDir
+Assert-Native "collect_licenses.py"
+$versionFile = Join-Path $outRoot "file_version_info.txt"
+& $python packaging\write_version_info.py --output $versionFile
+Assert-Native "write_version_info.py"
+$env:CRAFTS_LICENSE_DIR = $licenseDir
+$env:CRAFTS_VERSION_FILE = $versionFile
+
 & $python -m PyInstaller packaging\crafts-prepare.spec --noconfirm --distpath $dist --workpath $work
 Assert-Native "PyInstaller"
 $bundle = Join-Path $dist "CraftsPrepare"
-if (-not (Test-Path (Join-Path $bundle "CraftsPrepare.exe"))) {
-    throw "PyInstaller did not write packaging\dist\CraftsPrepare\CraftsPrepare.exe."
+$exePath = Join-Path $bundle "CraftsPrepare.exe"
+if (-not (Test-Path $exePath)) {
+    throw "PyInstaller did not write $exePath."
 }
 
 $builtAt = [DateTime]::UtcNow.ToString("o")
@@ -93,28 +119,35 @@ $info = @{
     source_sha = $sha
     built_at = $builtAt
     python = $versionText
+    executable = $exePath
+    output_root = $outRoot
 } | ConvertTo-Json
 $infoPath = Join-Path $bundle "build-info.json"
 Set-Content -Path $infoPath -Value $info -Encoding utf8
 
 $iscc = Find-Iscc
-$output = Join-Path $Root "packaging\output"
-New-Item -ItemType Directory -Force -Path $output | Out-Null
-& $iscc "/DAppVersion=$appVersion" "/DSourceDir=$bundle" "/DOutputDir=$output" (Join-Path $Root "packaging\crafts-prepare.iss")
+& $iscc @(
+    "/DAppVersion=$appVersion",
+    "/DSourceDir=`"$bundle`"",
+    "/DOutputDir=`"$installerOut`"",
+    (Join-Path $Root "packaging\crafts-prepare.iss")
+)
 Assert-Native "ISCC"
 
-$setup = Join-Path $output "CraftsPrepare-Setup-$appVersion.exe"
+$setup = Join-Path $installerOut "CraftsPrepare-Setup-$appVersion.exe"
 if (-not (Test-Path $setup)) {
     throw "Installer was not written to $setup."
 }
-Copy-Item $infoPath (Join-Path $output "build-info.json") -Force
+Copy-Item $infoPath (Join-Path $installerOut "build-info.json")
 $setupHash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLower()
-$exeHash = (Get-FileHash -Algorithm SHA256 (Join-Path $bundle "CraftsPrepare.exe")).Hash.ToLower()
+$exeHash = (Get-FileHash -Algorithm SHA256 $exePath).Hash.ToLower()
 @(
     "$setupHash  CraftsPrepare-Setup-$appVersion.exe",
-    "$exeHash  CraftsPrepare/CraftsPrepare.exe"
-) | Set-Content -Path (Join-Path $output "SHA256SUMS.txt") -Encoding ascii
+    "$exeHash  CraftsPrepare.exe"
+) | Set-Content -Path (Join-Path $installerOut "SHA256SUMS.txt") -Encoding ascii
 
+Write-Host "Output:    $outRoot"
+Write-Host "Executable: $exePath"
 Write-Host "Installer: $setup"
 Write-Host "SHA256:    $setupHash"
 Write-Host "Source:    $sha"

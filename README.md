@@ -26,14 +26,18 @@ The development start script still needs Python and Node. The installer does not
 powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
 ```
 
-The script does not download those tools, FFmpeg, or Gyroflow. It writes:
+The script does not download those tools, FFmpeg, or Gyroflow. It does not delete earlier build folders. Each run writes a new directory:
 
-- `packaging\dist\CraftsPrepare\` — the PyInstaller onedir folder
-- `packaging\output\CraftsPrepare-Setup-0.1.0.exe` — the per-user installer
-- `packaging\output\SHA256SUMS.txt` — SHA-256 of the installer and `CraftsPrepare.exe`
-- `packaging\output\build-info.json` — version and the git SHA that was built
+- `packaging\output\<yyyyMMdd-HHmmss>\dist\CraftsPrepare\CraftsPrepare.exe` — the windowed app
+- `packaging\output\<yyyyMMdd-HHmmss>\work\` — PyInstaller work files
+- `packaging\output\<yyyyMMdd-HHmmss>\licenses\` — Python, dependency, PyInstaller, and React license texts copied into the app
+- `packaging\output\<yyyyMMdd-HHmmss>\installer\CraftsPrepare-Setup-0.1.0.exe` — the per-user installer
+- `packaging\output\<yyyyMMdd-HHmmss>\installer\SHA256SUMS.txt` — SHA-256 of the installer and `CraftsPrepare.exe`
+- `packaging\output\<yyyyMMdd-HHmmss>\installer\build-info.json` — version and the git SHA that was built
 
-Install for the current user. Shortcuts go on the Start menu, and a desktop shortcut is optional. Uninstall removes the program files only. Settings, cache, logs, and projects stay in `%LOCALAPPDATA%\CraftsPrepare` and wherever you saved projects. The installed app is not signed. Windows may show a SmartScreen prompt until you sign the installer yourself.
+Pass `-OutputRoot` to choose that directory. If it already exists, the script stops and leaves it in place. `CraftsPrepare.exe` carries FileVersion and ProductVersion `0.1.0`. The build is unsigned. Windows may show a SmartScreen prompt until you sign the installer yourself.
+
+Install for the current user. Shortcuts go on the Start menu, and a desktop shortcut is optional. Uninstall removes the program files only. Settings, cache, logs, and projects stay in `%LOCALAPPDATA%\CraftsPrepare` and wherever you saved projects. The installed app ignores `CRAFTS_HOST`, `CRAFTS_PORT`, `CRAFTS_SETTINGS_PATH`, `CRAFTS_DATA_DIR`, `CRAFTS_LOG_PATH`, and `CRAFTS_DISABLE_WORKER`. Development still honors those. A separate frozen profile for QA is `%LOCALAPPDATA%\CraftsPrepare-<token>` when you start the exe with `--profile <token>` or set `CRAFTS_PROFILE` to a short token such as `qa`.
 
 FFmpeg, ffprobe, and Gyroflow stay separate programs. The app looks on PATH and in common install locations, or uses the paths you set in Capabilities. If they are missing, the window still opens and says so.
 

@@ -4,9 +4,11 @@ Crafts Prepare does not bundle FFmpeg, Gyroflow, Sony software, or camera footag
 
 The optional Windows installer does bundle a Python runtime and the PyInstaller bootloader so the installed app can start without a developer Python. It still does not bundle FFmpeg, Gyroflow, or camera footage.
 
-**Python.** PSF License. Used only as the runtime inside the Windows build. https://docs.python.org/3/license.html
+**Python.** PSF License. Used only as the runtime inside the Windows build. The build copies `LICENSE.txt` from that interpreter into `licenses/Python/`. https://docs.python.org/3/license.html
 
-**PyInstaller.** The application libraries are collected from the pins in `backend/requirements.lock`. The bootloader is GPL-2.0-or-later with the PyInstaller exception that allows using it to freeze and distribute a program that is not itself GPL. https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt Build pin: `packaging/requirements-build.txt`.
+**PyInstaller.** The application libraries are collected from the pins in `backend/requirements.lock`. The bootloader is GPL-2.0-or-later with the PyInstaller exception that allows using it to freeze and distribute a program that is not itself GPL. The build copies that `COPYING.txt` into `licenses/PyInstaller/`. https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt Build pin: `packaging/requirements-build.txt`.
+
+The Windows build also copies the license files of the Python packages it bundles (FastAPI, Uvicorn, Pydantic, Starlette, and their runtime dependencies) and the React and react-dom `LICENSE` files. FFmpeg and Gyroflow binaries are not in the package.
 
 **tkinter / Tcl/Tk.** Used for the installed app's Open/Quit window. The Windows python.org builds ship Tcl/Tk under their own license, which PyInstaller collects. Not used by the development server.
 
@@ -23,7 +25,7 @@ The optional Windows installer does bundle a Python runtime and the PyInstaller 
 | React | MIT | Web UI |
 | Vite | MIT | UI build |
 | TypeScript | Apache-2.0 | UI language |
-| Fraunces and Outfit via Fontsource | SIL Open Font License | UI fonts |
+| Fraunces and Outfit via Fontsource | SIL Open Font License | Listed in `frontend/package.json`. The UI does not import them, so the installer does not ship those font files |
 
 Lock files: `backend/requirements.txt`, `backend/requirements.lock`, `frontend/package-lock.json`.
 

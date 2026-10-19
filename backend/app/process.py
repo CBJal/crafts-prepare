@@ -9,8 +9,72 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 
 from .errors import Cancelled, CraftsError
+
+# Win32 CREATE_NO_WINDOW. subprocess does not define it outside Windows.
+CREATE_NO_WINDOW = 0x08000000
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+# Tests replace this with an object that records get/set. Production uses kernel32.
+_dll_controller = None
+_dll_lock = threading.Lock()
+
+
+def windows_no_window_flag() -> int:
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", CREATE_NO_WINDOW))
+
+
+def windows_creation_flags() -> int:
+    new_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", CREATE_NEW_PROCESS_GROUP))
+    return new_group | windows_no_window_flag()
+
+
+class _Kernel32DllDirectory:
+    """The DLL search directory the PyInstaller bootloader sets for this process."""
+
+    def get(self) -> str | None:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetDllDirectoryW(len(buffer), buffer)
+        if not length:
+            return None
+        return buffer.value
+
+    def set(self, value: str | None) -> None:
+        import ctypes
+
+        if not ctypes.windll.kernel32.SetDllDirectoryW(value):
+            raise OSError("SetDllDirectoryW failed")
+
+
+def _dll_reset_active() -> bool:
+    if _dll_controller is not None:
+        return True
+    return os.name == "nt" and bool(getattr(sys, "frozen", False))
+
+
+@contextmanager
+def isolate_external_dll_search():
+    """Clear the inherited PyInstaller DLL directory for one child, then restore it.
+
+    The Windows bootloader calls SetDllDirectoryW on its extraction directory.
+    Child processes inherit that search path, so PATH edits are not enough.
+    https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html
+    """
+    if not _dll_reset_active():
+        yield
+        return
+    controller = _dll_controller or _Kernel32DllDirectory()
+    with _dll_lock:
+        previous = controller.get()
+        controller.set(None)
+        try:
+            yield
+        finally:
+            controller.set(previous if previous else None)
 
 
 def spawn(args: list[str], cwd: str | None = None) -> subprocess.Popen[str]:
@@ -27,15 +91,15 @@ def spawn(args: list[str], cwd: str | None = None) -> subprocess.Popen[str]:
     }
     if os.name == "nt":
         # CREATE_NO_WINDOW keeps ffmpeg and Gyroflow from opening a console.
-        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | no_window
+        kwargs["creationflags"] = windows_creation_flags()
     else:
         kwargs["start_new_session"] = True
-    if getattr(sys, "frozen", False):
-        from .runtime import external_tool_environ
+    with isolate_external_dll_search():
+        if getattr(sys, "frozen", False):
+            from .runtime import external_tool_environ
 
-        kwargs["env"] = external_tool_environ()
-    return subprocess.Popen(args, **kwargs)
+            kwargs["env"] = external_tool_environ()
+        return subprocess.Popen(args, **kwargs)
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -47,6 +111,7 @@ def kill_tree(proc: subprocess.Popen) -> None:
             ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
             capture_output=True,
             check=False,
+            creationflags=windows_no_window_flag(),
         )
     else:
         try:

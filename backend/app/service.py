@@ -70,7 +70,9 @@ class Service:
         self._caps_cache: dict | None = None
 
     def start(self) -> None:
-        if os.environ.get("CRAFTS_DISABLE_WORKER") == "1":
+        from .runtime import is_frozen
+
+        if not is_frozen() and os.environ.get("CRAFTS_DISABLE_WORKER") == "1":
             return
         if self.worker and self.worker.is_alive():
             return
@@ -78,11 +80,18 @@ class Service:
         self.worker = threading.Thread(target=self._loop, name="crafts-queue", daemon=True)
         self.worker.start()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 8.0) -> None:
+        """Cancel queued work and wait for the owned worker, unless this is that worker."""
         self.stop.set()
         self.wake.set()
         for flag in self.cancel_flags.values():
             flag.set()
+        worker = self.worker
+        if worker is None or not worker.is_alive():
+            return
+        if worker is threading.current_thread():
+            return
+        worker.join(timeout=timeout)
 
     def _load_settings(self) -> dict:
         defaults = {

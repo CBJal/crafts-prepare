@@ -5,4 +5,4 @@ Install those programs yourself if you want export, preview, or gyro stabilizati
 FFmpeg and ffprobe: https://ffmpeg.org/download.html
 Gyroflow: https://gyroflow.xyz/download
 
-The installer does not add a Windows service, a firewall rule, or a sign-in at startup. Uninstall removes the program files only. Your projects, settings, cache, and logs stay in %LOCALAPPDATA%\CraftsPrepare.
+The installer does not add a Windows service, a firewall rule, or a sign-in at startup. Uninstall removes the program files only. Your projects, settings, cache, and logs stay in %LOCALAPPDATA%\CraftsPrepare. A short --profile token uses %LOCALAPPDATA%\CraftsPrepare-<token> instead. That token is not a folder path.

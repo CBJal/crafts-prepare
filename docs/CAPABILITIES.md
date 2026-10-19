@@ -34,8 +34,8 @@ Status below is what this repository implements. "Verified here" means an automa
 | Automatic Gyroflow batch | Implemented when Gyroflow is installed | Each clip is preflighted with `--export-metadata 2` inside that job's staging directory. `raw_imu` must be a progressing sequence of finite timestamped gyro vectors, and files above 256 MiB are not decoded. The requested codec, pixel format, dimensions, and audio replace those fields on the staged project and preset. The render is published only when ffprobe matches. A test double encodes with ffmpeg; this session did not finish a GPU render |
 | Light, Dark, and System themes | Implemented | Neutral slate and white surfaces with a blue accent. The choice is stored locally. Footage is not recolored |
 | Queue cancel, retry, collision, failed ffmpeg | Implemented | Yes |
-| Windows process-tree kill | Code path uses `taskkill /F /T` | Not executed on Windows. Linux process-group kill was tested |
-| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup. This session did not produce or run a Windows installer. FFmpeg and Gyroflow are not inside the package |
+| Windows process-tree kill | Code path uses `taskkill /F /T` with `CREATE_NO_WINDOW` | Not executed on Windows. Linux process-group kill was tested |
+| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup. The build script keeps each attempt in its own output directory and does not delete older ones. This Linux session did not run PyInstaller or Inno Setup. FFmpeg and Gyroflow are not inside the package |
 | Accounts, payments, cloud upload | Not implemented | |
 
 Preset pixel formats:

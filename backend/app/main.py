@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .errors import CraftsError
 from .filters import FilterSpec
-from .runtime import frontend_dist
+from .runtime import frontend_dist, preferred_port, profile_name
 from .security import MAX_JSON_BYTES, assert_loopback_request
 from .service import Service
 from .version import APP_NAME, APP_VERSION
@@ -184,7 +184,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def health():
-        return {"ok": True, "name": APP_NAME, "version": APP_VERSION, "bind": "127.0.0.1"}
+        return {
+            "ok": True,
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "bind": "127.0.0.1",
+            "profile": profile_name(),
+        }
 
     @app.get("/api/capabilities")
     def capabilities():
@@ -351,9 +357,10 @@ def main() -> None:
     host = os.environ.get("CRAFTS_HOST", "127.0.0.1")
     if host not in {"127.0.0.1", "localhost"}:
         raise SystemExit("Crafts Prepare binds to 127.0.0.1 only.")
-    port = int(os.environ.get("CRAFTS_PORT", "8765"))
-    if not 1 <= port <= 65535:
-        raise SystemExit("CRAFTS_PORT is invalid.")
+    try:
+        port = preferred_port()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     uvicorn.run(create_app(), host="127.0.0.1", port=port, log_level="info")
 
 

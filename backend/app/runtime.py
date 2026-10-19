@@ -7,11 +7,22 @@ keeps settings, cache, and logs under LocalAppData, outside the install folder.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
 APP_DIR_NAME = "CraftsPrepare"
 HEALTH_NAME = "Crafts Prepare"
+DEFAULT_PORT = 8765
+FROZEN_IGNORED_ENV = (
+    "CRAFTS_HOST",
+    "CRAFTS_PORT",
+    "CRAFTS_SETTINGS_PATH",
+    "CRAFTS_DATA_DIR",
+    "CRAFTS_LOG_PATH",
+    "CRAFTS_DISABLE_WORKER",
+)
+_PROFILE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 # Relative to the standard Windows directory named by the environment variable.
 _WINDOWS_TOOL_PATHS = {
@@ -60,34 +71,80 @@ def frontend_dist() -> Path:
     return repo_root() / "frontend" / "dist"
 
 
+def strip_developer_overrides(environ: dict[str, str] | None = None) -> None:
+    """Drop inherited developer settings in a frozen app. Development keeps them."""
+    if not is_frozen():
+        return
+    target = os.environ if environ is None else environ
+    for name in FROZEN_IGNORED_ENV:
+        target.pop(name, None)
+
+
+def profile_name() -> str:
+    """Health identity. Development is always `dev`. A frozen QA token is not a path."""
+    if not is_frozen():
+        return "dev"
+    token = os.environ.get("CRAFTS_PROFILE", "").strip()
+    if token and _PROFILE_TOKEN.fullmatch(token) and token.casefold() != "dev":
+        return token
+    return "user"
+
+
 def user_root() -> Path:
     """Writable per-user directory. Never the installation directory."""
     if is_frozen():
         local = os.environ.get("LOCALAPPDATA")
         base = Path(local) if local else Path.home() / "AppData" / "Local"
-        return base / APP_DIR_NAME
+        token = profile_name()
+        folder = APP_DIR_NAME if token == "user" else f"{APP_DIR_NAME}-{token}"
+        return base / folder
     return Path.home() / ".crafts-prepare"
 
 
+def _dev_override(name: str) -> str | None:
+    if is_frozen():
+        return None
+    value = os.environ.get(name)
+    if value is None or not str(value).strip():
+        return None
+    return str(value).strip()
+
+
 def settings_path() -> Path:
-    override = os.environ.get("CRAFTS_SETTINGS_PATH")
+    override = _dev_override("CRAFTS_SETTINGS_PATH")
     if override:
         return Path(override)
     return user_root() / "settings.json"
 
 
 def data_dir() -> Path:
-    override = os.environ.get("CRAFTS_DATA_DIR")
+    override = _dev_override("CRAFTS_DATA_DIR")
     if override:
         return Path(override)
     return user_root() / "cache"
 
 
 def log_path() -> Path:
-    override = os.environ.get("CRAFTS_LOG_PATH")
+    override = _dev_override("CRAFTS_LOG_PATH")
     if override:
         return Path(override)
     return user_root() / "logs" / "crafts-prepare.log"
+
+
+def preferred_port() -> int:
+    """Loopback port. A frozen app always starts at 8765 and ignores CRAFTS_PORT."""
+    if is_frozen():
+        return DEFAULT_PORT
+    raw = os.environ.get("CRAFTS_PORT", str(DEFAULT_PORT))
+    if raw is None or not str(raw).strip():
+        return DEFAULT_PORT
+    try:
+        port = int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError("CRAFTS_PORT is invalid.") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("CRAFTS_PORT is invalid.")
+    return port
 
 
 def instance_path() -> Path:
@@ -213,3 +270,77 @@ def can_bind_loopback(port: int) -> bool:
     finally:
         sock.close()
     return True
+
+
+def claim_listen_socket(port: int):
+    """Bind and listen, and return the open socket. None when the port is taken.
+
+    The caller keeps the socket and hands it to the server. Closing it and
+    binding again would let another process take the port in between.
+    """
+    import socket
+
+    if port != 0 and not 1 <= port <= 65535:
+        return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name != "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", port))
+        sock.listen(128)
+    except OSError:
+        sock.close()
+        return None
+    return sock
+
+
+class InstanceLock:
+    """Exclusive OS lock for one user profile. Released when the process exits."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or (user_root() / "instance.lock")
+        self._file = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(self.path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                if handle.read(1) != b"\0":
+                    handle.seek(0)
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        self._file = handle
+        return True
+
+    def release(self) -> None:
+        handle = self._file
+        self._file = None
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            handle.close()
