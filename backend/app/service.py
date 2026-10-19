@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import logging
 import math
 import os
 import re
@@ -35,10 +37,65 @@ from .security import (
 
 SCHEMA = "crafts-prepare.project"
 VERSION = 1
+# WinError 5, 32, and 33: access denied, sharing violation, lock violation.
+_TRANSIENT_WINERRORS = {5, 32, 33}
+_REPLACE_ATTEMPTS = 6
+_PROJECT_LOCK_MESSAGE = (
+    "Could not replace the project file. The previous file was left unchanged. "
+    "The queue is paused until that file can be saved. "
+    "Free the file, or use Save As to store the project in another folder."
+)
+log = logging.getLogger(__name__)
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _transient_replace_error(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if winerror in _TRANSIENT_WINERRORS:
+        return True
+    if isinstance(exc, PermissionError):
+        return True
+    return exc.errno in {errno.EACCES, errno.EPERM, errno.EBUSY}
+
+
+def _replace_durable(source: Path, dest: Path, attempts: int) -> None:
+    """Replace dest with source. Retry only transient share/permission failures."""
+    delay = 0.05
+    last: OSError | None = None
+    total = max(1, attempts)
+    for attempt in range(total):
+        try:
+            os.replace(source, dest)
+            return
+        except OSError as exc:
+            last = exc
+            if not _transient_replace_error(exc) or attempt + 1 >= total:
+                break
+            time.sleep(delay)
+            delay = min(delay * 2, 0.4)
+    raise CraftsError(_PROJECT_LOCK_MESSAGE, code="project_locked") from last
+
+
+def _discard_owned_temp(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.warning("Left an unreplaced project temp in place: %s", path.name)
+
+
+def _job_view(job: dict) -> dict:
+    return {
+        "status": job["status"],
+        "progress": job["progress"],
+        "error": job["error"],
+        "code": job["code"],
+        "result": job["result"],
+        "finished_at": job["finished_at"],
+        "attempt": job.get("attempt"),
+    }
 
 
 def default_settings_path() -> Path:
@@ -68,6 +125,8 @@ class Service:
         self.worker: threading.Thread | None = None
         self._last_save = 0.0
         self._caps_cache: dict | None = None
+        self.persist_error: str | None = None
+        self._claims_paused = False
 
     def start(self) -> None:
         from .runtime import is_frozen
@@ -529,7 +588,12 @@ class Service:
             }
             self.project["jobs"].append(job)
             self.cancel_flags[job["id"]] = threading.Event()
-            self._persist()
+            try:
+                self._persist()
+            except CraftsError:
+                self.project["jobs"].pop()
+                self.cancel_flags.pop(job["id"], None)
+                raise
             self.wake.set()
             return job
 
@@ -550,7 +614,12 @@ class Service:
         with self.lock:
             self.project["jobs"].append(job)
             self.cancel_flags[job["id"]] = threading.Event()
-            self._persist()
+            try:
+                self._persist()
+            except CraftsError:
+                self.project["jobs"].pop()
+                self.cancel_flags.pop(job["id"], None)
+                raise
             self.wake.set()
         return job
 
@@ -652,7 +721,14 @@ class Service:
                 self.project["jobs"].append(job)
                 self.cancel_flags[job["id"]] = threading.Event()
                 jobs.append(job)
-            self._persist()
+            try:
+                self._persist()
+            except CraftsError:
+                queued_ids = {job["id"] for job in jobs}
+                self.project["jobs"] = [job for job in self.project["jobs"] if job["id"] not in queued_ids]
+                for job in jobs:
+                    self.cancel_flags.pop(job["id"], None)
+                raise
             self.wake.set()
             return {"batch_id": batch_id, "queued": jobs, "count": len(jobs)}
 
@@ -695,11 +771,13 @@ class Service:
         signalled = []
         with self.lock:
             found = False
+            snapshots: list[tuple[dict, dict]] = []
             for job in self.project["jobs"]:
                 if job.get("batch_id") != batch_id:
                     continue
                 found = True
                 if job["status"] == "queued":
+                    snapshots.append((job, _job_view(job)))
                     job["status"] = "cancelled"
                     job["error"] = "Cancelled before it started."
                     job["code"] = "cancelled"
@@ -710,7 +788,12 @@ class Service:
                     signalled.append(job["id"])
             if not found:
                 raise CraftsError("No jobs belong to that batch.", code="not_found", status=404)
-            self._persist()
+            try:
+                self._persist()
+            except CraftsError:
+                for job, snap in snapshots:
+                    job.update(snap)
+                raise
         return {"batch_id": batch_id, "cancelled": cancelled, "signalled": signalled}
 
     def retry_batch_failures(self, batch_id: str) -> dict:
@@ -720,6 +803,7 @@ class Service:
         succeeded = []
         with self.lock:
             found = False
+            snapshots: list[tuple[dict, dict]] = []
             for job in self.project["jobs"]:
                 if job.get("batch_id") != batch_id:
                     continue
@@ -729,6 +813,7 @@ class Service:
                     continue
                 if job["status"] != "failed":
                     continue
+                snapshots.append((job, _job_view(job)))
                 job["status"] = "queued"
                 job["progress"] = 0.0
                 job["error"] = None
@@ -741,7 +826,12 @@ class Service:
             if not found:
                 raise CraftsError("No jobs belong to that batch.", code="not_found", status=404)
             if retried:
-                self._persist()
+                try:
+                    self._persist()
+                except CraftsError:
+                    for job, snap in snapshots:
+                        job.update(snap)
+                    raise
                 self.wake.set()
         return {"batch_id": batch_id, "retried": retried, "succeeded_left_unchanged": succeeded}
 
@@ -756,12 +846,19 @@ class Service:
                 raise CraftsError("This job is already finished.", code="bad_state")
             flag = self.cancel_flags.setdefault(job_id, threading.Event())
             flag.set()
+            snap = None
             if job["status"] == "queued":
+                snap = _job_view(job)
                 job["status"] = "cancelled"
                 job["error"] = "Cancelled before it started."
                 job["code"] = "cancelled"
                 job["finished_at"] = utcnow()
+            try:
                 self._persist()
+            except CraftsError:
+                if snap is not None:
+                    job.update(snap)
+                raise
             return job
 
     def retry(self, job_id: str) -> dict:
@@ -772,6 +869,7 @@ class Service:
                     "Only failed, cancelled, interrupted, or paused jobs can be retried.",
                     code="bad_state",
                 )
+            snap = _job_view(job)
             job["status"] = "queued"
             job["progress"] = 0.0
             job["error"] = None
@@ -780,7 +878,11 @@ class Service:
             job["finished_at"] = None
             job["attempt"] = int(job.get("attempt") or 1) + 1
             self.cancel_flags[job_id] = threading.Event()
-            self._persist()
+            try:
+                self._persist()
+            except CraftsError:
+                job.update(snap)
+                raise
             self.wake.set()
             return job
 
@@ -793,7 +895,24 @@ class Service:
 
     def _loop(self) -> None:
         while not self.stop.is_set():
-            job_id = self._claim()
+            try:
+                if self._claims_paused:
+                    try:
+                        with self.lock:
+                            self._persist(attempts=1)
+                    except CraftsError as exc:
+                        self._pause_claims(exc)
+                        self.wake.wait(1.0)
+                        self.wake.clear()
+                        continue
+                job_id = self._claim()
+            except Exception as exc:  # noqa: BLE001 — the queue thread must stay alive
+                log.exception("Queue paused after an unexpected error")
+                self._claims_paused = True
+                self.persist_error = self.persist_error or str(exc)
+                self.wake.wait(1.0)
+                self.wake.clear()
+                continue
             if job_id is None:
                 self.wake.wait(0.25)
                 self.wake.clear()
@@ -802,14 +921,29 @@ class Service:
 
     def _claim(self) -> str | None:
         with self.lock:
+            if self._claims_paused:
+                return None
             for job in self.project["jobs"]:
-                if job["status"] == "queued":
-                    job["status"] = "running"
-                    job["progress"] = 0.0
-                    self.cancel_flags.setdefault(job["id"], threading.Event())
+                if job["status"] != "queued":
+                    continue
+                job["status"] = "running"
+                job["progress"] = 0.0
+                self.cancel_flags.setdefault(job["id"], threading.Event())
+                try:
                     self._persist()
-                    return job["id"]
+                except CraftsError as exc:
+                    job["status"] = "queued"
+                    job["progress"] = 0.0
+                    self._pause_claims(exc)
+                    return None
+                return job["id"]
         return None
+
+    def _pause_claims(self, exc: CraftsError) -> None:
+        if not self._claims_paused:
+            log.error("Project save failed: %s", exc.message)
+        self._claims_paused = True
+        self.persist_error = exc.message
 
     def _execute(self, job_id: str) -> None:
         with self.lock:
@@ -921,7 +1055,10 @@ class Service:
             now = time.monotonic()
             if now - self._last_save > 1:
                 self._last_save = now
-                self._persist()
+                try:
+                    self._persist()
+                except CraftsError as exc:
+                    self.persist_error = exc.message
 
     def _finish(self, job_id: str, status: str, error: str | None = None, code: str | None = None, result: dict | None = None) -> None:
         with self.lock:
@@ -938,7 +1075,11 @@ class Service:
             job["finished_at"] = utcnow()
             if status == "succeeded":
                 job["progress"] = 1.0
-            self._persist()
+            try:
+                self._persist()
+            except CraftsError as exc:
+                # The render already finished. Keep that result and do not run it again.
+                self._pause_claims(exc)
 
     def _job(self, job_id: str) -> dict:
         for job in self.project["jobs"]:
@@ -987,6 +1128,7 @@ class Service:
 
     def save_project(self, raw: str | None) -> dict:
         with self.lock:
+            previous_path = self.project_path
             if raw:
                 path = Path(raw).expanduser()
                 self._assert_project_path(path)
@@ -1018,7 +1160,11 @@ class Service:
                 self.project_path = path
             if self.project_path is None:
                 raise CraftsError("Save needs a project path ending in .crafts.json.", code="bad_project")
-            self._write_project(self.project_path)
+            try:
+                self._write_project(self.project_path)
+            except CraftsError:
+                self.project_path = previous_path
+                raise
             return self.project_summary()
 
     def project_summary(self) -> dict:
@@ -1036,8 +1182,13 @@ class Service:
         if not isinstance(name, str) or not name.strip() or len(name) > 120:
             raise CraftsError("Project name must be 1–120 characters.", code="bad_name")
         with self.lock:
+            previous = self.project["name"]
             self.project["name"] = name.strip()
-            self._persist()
+            try:
+                self._persist()
+            except CraftsError:
+                self.project["name"] = previous
+                raise
         return self.project_summary()
 
     def parse_gcsv(self, raw: str, cancel=None) -> dict:
@@ -1081,15 +1232,32 @@ class Service:
             }
         raise CraftsError("Telemetry helper returned no JSON.", code="telemetry_failed")
 
-    def _persist(self) -> None:
+    def _persist(self, *, attempts: int | None = None) -> None:
         if self.project_path is not None:
-            self._write_project(self.project_path)
+            self._write_project(self.project_path, attempts=attempts)
 
-    def _write_project(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=False) if False else None
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(self.project, indent=2), encoding="utf-8")
-        os.replace(temporary, path)
+    def _write_project(self, path: Path, *, attempts: int | None = None) -> None:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(self.project, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
+            _replace_durable(temporary, path, _REPLACE_ATTEMPTS if attempts is None else attempts)
+        except CraftsError:
+            _discard_owned_temp(temporary)
+            raise
+        except OSError as exc:
+            _discard_owned_temp(temporary)
+            raise CraftsError(_PROJECT_LOCK_MESSAGE, code="project_locked") from exc
+        self._note_project_saved()
+
+    def _note_project_saved(self) -> None:
+        paused = self._claims_paused
+        self._claims_paused = False
+        self.persist_error = None
+        if paused:
+            self.wake.set()
 
     def _assert_project_path(self, path: Path) -> None:
         if not path.name.endswith(".crafts.json"):

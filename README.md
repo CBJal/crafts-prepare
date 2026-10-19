@@ -80,7 +80,7 @@ Example `smoke.json` for 10-bit sources that need an acknowledged ProRes export:
 
 `trim_in` and `trim_out` are written through the trim controls on every selected clip, then checked against the stored values, before the ordinary export is queued. That export uses 0.2–1.2 seconds. Gyro jobs do not read those trim fields; each one renders the whole clip. `expect.min_export_succeeded` and `expect.min_gyro_succeeded` default to the number of samples. With `"expect": "succeeded"` every required gyro job must publish a file. `"expect": "failed"` is only a negative control. The report records import, theme, project round-trip, viewer `playback.frames` and `playback.position_ms` from the production player, queue rows, `source_sha256_before` and `source_sha256_after`, screenshots, and close. The process exits nonzero when any of those steps is not ok, a required job is missing or failed, or a source hash changes. A second launch of `CraftsPrepare.exe` with no arguments focuses the window already open. It does not start a browser or an HTTP server.
 
-A normal double-click does not show that diagnostic mode. A second launch focuses the window that is already open.
+A normal double-click does not show that diagnostic mode. A second launch focuses the window that is already open. `--smoke` exits with the report's status, including 2 when a sample, tool, or required export is missing. If the project file cannot be replaced, the previous file stays in place and the queue pauses instead of dropping a job. Save As to another folder, or free the file, and the queued jobs continue.
 
 ## Windows development
 

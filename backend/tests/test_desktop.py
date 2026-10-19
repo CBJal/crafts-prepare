@@ -576,6 +576,61 @@ def test_tool_report_cancel_stops_the_owned_process(qapp, desktop, tmp_path: Pat
     assert seen["proc"].poll() is not None
 
 
+def test_project_lock_status_stays_ahead_of_the_batch_count(qapp, desktop):
+    desktop.last_batch_id = "not-a-batch"
+    desktop.service.persist_error = "Could not replace the project file. The previous file was left unchanged."
+    desktop.refresh_queue()
+    assert "Could not replace the project file" in desktop.statusBar().currentMessage()
+    assert "Batch" not in desktop.statusBar().currentMessage()
+    desktop.service.persist_error = None
+    desktop.refresh_queue()
+    assert "Could not replace the project file" not in desktop.statusBar().currentMessage()
+
+
+def test_frozen_entry_returns_the_smoke_failure_code(tmp_path: Path):
+    import subprocess
+    import sys
+
+    backend = Path(__file__).resolve().parents[1]
+    report = tmp_path / "smoke.json"
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["PYTHONPATH"] = str(backend)
+    env["CRAFTS_SETTINGS_PATH"] = str(tmp_path / "settings.json")
+    env["CRAFTS_DATA_DIR"] = str(tmp_path / "cache")
+    env["CRAFTS_LOG_PATH"] = str(tmp_path / "app.log")
+    env["CRAFTS_DISABLE_WORKER"] = "1"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(backend / "crafts_prepare_entry.py"),
+            "--smoke",
+            "--output",
+            str(tmp_path / "out"),
+            "--report",
+            str(report),
+            "--screenshots",
+            str(tmp_path / "shots"),
+            "--sample",
+            str(tmp_path / "missing.mp4"),
+        ],
+        cwd=str(backend),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == 2, completed.stderr
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["steps"][0]["step"] == "import"
+    assert payload["steps"][0]["ok"] is False
+    entry = (backend / "crafts_prepare_entry.py").read_text(encoding="utf-8")
+    desktop_main = (backend / "app" / "desktop" / "__main__.py").read_text(encoding="utf-8")
+    assert "sys.exit(main())" in entry
+    assert "SystemExit(main())" in desktop_main
+
+
 def test_server_name_includes_the_user_and_profile():
     import getpass
 

@@ -116,6 +116,7 @@ class MainWindow(QMainWindow):
         self.last_error = ""
         self.force_close = False
         self.last_batch_id = ""
+        self._lock_message_shown = False
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 800)
         self.setMinimumSize(960, 640)
@@ -1392,6 +1393,13 @@ class MainWindow(QMainWindow):
                 item.setFlags(shown)
                 item.setData(Qt.ItemDataRole.UserRole, job["id"])
                 self.queue.setItem(row, column, item)
+        if self.service.persist_error:
+            self._lock_message_shown = True
+            self.statusBar().showMessage(self.service.persist_error)
+            return
+        if self._lock_message_shown:
+            self._lock_message_shown = False
+            self.statusBar().clearMessage()
         if self.last_batch_id:
             try:
                 status = self.service.batch_status(self.last_batch_id)
