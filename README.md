@@ -78,7 +78,7 @@ Example `smoke.json` for 10-bit sources that need an acknowledged ProRes export:
 }
 ```
 
-`trim_in` and `trim_out` are applied with the trim controls on every selected clip before the ordinary export. Gyro jobs use each clip's full stored range only when those trim fields are omitted; with the values above, the ordinary export is 0.2–1.2 seconds and the gyro job still uses the trim that was just saved. Set gyro `expect` to `failed` only for an explicit negative control. The run exits nonzero unless every required export and gyro job publishes a file, the viewer records frames and a position, and the source SHA-256 values are unchanged.
+`trim_in` and `trim_out` are written through the trim controls on every selected clip, then checked against the stored values, before the ordinary export is queued. That export uses 0.2–1.2 seconds. Gyro jobs do not read those trim fields; each one renders the whole clip. `expect.min_export_succeeded` and `expect.min_gyro_succeeded` default to the number of samples. With `"expect": "succeeded"` every required gyro job must publish a file. `"expect": "failed"` is only a negative control. The report records import, theme, project round-trip, viewer `playback.frames` and `playback.position_ms` from the production player, queue rows, `source_sha256_before` and `source_sha256_after`, screenshots, and close. The process exits nonzero when any of those steps is not ok, a required job is missing or failed, or a source hash changes. A second launch of `CraftsPrepare.exe` with no arguments focuses the window already open. It does not start a browser or an HTTP server.
 
 A normal double-click does not show that diagnostic mode. A second launch focuses the window that is already open.
 

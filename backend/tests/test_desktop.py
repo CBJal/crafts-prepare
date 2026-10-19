@@ -516,6 +516,18 @@ def test_invalid_notes_block_save(qapp, desktop, media_dir: Path, tmp_path: Path
     assert desktop.commit_editor() is False
     assert desktop.save_project_to(str(tmp_path / "notes.crafts.json")) is False
     assert desktop.clips[0]["notes"] == ""
+    before = desktop.service.clips()[0]["trim_in"]
+    desktop.trim_in.setValue(0.2)
+    desktop.trim_out.setValue(0.8)
+    desktop.save_trim()
+    assert desktop.service.clips()[0]["trim_in"] == before
+    assert desktop.service.clips()[0]["notes"] == ""
+    assert desktop.new_project(discard=True) is False
+    assert desktop.open_project_path(str(tmp_path / "missing.crafts.json")) is False
+    assert desktop.clips
+    desktop.force_close = True
+    desktop.close()
+    assert desktop.isVisible()
 
 
 def test_tool_report_cancel_stops_the_owned_process(qapp, desktop, tmp_path: Path, monkeypatch):

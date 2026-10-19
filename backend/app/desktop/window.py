@@ -939,7 +939,8 @@ class MainWindow(QMainWindow):
     def _save_flag(self) -> None:
         if self._filling:
             return
-        self.commit_editor()
+        if not self.commit_editor():
+            return
         clip = self.focused_clip()
         if clip is None:
             return
@@ -979,7 +980,8 @@ class MainWindow(QMainWindow):
     def save_trim(self) -> None:
         if self._filling:
             return
-        self.commit_editor()
+        if not self.commit_editor():
+            return
         clip = self.focused_clip()
         if clip is None:
             return
@@ -993,7 +995,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Trim stored in the project. The source file was not cut.", 5000)
 
     def add_marker(self) -> None:
-        self.commit_editor()
+        if not self.commit_editor():
+            return
         clip = self.focused_clip()
         if clip is None:
             return
@@ -1009,7 +1012,8 @@ class MainWindow(QMainWindow):
         self._fill_focus()
 
     def remove_marker(self) -> None:
-        self.commit_editor()
+        if not self.commit_editor():
+            return
         clip = self.focused_clip()
         row = self.markers.currentRow()
         if clip is None or row < 0:
@@ -1234,7 +1238,8 @@ class MainWindow(QMainWindow):
         self.viewer_stack.setCurrentIndex(2 if adjusted else 1)
 
     def queue_focused_export(self) -> None:
-        self.commit_editor()
+        if not self.commit_editor():
+            return
         clip = self.focused_clip()
         if clip is None:
             self.statusBar().showMessage("Select a clip first.", 5000)
@@ -1263,7 +1268,8 @@ class MainWindow(QMainWindow):
         self.refresh_queue()
 
     def queue_checked_batch(self, operation: str) -> None:
-        self.commit_editor()
+        if not self.commit_editor():
+            return
         clip_ids = self.checked_ids()
         if not clip_ids:
             self.statusBar().showMessage("Check at least one clip. Focus and batch selection are separate.", 6000)
@@ -1311,6 +1317,8 @@ class MainWindow(QMainWindow):
         self.refresh_queue()
 
     def queue_manual_gyro(self) -> None:
+        if not self.commit_editor():
+            return
         clip = self.focused_clip()
         output = self.manual_output.text().strip()
         if not output:

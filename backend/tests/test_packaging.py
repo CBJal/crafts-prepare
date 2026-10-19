@@ -24,6 +24,7 @@ def test_bundle_guard_drops_foreign_icu_and_virtual_keyboard():
     spec.loader.exec_module(module)
     entries = [
         ("icuuc.dll", r"C:\Users\me\codex-runtimes\poppler\Library\bin\icuuc.dll", "BINARY"),
+        ("icudt78.dll", r"C:\Windows\System32\icudt78.dll", "BINARY"),
         ("Qt6Core.dll", r"C:\py\Lib\site-packages\PySide6\Qt6Core.dll", "BINARY"),
         ("Qt6VirtualKeyboard.dll", r"C:\py\Lib\site-packages\PySide6\Qt6VirtualKeyboard.dll", "BINARY"),
         ("qml/QtQuick/VirtualKeyboard/qmldir", r"C:\py\Lib\site-packages\PySide6\qml\QtQuick\VirtualKeyboard\qmldir", "DATA"),
@@ -34,6 +35,7 @@ def test_bundle_guard_drops_foreign_icu_and_virtual_keyboard():
     assert "Qt6Core.dll" in names
     assert "ffmpeg.exe" in names
     assert "icuuc.dll" not in names
+    assert "icudt78.dll" not in names
     assert "Qt6VirtualKeyboard.dll" not in names
     assert all("VirtualKeyboard" not in item[0] for item in kept)
     assert any("ICU" in item["reason"] for item in rejected)
@@ -57,6 +59,8 @@ def test_build_script_does_not_delete_previous_outputs():
     assert "npm ci" not in text
     spec = (ROOT / "packaging" / "crafts-prepare.spec").read_text(encoding="utf-8")
     assert "frontend/dist" not in spec
+    assert "ICU is supplied by Windows at runtime" in (ROOT / "packaging" / "bundle_guard.py").read_text(encoding="utf-8")
+    assert '"ICU" in item["reason"]' in spec
     assert "QtWebEngine" in spec
     assert "PySide6.QtWebView" in spec
     assert "pyinstaller==6.22.3" in (ROOT / "packaging" / "requirements-build.txt").read_text(encoding="utf-8")
