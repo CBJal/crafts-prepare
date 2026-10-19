@@ -42,17 +42,15 @@ def utcnow() -> str:
 
 
 def default_settings_path() -> Path:
-    override = os.environ.get("CRAFTS_SETTINGS_PATH")
-    if override:
-        return Path(override)
-    return Path.home() / ".crafts-prepare" / "settings.json"
+    from .runtime import settings_path
+
+    return settings_path()
 
 
 def default_data_dir() -> Path:
-    override = os.environ.get("CRAFTS_DATA_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".crafts-prepare" / "cache"
+    from .runtime import data_dir
+
+    return data_dir()
 
 
 class Service:

@@ -82,12 +82,9 @@ def bit_depth_for(pix_fmt: str | None, raw_bits: int | None) -> int | None:
 
 
 def discover_executable(configured: str) -> str | None:
-    if not configured:
-        return None
-    path = Path(configured)
-    if path.is_file():
-        return str(path.resolve())
-    return shutil.which(configured)
+    from .runtime import discover_tool
+
+    return discover_tool(configured, which=shutil.which)
 
 
 def probe_file(ffprobe: str, path: Path, *, timeout: float = 60) -> dict:

@@ -9,3 +9,7 @@ tools/telemetry-inspect/target/
 *.crafts-partial
 *.trf
 .DS_Store
+packaging/.build-venv/
+packaging/build/
+packaging/dist/
+packaging/output/

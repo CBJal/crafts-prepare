@@ -1,0 +1,4 @@
+# Build-only pins. Not imported by the running app.
+# PyInstaller 6.15.0 added Python 3.14 support. 6.22.3 is the newest
+# release before 2026-10-19 and still supports Python 3.12 through 3.14.
+pyinstaller==6.22.3

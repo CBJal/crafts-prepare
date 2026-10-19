@@ -13,11 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .errors import CraftsError
 from .filters import FilterSpec
+from .runtime import frontend_dist
 from .security import MAX_JSON_BYTES, assert_loopback_request
 from .service import Service
-
-ROOT = Path(__file__).resolve().parents[2]
-DIST = ROOT / "frontend" / "dist"
+from .version import APP_NAME, APP_VERSION
 
 
 class ImportBody(BaseModel):
@@ -157,7 +156,7 @@ def create_app() -> FastAPI:
         yield
         app.state.service.shutdown()
 
-    app = FastAPI(title="Crafts Prepare", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
     app.state.service = service
 
     @app.middleware("http")
@@ -185,7 +184,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def health():
-        return {"ok": True, "name": "Crafts Prepare", "bind": "127.0.0.1"}
+        return {"ok": True, "name": APP_NAME, "version": APP_VERSION, "bind": "127.0.0.1"}
 
     @app.get("/api/capabilities")
     def capabilities():
@@ -326,7 +325,7 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     def index():
-        page = DIST / "index.html"
+        page = frontend_dist() / "index.html"
         if page.is_file():
             return FileResponse(page)
         return JSONResponse(
@@ -337,7 +336,7 @@ def create_app() -> FastAPI:
             status_code=503,
         )
 
-    assets = DIST / "assets"
+    assets = frontend_dist() / "assets"
     if assets.is_dir():
         from fastapi.staticfiles import StaticFiles
 

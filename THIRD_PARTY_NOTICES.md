@@ -2,6 +2,14 @@
 
 Crafts Prepare does not bundle FFmpeg, Gyroflow, Sony software, or camera footage.
 
+The optional Windows installer does bundle a Python runtime and the PyInstaller bootloader so the installed app can start without a developer Python. It still does not bundle FFmpeg, Gyroflow, or camera footage.
+
+**Python.** PSF License. Used only as the runtime inside the Windows build. https://docs.python.org/3/license.html
+
+**PyInstaller.** The application libraries are collected from the pins in `backend/requirements.lock`. The bootloader is GPL-2.0-or-later with the PyInstaller exception that allows using it to freeze and distribute a program that is not itself GPL. https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt Build pin: `packaging/requirements-build.txt`.
+
+**tkinter / Tcl/Tk.** Used for the installed app's Open/Quit window. The Windows python.org builds ship Tcl/Tk under their own license, which PyInstaller collects. Not used by the development server.
+
 ## Application dependencies
 
 | Component | License | Role |

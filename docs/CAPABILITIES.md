@@ -35,6 +35,7 @@ Status below is what this repository implements. "Verified here" means an automa
 | Light, Dark, and System themes | Implemented | Neutral slate and white surfaces with a blue accent. The choice is stored locally. Footage is not recolored |
 | Queue cancel, retry, collision, failed ffmpeg | Implemented | Yes |
 | Windows process-tree kill | Code path uses `taskkill /F /T` | Not executed on Windows. Linux process-group kill was tested |
+| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup. This session did not produce or run a Windows installer. FFmpeg and Gyroflow are not inside the package |
 | Accounts, payments, cloud upload | Not implemented | |
 
 Preset pixel formats:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -25,9 +26,15 @@ def spawn(args: list[str], cwd: str | None = None) -> subprocess.Popen[str]:
         "cwd": cwd,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        # CREATE_NO_WINDOW keeps ffmpeg and Gyroflow from opening a console.
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | no_window
     else:
         kwargs["start_new_session"] = True
+    if getattr(sys, "frozen", False):
+        from .runtime import external_tool_environ
+
+        kwargs["env"] = external_tool_environ()
     return subprocess.Popen(args, **kwargs)
 
 

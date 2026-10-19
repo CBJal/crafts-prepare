@@ -18,9 +18,28 @@ Optional:
 
 Crafts Prepare does not download or redistribute those tools. A missing tool is reported as unavailable. That is not a subscription lock.
 
-## Windows
+## Windows installer
 
-1. Install Python 3.11+ and make sure `python` works in PowerShell.
+The development start script still needs Python and Node. The installer does not. On a Windows x64 build machine that already has Python 3.12–3.14, Node.js with npm, and Inno Setup 6:
+
+```
+powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
+```
+
+The script does not download those tools, FFmpeg, or Gyroflow. It writes:
+
+- `packaging\dist\CraftsPrepare\` — the PyInstaller onedir folder
+- `packaging\output\CraftsPrepare-Setup-0.1.0.exe` — the per-user installer
+- `packaging\output\SHA256SUMS.txt` — SHA-256 of the installer and `CraftsPrepare.exe`
+- `packaging\output\build-info.json` — version and the git SHA that was built
+
+Install for the current user. Shortcuts go on the Start menu, and a desktop shortcut is optional. Uninstall removes the program files only. Settings, cache, logs, and projects stay in `%LOCALAPPDATA%\CraftsPrepare` and wherever you saved projects. The installed app is not signed. Windows may show a SmartScreen prompt until you sign the installer yourself.
+
+FFmpeg, ffprobe, and Gyroflow stay separate programs. The app looks on PATH and in common install locations, or uses the paths you set in Capabilities. If they are missing, the window still opens and says so.
+
+## Windows development
+
+1. Install Python 3.12, 3.13, or 3.14 and make sure `python` works in PowerShell.
 2. Install ffmpeg and confirm `ffmpeg -version` and `ffprobe -version`.
 3. Install Node.js if `frontend\dist\index.html` is not already built.
 4. In this folder, run:

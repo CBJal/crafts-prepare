@@ -1,0 +1,8 @@
+Crafts Prepare does not include FFmpeg, ffprobe, or Gyroflow.
+
+Install those programs yourself if you want export, preview, or gyro stabilization. The app still opens when they are missing. Set their paths in Capabilities after you install them. Crafts Prepare does not download them.
+
+FFmpeg and ffprobe: https://ffmpeg.org/download.html
+Gyroflow: https://gyroflow.xyz/download
+
+The installer does not add a Windows service, a firewall rule, or a sign-in at startup. Uninstall removes the program files only. Your projects, settings, cache, and logs stay in %LOCALAPPDATA%\CraftsPrepare.
