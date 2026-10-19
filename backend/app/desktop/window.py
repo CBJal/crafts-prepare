@@ -617,7 +617,7 @@ class MainWindow(QMainWindow):
         def page(*widgets: QWidget) -> QScrollArea:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
             host = QWidget()
             host.setObjectName("inspectorPage")
