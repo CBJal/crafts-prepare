@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEventLoop, QSize, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -89,7 +90,6 @@ _ICON_FOR_LABEL = {
     "Cancel batch": "cancel",
     "Retry failed": "retry",
     "External programs…": "tools",
-    "Tools": "settings",
     "Clip": "clip",
     "Refresh tool report": "retry",
     "Light": "sun",
@@ -733,6 +733,7 @@ class MainWindow(QMainWindow):
 
         tools_menu = self.menuBar().addMenu("Tools")
         self.settings_action = QAction("Tools", self)
+        self.settings_action.setProperty("iconName", "settings")
         self.settings_action.setToolTip("External programs")
         self.settings_action.triggered.connect(self.open_settings)
         toolbar.addAction(self.settings_action)
@@ -825,7 +826,13 @@ class MainWindow(QMainWindow):
         if not mark.isNull():
             self.brand_mark.setPixmap(mark)
         self._tint_scrolls(theme)
+        self._style_toolbar_buttons(theme)
+        menu_actions = {menu.menuAction() for menu in self.findChildren(QMenu)}
+        for action in menu_actions:
+            action.setIcon(QIcon())
         for widget in self.findChildren(QPushButton) + self.findChildren(QAction):
+            if isinstance(widget, QAction) and widget in menu_actions:
+                continue
             named = widget.property("iconName")
             label = widget.text() or ""
             key = str(named) if named else _ICON_FOR_LABEL.get(label)
@@ -846,6 +853,27 @@ class MainWindow(QMainWindow):
             for index, icon_name in enumerate(("clip", "adjusted", "export", "gyro")):
                 tabs.setTabIcon(index, action_icon(icon_name, theme))
         del QPixmap
+
+    def _style_toolbar_buttons(self, theme: str) -> None:
+        from PySide6.QtGui import QColor, QPalette
+        from PySide6.QtWidgets import QToolBar, QToolButton
+
+        dark = theme == "dark"
+        text = QColor("#e8eef4" if dark else "#1a2028")
+        muted = QColor("#6e7c8c" if dark else "#8b97a3")
+        surface = QColor("#171c23" if dark else "#f6f7f8")
+        for bar in self.findChildren(QToolBar):
+            for button in bar.findChildren(QToolButton):
+                palette = button.palette()
+                for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+                    palette.setColor(group, QPalette.ColorRole.Window, surface)
+                    palette.setColor(group, QPalette.ColorRole.Button, surface)
+                    palette.setColor(group, QPalette.ColorRole.WindowText, text)
+                    palette.setColor(group, QPalette.ColorRole.ButtonText, text)
+                    palette.setColor(group, QPalette.ColorRole.Text, text)
+                palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, muted)
+                palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, muted)
+                button.setPalette(palette)
 
     def _tint_scrolls(self, theme: str) -> None:
         from PySide6.QtGui import QColor, QPalette

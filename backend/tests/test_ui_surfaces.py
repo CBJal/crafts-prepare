@@ -9,7 +9,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication, QTableWidgetItem
+from PySide6.QtGui import QPalette
+from PySide6.QtWidgets import QApplication, QTableWidgetItem, QToolBar, QToolButton
 
 from app.desktop.prefs import PrefsWriteError, save_state
 from app.desktop.window import MainWindow
@@ -138,6 +139,39 @@ def test_project_chip_is_honest_and_elides(qapp, window):
     assert len(window.project_chip.text()) < 48
     assert "project-" in window.project_chip.toolTip()
     window.service.project_path = None
+
+
+def test_dark_toolbar_text_is_light_and_tools_menu_keeps_its_label(qapp, window):
+    from app.desktop.icons import action_icon
+
+    window.set_theme("dark")
+    qapp.processEvents()
+    toolbar = window.findChild(QToolBar, "mainToolBar")
+    labeled = [button for button in toolbar.findChildren(QToolButton) if button.text()]
+    assert labeled
+    for button in labeled:
+        ink = button.palette().color(QPalette.ColorRole.ButtonText)
+        assert ink.lightness() > 180
+        surface = button.grab().toImage().pixelColor(2, 2)
+        assert surface.lightness() < 80
+    window.set_theme("light")
+    qapp.processEvents()
+    for button in toolbar.findChildren(QToolButton):
+        if not button.text():
+            continue
+        ink = button.palette().color(QPalette.ColorRole.ButtonText)
+        assert ink.lightness() < 80
+    tools = next(action for action in window.menuBar().actions() if action.text() == "Tools")
+    assert tools.icon().isNull()
+    assert window.settings_action.property("iconName") == "settings"
+    assert window.settings_action.icon().isNull() is False
+    gear = action_icon("settings", "dark").pixmap(24, 24).toImage()
+    sun = action_icon("sun", "dark").pixmap(24, 24).toImage()
+    assert gear != sun
+    sheet = window.styleSheet()
+    assert "QScrollBar::handle" in sheet
+    assert "QToolBar QToolButton" in sheet
+    assert "width: 16px" in sheet
 
 
 def test_transient_preference_replace_keeps_then_updates(tmp_path, monkeypatch):

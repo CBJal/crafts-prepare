@@ -38,14 +38,10 @@ Assert-Native "Reading the Python version"
 if ($LASTEXITCODE -ne 0) {
     throw "Python $versionText is outside 3.12-3.14. Crafts Prepare does not install another interpreter."
 }
-$appVersion = (& python -c @'
-import pathlib, re, sys
-text = pathlib.Path("backend/app/version.py").read_text(encoding="utf-8")
-match = re.search(r'APP_VERSION = "([^"]+)"', text)
-if not match:
-    sys.exit(1)
-print(match.group(1))
-'@).Trim()
+$savedPythonPath = $env:PYTHONPATH
+$env:PYTHONPATH = Join-Path $Root 'backend'
+$appVersion = (& python -c 'from app.version import APP_VERSION; print(APP_VERSION)').Trim()
+$env:PYTHONPATH = $savedPythonPath
 Assert-Native "Reading APP_VERSION"
 if (-not $appVersion) { throw "APP_VERSION was not found." }
 

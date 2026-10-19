@@ -52,6 +52,9 @@ def test_inno_script_has_no_pascal_comment_and_keeps_user_data():
 def test_build_script_does_not_delete_previous_outputs():
     text = (ROOT / "packaging" / "build-windows.ps1").read_text(encoding="utf-8")
     assert "Remove-Item" not in text
+    assert "from app.version import APP_VERSION" in text
+    assert "re.search" not in text
+    assert "@'" not in text
     assert "Refusing to overwrite" in text
     assert '"/DSourceDir=$bundle"' in text
     assert '"/DOutputDir=$installerOut"' in text
