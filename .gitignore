@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+node_modules/
+frontend/dist/
+tools/telemetry-inspect/target/
+.crafts-prepare/
+*.crafts-partial
+*.trf
+.DS_Store
+packaging/.build-venv/
+packaging/build/
+packaging/dist/
+packaging/output/
+packaging/licenses-bundle/

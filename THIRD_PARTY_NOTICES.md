@@ -1,0 +1,46 @@
+# Third-party notices
+
+Crafts Prepare does not bundle FFmpeg, Gyroflow, Sony software, or camera footage.
+
+The optional Windows installer does bundle a Python runtime and the PyInstaller bootloader so the installed app can start without a developer Python. It still does not bundle FFmpeg, Gyroflow, or camera footage.
+
+**Python.** PSF License. Used only as the runtime inside the Windows build. The build copies `LICENSE.txt` from that interpreter into `licenses/Python/`. https://docs.python.org/3/license.html
+
+**PyInstaller.** The application libraries are collected from the pins in `backend/requirements.lock`. The bootloader is GPL-2.0-or-later with the PyInstaller exception that allows using it to freeze and distribute a program that is not itself GPL. The build copies that `COPYING.txt` into `licenses/PyInstaller/`. https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt Build pin: `packaging/requirements-build.txt`.
+
+The Windows build also copies the license files of the Python packages it bundles (FastAPI, Uvicorn, Pydantic, Starlette, and their runtime dependencies) and the React and react-dom `LICENSE` files. FFmpeg and Gyroflow binaries are not in the package.
+
+**PySide6 / Qt 6.12 / shiboken6.** The installed desktop application. LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only. Pins: `PySide6-Essentials`, `PySide6-Addons`, and `shiboken6` 6.12.0. The PySide6 metapackage is not used, because it depends on Qt WebEngine. Qt WebEngine is not part of this app. The libraries are separate shared modules in the onedir folder. See `packaging/QT_NOTICES.txt` for source links and how to replace those modules. Qt Multimedia may ship its own FFmpeg playback libraries (`avcodec`, `avformat`, `swscale`, `swresample`, and the ffmpeg media plugin). Those are not the ffmpeg.exe you configure for export, proxies, stills, or gyro.
+
+**tkinter / Tcl/Tk.** No longer used by the installed app. The optional development server does not use it either.
+
+## Application dependencies
+
+| Component | License | Role |
+| --- | --- | --- |
+| FastAPI | MIT | Local HTTP API |
+| Uvicorn | BSD-3-Clause | Loopback server |
+| Pydantic | MIT | Request validation |
+| Starlette | BSD-3-Clause | HTTP toolkit used by FastAPI |
+| HTTPX | BSD-3-Clause | Test client |
+| pytest | MIT | Tests |
+| React | MIT | Web UI |
+| Vite | MIT | UI build |
+| TypeScript | Apache-2.0 | UI language |
+| Fraunces and Outfit via Fontsource | SIL Open Font License | Listed in `frontend/package.json`. The UI does not import them, so the installer does not ship those font files |
+
+Lock files: `backend/requirements.txt`, `backend/requirements.lock`, `frontend/package-lock.json`.
+
+## Caller-installed tools
+
+**FFmpeg / ffprobe.** Not distributed. The build on a machine may be GPL, LGPL, or nonfree depending on how the user compiled it. This environment's Ubuntu ffmpeg 6.1.1 reports `--enable-gpl` and includes libx264, libx265, libvidstab, and prores_ks. A different machine (the local observation of FFmpeg 9.0.2 with AMF) is a different binary. See https://ffmpeg.org/legal.html and https://ffmpeg.org/ffmpeg-filters.html.
+
+**libvidstab.** Used only through the installed ffmpeg filters `vidstabdetect` and `vidstabtransform`. GPL-2.0-or-later. Not copied into this repository.
+
+**Gyroflow.** Optional external application. Public CLI: https://docs.gyroflow.xyz/app/advanced-usage/command-line-cli. Gyroflow is GPL-licensed. This repository does not copy Gyroflow source, and it does not pass `--overwrite`, `--watch`, or `--when-done`. Whether you may distribute Gyroflow beside Crafts Prepare is a Gyroflow licensing question, not something this app decides.
+
+**telemetry-parser 0.2.6** by Adrian Eddy, MIT OR Apache-2.0. Optional helper in `tools/telemetry-inspect` links the crates.io crate. It is not a copy of Gyroflow. The published 0.2.6 crate (2022-09-06) is older than the unpublished git master (edition 2024). No camera support is claimed from its output.
+
+## Not included
+
+Sony Catalyst Prepare, Catalyst Browse, Sony installers, Sony DLLs, Sony trademarks, and Sony camera footage are not in this repository.

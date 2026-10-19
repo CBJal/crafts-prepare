@@ -1,0 +1,60 @@
+Qt, PySide6, and the playback libraries
+======================================
+
+Crafts Prepare 0.2.1 links to Qt 6 through PySide6. The packages are
+PySide6-Essentials, PySide6-Addons, and shiboken6, pinned in
+backend/requirements.txt. Qt WebEngine is not installed and is not part of
+this application. There is no embedded browser.
+
+License
+-------
+
+PySide6, Qt, and shiboken6 are available under LGPL-3.0-only OR GPL-2.0-only
+OR GPL-3.0-only. The full texts are in this folder:
+
+- LGPL-3.0.txt
+- GPL-2.0.txt
+- GPL-3.0.txt
+
+Source
+------
+
+- PySide6 / shiboken6: https://code.qt.io/cgit/pyside/pyside-setup.git/
+- Release downloads: https://download.qt.io/official_releases/QtForPython/
+- Qt archives: https://download.qt.io/archive/qt/
+
+This build uses Qt 6.12.0.
+
+Dynamic linking and relinking
+-----------------------------
+
+The Windows installer is a PyInstaller onedir folder. Qt, shiboken, and the
+Qt Multimedia libraries are separate shared libraries next to
+CraftsPrepare.exe. They are not compiled into that executable.
+
+You may replace those shared libraries with compatible builds you produce
+from the corresponding source, or rebuild this application against another
+PySide6 build. Replacing a library does not require Crafts Prepare's own
+source to be relicensed.
+
+Qt Multimedia is not the FFmpeg you configure
+---------------------------------------------
+
+Playback can use Qt Multimedia's FFmpeg plugin. That plugin loads separate
+shared libraries such as avcodec, avformat, swscale, and swresample that ship
+inside the Qt build, together with the ffmpegmediaplugin. Those files are
+only the playback backend.
+
+They are not ffmpeg.exe, ffprobe.exe, or Gyroflow. Export, proxies, stills,
+and gyro stabilization call the programs you install and set under Tools.
+If those programs are missing, the job fails and is not reported as success.
+A missing playback codec does not change that.
+
+The playback plugin reports FFmpeg 9.0.1 under LGPL-2.1-or-later. See
+FFMPEG-QT.txt and LGPL-2.1.txt. That is the FFmpeg release Qt 6.12.0's
+multimedia module was built with. The Windows avcodec-63 DLL reviewed with
+this app was a shared MSVC build with zlib. That configure line is the
+Windows DLL's, and it is not reused as a description of any other build.
+The corresponding FFmpeg source is https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
+and the Qt Multimedia sources are the qtmultimedia 6.12.0 submodule. Those
+libraries stay separate files and can be replaced with a compatible build.

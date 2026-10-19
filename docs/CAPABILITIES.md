@@ -1,0 +1,49 @@
+# Capabilities and limits
+
+Status below is what this repository implements. "Verified here" means an automated test in this session, on Linux, with the system ffmpeg. It is not a Windows UI test and not a Sony camera test.
+
+| Feature | Status | Verified here |
+| --- | --- | --- |
+| Loopback bind and Host/Origin checks | Implemented | Yes, API test |
+| Import file or folder by path | Implemented | Yes |
+| Skip symlinks that resolve outside the selected folder | Implemented | Yes |
+| Support decided by ffprobe, not the extension | Implemented | Yes, junk `.mp4` rejected; H.264, HEVC, ProRes, DNxHR probed |
+| Canonical path, SHA-256 identity, dedup | Implemented | Yes |
+| Source file left unchanged | Implemented | Yes, SHA-256 before and after |
+| Metadata: video, audio, data, rate, duration, color, timecode tags | Implemented | Yes for the synthetic fixtures |
+| "No gyro" inferred from missing ffprobe tags | Not done | The UI says missing data streams are not that claim |
+| Browser preview for H.264 yuv420p | Implemented | Linux Chrome smoke: import, metadata, play, trim 0–1s, H.264 export succeeded. Output probed as 1.000s, 640×360, yuv420p, 25/1, AAC. Windows UI was not driven |
+| Proxy or still for other codecs | Implemented | Viewing proxy is a `<video>` element, capped at 60 seconds. Stills and export share one filter graph passed as a single `-vf` argument |
+| In/out trim in seconds, rational frame display | Implemented | Export duration checked within one frame |
+| Project JSON with OK/KEEP/NG, notes, markers, queue | Implemented | A saved probe must include video, audio, and data lists and at least one video object. Nested fields the UI renders must be text or numbers. A failed open leaves the current project usable. Queued work stays paused until Retry |
+| H.264 MP4 and ProRes 422 MOV export | Implemented when those encoders exist | Yes on this ffmpeg: trimmed/resized H.264 and trimmed ProRes, then decoded |
+| HEVC Main, HEVC Main10, DNxHR HQ, DNxHR HQX | Offered only if the encoder exists | HEVC 10-bit source was converted to H.264 only after acknowledgement. DNxHR HQ was probed. A DNxHR export preset exists and was not the required export pair |
+| Explicit bit-depth declaration | Implemented | 10-bit to 8-bit is rejected until acknowledged |
+| Rational output frame rate | Implemented | 25/1 and 30000/1001 |
+| Resize, crop-to-fill, letterbox, rotate | Implemented | Resize covered by the H.264 export test |
+| Exposure and saturation via `eq` | Implemented | Same filter string for the still and the export |
+| `.cube` LUT via `lut3d` | Implemented | The UI has a LUT path field. The file is copied to `grade.cube` in a job directory and referenced by that safe name, so spaces, apostrophes, and Windows drive letters are not placed in the filter graph. FFmpeg 6 export of that path was tested here |
+| HDR display matching | Not implemented | |
+| Sony color transforms | Not implemented | |
+| vidstab two-pass | Implemented when the filters exist | Synthetic shake: white-square centroid spread dropped. That is a motion measurement, not a quality grade |
+| deshake fallback | Implemented and labeled as visual fallback | Export ran. Stabilization quality was not scored |
+| Gyroflow CLI adapter | Implemented, including a Gyro panel in the UI | A `.gyroflow` project or preset is copied into the job staging directory. When that file has an output section, its folder (file URI), filename, and legacy output path are pointed at the owned staging file before launch, because Gyroflow 1.6.3 uses the project output instead of `--out-params`. A preset output section is rewritten the same way. Relative media and gyro paths are resolved from the original project directory. Absolute paths and file URIs, including percent-encoding, are left unchanged. An `output_folder_bookmark` is dropped on the copy only. Official Linux Gyroflow 1.6.3 (not bundled) confirmed the path choice on a synthetic clip: the unmodified project queued its stored folder, and the staged copy queued the staging file. That run did not finish a video file; this machine has no OpenCL or GPU. No camera footage was used |
+| `.gcsv` parser | Implemented | Units, negative samples, column order, gaps |
+| telemetry-parser 0.2.6 helper | Optional, builds with the pinned crates | Synthetic MP4 returned unsupported. No camera claim |
+| Library multi-select and batch queue | Implemented | Export and gyro batches queue every selected clip or none, with duplicate, missing, and collision reasons. Saved trim is used for export. Batch ids persist. Opening a project still pauses queued work. Cancel batch and retry-failed were tested |
+| Automatic Gyroflow batch | Implemented when Gyroflow is installed | Each clip is preflighted with `--export-metadata 2` inside that job's staging directory. `raw_imu` must be a progressing sequence of finite timestamped gyro vectors, and files above 256 MiB are not decoded. The requested codec, pixel format, dimensions, and audio replace those fields on the staged project and preset. The render is published only when ffprobe matches. A test double encodes with ffmpeg; this session did not finish a GPU render |
+| Light, Dark, and System themes | Implemented | Neutral slate and white surfaces with a blue accent. The choice is stored locally. Footage is not recolored |
+| Queue cancel, retry, collision, failed ffmpeg | Implemented | Yes |
+| Windows process-tree kill | Code path uses `taskkill /F /T` with `CREATE_NO_WINDOW` | Not executed on Windows. Linux process-group kill was tested |
+| Native desktop | PySide6 Qt Widgets | Library, viewer, inspector, and queue. No embedded browser and no loopback UI server in the installed app. The optional web UI remains available with `python -m app` |
+| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup, version 0.2.1, same install id as 0.1.0. This Linux session did not run PyInstaller or Inno Setup. FFmpeg and Gyroflow programs are not inside the package. Qt playback libraries, when the wheel includes them, are separate from those programs |
+| Accounts, payments, cloud upload | Not implemented | |
+
+Preset pixel formats:
+
+- H.264 MP4: `yuv420p`, 8-bit
+- ProRes 422 MOV: `yuv422p10le`, 10-bit, `prores_ks` profile 2
+- HEVC Main: `yuv420p`, 8-bit
+- HEVC Main10: `yuv420p10le`, 10-bit
+- DNxHR HQ: `yuv422p`, 8-bit, profile `dnxhr_hq`
+- DNxHR HQX: `yuv422p10le`, 10-bit, profile `dnxhr_hqx`
