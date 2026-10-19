@@ -70,7 +70,7 @@ output_root = os.environ.get("CRAFTS_OUTPUT_ROOT", "").strip()
 manifest_path = Path(output_root) / "dependency-sources.json" if output_root else spec_dir / "dependency-sources.json"
 manifest_path.parent.mkdir(parents=True, exist_ok=True)
 manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-a.datas.append((str(manifest_path), "."))
+a.datas.append(("dependency-sources.json", str(manifest_path), "DATA"))
 foreign = [item for item in manifest["rejected"] if "ICU" in item["reason"]]
 if foreign:
     print("Excluded ICU libraries so Qt6Core loads the Windows copy at runtime:")
