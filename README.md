@@ -1,6 +1,11 @@
 # Crafts Prepare
 
+<img src="docs/ui/app-icon.png" alt="Crafts Prepare" width="64" height="64">
+
 Crafts Prepare is a local video-preparation bench for inspecting, trimming, adjusting, visually stabilizing, and batch-exporting footage. It runs on your machine. It does not upload media, create an account, or charge for its own features.
+
+![Light workspace](docs/ui/workspace-light.png)
+![Dark workspace](docs/ui/workspace-dark.png)
 
 It is an independent app. Sony Catalyst Prepare is a separate product. Public Catalyst help pages were used as a feature checklist only. This repository does not contain Sony code, Sony artwork, or camera footage.
 

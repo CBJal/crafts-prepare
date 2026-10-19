@@ -89,6 +89,8 @@ _ICON_FOR_LABEL = {
     "Cancel batch": "cancel",
     "Retry failed": "retry",
     "External programs…": "tools",
+    "Tools": "settings",
+    "Clip": "clip",
     "Refresh tool report": "retry",
     "Light": "sun",
     "Dark": "moon",
@@ -214,20 +216,25 @@ class MainWindow(QMainWindow):
         dock = QDockWidget("Library", self)
         dock.setObjectName("libraryDock")
         body = QWidget()
+        body.setObjectName("libraryBody")
         layout = QVBoxLayout(body)
         controls = QHBoxLayout()
         select_all = QPushButton("Select all")
         select_all.setObjectName("selectAllButton")
         select_all.clicked.connect(self.select_all_batch)
+        select_all.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         clear = QPushButton("Clear")
         clear.setObjectName("clearChecksButton")
         clear.clicked.connect(self.clear_batch)
+        clear.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.batch_count = QLabel("0 of 0 selected")
         self.batch_count.setObjectName("batchCount")
+        self.batch_count.setMinimumWidth(0)
         controls.addWidget(select_all)
         controls.addWidget(clear)
-        controls.addWidget(self.batch_count)
+        controls.addStretch(1)
         layout.addLayout(controls)
+        layout.addWidget(self.batch_count)
         self.library = QTableWidget(0, 4)
         self.library_empty = QLabel("No clips yet. Import files or a folder.")
         self.library_empty.setObjectName("libraryEmpty")
@@ -256,6 +263,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QStackedWidget
 
         center = QWidget()
+        center.setObjectName("viewerShell")
         layout = QVBoxLayout(center)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
@@ -265,8 +273,11 @@ class MainWindow(QMainWindow):
         self.brand_mark.setFixedSize(28, 28)
         self.brand_title = QLabel(APP_NAME)
         self.brand_title.setObjectName("brandTitle")
-        self.project_chip = QLabel("New project")
+        self.project_chip = QLabel("New")
         self.project_chip.setObjectName("projectChip")
+        self.project_chip.setMaximumWidth(200)
+        self.project_chip.setMinimumWidth(0)
+        self.project_chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         header.addWidget(self.brand_mark)
         header.addWidget(self.brand_title)
         header.addWidget(self.project_chip)
@@ -304,42 +315,32 @@ class MainWindow(QMainWindow):
         self.viewer_stack.addWidget(self.still_adjusted)
         layout.addWidget(self.viewer_stack, 1)
         transport = QHBoxLayout()
-        self.play_button = QPushButton("Play")
-        self.play_button.setObjectName("playButton")
-        self.play_button.clicked.connect(self.play)
-        self.pause_button = QPushButton("Pause")
-        self.pause_button.clicked.connect(self.pause)
-        back = QPushButton("Frame −")
-        back.clicked.connect(lambda: self.step_frame(-1))
-        forward = QPushButton("Frame +")
-        forward.clicked.connect(lambda: self.step_frame(1))
-        mark_in = QPushButton("Set in")
-        mark_in.clicked.connect(lambda: self.set_trim_from_player("in"))
-        mark_out = QPushButton("Set out")
-        mark_out.clicked.connect(lambda: self.set_trim_from_player("out"))
+        transport.setSpacing(4)
+        self.play_button = self._transport_button("Play", "play", self.play, "playButton")
+        self.pause_button = self._transport_button("Pause", "pause", self.pause, "pauseButton")
+        self.frame_back_button = self._transport_button("Previous frame", "frame-back", lambda: self.step_frame(-1))
+        self.frame_forward_button = self._transport_button("Next frame", "frame-forward", lambda: self.step_frame(1))
+        self.mark_in_button = self._transport_button("Set trim in", "mark-in", lambda: self.set_trim_from_player("in"))
+        self.mark_out_button = self._transport_button("Set trim out", "mark-out", lambda: self.set_trim_from_player("out"))
         self.time_label = QLabel("0:00.0 / 0:00.0")
         self.time_label.setObjectName("timeLabel")
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
-        for button in (self.play_button, self.pause_button, back, forward, mark_in, mark_out):
-            button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        for button in (
+            self.play_button,
+            self.pause_button,
+            self.frame_back_button,
+            self.frame_forward_button,
+            self.mark_in_button,
+            self.mark_out_button,
+        ):
             transport.addWidget(button)
         transport.addStretch(1)
         transport_host = QWidget()
         transport_host.setObjectName("transportHost")
         transport_host.setLayout(transport)
-        transport_scroll = QScrollArea()
-        transport_scroll.setObjectName("transportScroll")
-        transport_scroll.setWidget(transport_host)
-        transport_scroll.setWidgetResizable(True)
-        transport_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        transport_host.setAutoFillBackground(False)
-        transport_scroll.viewport().setAutoFillBackground(False)
-        transport_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        transport_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        transport_scroll.setMinimumHeight(44)
         self.time_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         transport_row = QHBoxLayout()
-        transport_row.addWidget(transport_scroll, 1)
+        transport_row.addWidget(transport_host, 1)
         transport_row.addWidget(self.time_label)
         layout.addLayout(transport_row)
         self.scrub = QSlider(Qt.Orientation.Horizontal)
@@ -351,6 +352,16 @@ class MainWindow(QMainWindow):
 
     def _still_page(self, text: str) -> FitLabel:
         return FitLabel(text)
+
+    def _transport_button(self, name: str, icon: str, slot, object_name: str | None = None) -> QPushButton:
+        button = QPushButton()
+        button.setObjectName(object_name or "transportButton")
+        button.setProperty("iconName", icon)
+        button.setAccessibleName(name)
+        button.setToolTip(name)
+        button.setFixedSize(36, 32)
+        button.clicked.connect(slot)
+        return button
 
     def _show_view(self, index: int) -> None:
         self.viewer_stack.setCurrentIndex(index)
@@ -590,6 +601,9 @@ class MainWindow(QMainWindow):
         self.inspector_dock = dock
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self._fit_changed()
+        for edit in self.findChildren(QLineEdit) + self.findChildren(QSpinBox) + self.findChildren(QDoubleSpinBox):
+            edit.setMinimumWidth(0)
+            edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def _inspector_tabs(self):
         from PySide6.QtWidgets import QTabWidget
@@ -606,6 +620,7 @@ class MainWindow(QMainWindow):
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
             host = QWidget()
+            host.setObjectName("inspectorPage")
             host.setAutoFillBackground(False)
             scroll.viewport().setAutoFillBackground(False)
             column = QVBoxLayout(host)
@@ -630,12 +645,14 @@ class MainWindow(QMainWindow):
         tabs.addTab(page(self._grade_group), "Adjust")
         tabs.addTab(page(self._export_group), "Export")
         tabs.addTab(page(self._gyro_group, self._manual_group), "Gyro")
+        self.inspector_tabs = tabs
         return tabs
 
     def _build_queue(self) -> None:
         dock = QDockWidget("Queue", self)
         dock.setObjectName("queueDock")
         body = QWidget()
+        body.setObjectName("queueBody")
         layout = QVBoxLayout(body)
         self.queue = QTableWidget(0, 5)
         self.queue.setObjectName("queueTable")
@@ -715,6 +732,10 @@ class MainWindow(QMainWindow):
         queue_menu.addAction("Gyro checked clips", lambda: self.queue_checked_batch("gyro"))
 
         tools_menu = self.menuBar().addMenu("Tools")
+        self.settings_action = QAction("Tools", self)
+        self.settings_action.setToolTip("External programs")
+        self.settings_action.triggered.connect(self.open_settings)
+        toolbar.addAction(self.settings_action)
         tools_menu.addAction("External programs…", self.open_settings)
         tools_menu.addAction(
             "Refresh tool report",
@@ -776,7 +797,7 @@ class MainWindow(QMainWindow):
         resolved = apply_theme(self, choice)
         self._paint_icons(resolved)
         self.state["theme"] = choice
-        save_state(self.state, self.state_path)
+        self._save_preferences()
         if not self._scheme_connected:
             from PySide6.QtGui import QGuiApplication
 
@@ -805,28 +826,39 @@ class MainWindow(QMainWindow):
             self.brand_mark.setPixmap(mark)
         self._tint_scrolls(theme)
         for widget in self.findChildren(QPushButton) + self.findChildren(QAction):
-            key = _ICON_FOR_LABEL.get(widget.text())
+            named = widget.property("iconName")
+            label = widget.text() or ""
+            key = str(named) if named else _ICON_FOR_LABEL.get(label)
             if not key:
                 continue
-            widget.setIcon(action_icon(key, theme))
+            role = "on-primary" if widget.objectName() == "exportButton" else "normal"
+            widget.setIcon(action_icon(key, theme, role=role))
             if isinstance(widget, QPushButton):
                 widget.setIconSize(QSize(16, 16))
+                if label and not widget.accessibleName():
+                    widget.setAccessibleName(label)
             if isinstance(widget, QAction) and widget.shortcut():
                 widget.setToolTip(f"{widget.text()} ({widget.shortcut().toString()})")
             elif not widget.toolTip():
-                widget.setToolTip(widget.text())
+                widget.setToolTip(widget.text() or widget.accessibleName())
+        tabs = getattr(self, "inspector_tabs", None)
+        if tabs is not None:
+            for index, icon_name in enumerate(("clip", "adjusted", "export", "gyro")):
+                tabs.setTabIcon(index, action_icon(icon_name, theme))
         del QPixmap
 
     def _tint_scrolls(self, theme: str) -> None:
         from PySide6.QtGui import QColor, QPalette
 
-        color = QColor("#171c23" if theme == "dark" else "#f6f7f8")
+        color = QColor("#12161c" if theme == "dark" else "#e8ecef")
+        panel = QColor("#171c23" if theme == "dark" else "#f6f7f8")
         for scroll in self.findChildren(QScrollArea):
+            chosen = color if scroll.objectName() == "transportScroll" else panel
             viewport = scroll.viewport()
             viewport.setAutoFillBackground(True)
             palette = viewport.palette()
-            palette.setColor(QPalette.ColorRole.Window, color)
-            palette.setColor(QPalette.ColorRole.Base, color)
+            palette.setColor(QPalette.ColorRole.Window, chosen)
+            palette.setColor(QPalette.ColorRole.Base, chosen)
             viewport.setPalette(palette)
 
     def reset_layout(self) -> None:
@@ -874,10 +906,24 @@ class MainWindow(QMainWindow):
         if window_state:
             self.restoreState(QByteArray.fromBase64(window_state.encode("ascii")))
 
+    def _save_preferences(self) -> bool:
+        from .prefs import PrefsWriteError
+
+        try:
+            save_state(self.state, self.state_path)
+        except (PrefsWriteError, OSError) as exc:
+            import logging
+
+            logging.getLogger(__name__).error("Window preferences were not replaced: %s", exc)
+            self.last_error = "Window layout could not be saved. The previous preferences file was left unchanged."
+            self.statusBar().showMessage(self.last_error, 8000)
+            return False
+        return True
+
     def _persist_window(self) -> None:
         self.state["geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
         self.state["window_state"] = bytes(self.saveState().toBase64()).decode("ascii")
-        save_state(self.state, self.state_path)
+        self._save_preferences()
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
@@ -944,10 +990,7 @@ class MainWindow(QMainWindow):
     def reload_all(self, *, keep_checks: bool = True, keep_focus: bool = True) -> None:
         self.clips = self.service.clips()
         self.library_empty.setVisible(not self.clips)
-        name = self.service.project.get("name") or "Untitled"
-        path = self.service.project_path
-        state = "Unsaved" if path is None else path.name
-        self.project_chip.setText(f"{name}  ·  {state}")
+        self._refresh_project_chip()
         self._fill_library(keep_checks=keep_checks, keep_focus=keep_focus)
         self.refresh_queue()
         self._fill_focus()
@@ -1120,6 +1163,26 @@ class MainWindow(QMainWindow):
     def _notes_edited(self) -> None:
         if not self._filling:
             self._notes_dirty = True
+            self._refresh_project_chip()
+
+    def _refresh_project_chip(self) -> None:
+        name = self.service.project.get("name") or "Untitled"
+        path = self.service.project_path
+        dirty = self.is_unsaved()
+        if path is None:
+            state = "Unsaved" if dirty else "New"
+            full = f"{name} · {state}"
+            tip = "This project has not been saved." if dirty else "New project. Nothing is waiting to be saved."
+        else:
+            state = path.name
+            full = f"{name} · {state}" + (" · Unsaved" if dirty else "")
+            tip = str(path)
+            if dirty:
+                tip = tip + "\nUnsaved changes are still in this window."
+        width = max(80, self.project_chip.maximumWidth())
+        shown = self.project_chip.fontMetrics().elidedText(full, Qt.TextElideMode.ElideMiddle, width)
+        self.project_chip.setText(shown)
+        self.project_chip.setToolTip(tip if path is None else f"{full}\n{tip}")
 
     def _commit_notes_to(self, clip_id: str) -> bool:
         if not self._notes_dirty:
@@ -1709,7 +1772,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(exc.message, 10000)
             return False
         remember_project(self.state, str(self.service.project_path))
-        save_state(self.state, self.state_path)
+        self._save_preferences()
         self._rebuild_recent()
         self._reset_workspace()
         self.statusBar().showMessage("Opened. Saved queued exports stay paused until you retry them.", 8000)
@@ -1778,7 +1841,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(exc.message, 8000)
             return False
         remember_project(self.state, str(self.service.project_path))
-        save_state(self.state, self.state_path)
+        self._save_preferences()
         self._rebuild_recent()
         self.reload_all()
         return True
@@ -1892,7 +1955,12 @@ class MainWindow(QMainWindow):
                 self._refresh_timer.start()
             event.ignore()
             return
-        self._persist_window()
+        try:
+            self._persist_window()
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("Window preferences failed during close")
         event.accept()
 
     def _start(self, fn, on_ok, *, key: str | None = None) -> None:

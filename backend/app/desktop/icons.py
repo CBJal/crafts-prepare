@@ -39,6 +39,8 @@ _BODIES: dict[str, str] = {
     "cancel": '<path d="M8 8l8 8M16 8l-8 8"/><circle cx="12" cy="12" r="7.25"/>',
     "retry": '<path d="M7 9.5A5 5 0 1 1 6.2 14"/><path d="M7 5.8v4h4"/>',
     "tools": '<path d="M14.5 6.2a3 3 0 0 0-3.8 3.8L5.2 15.5l3.3 3.3 5.5-5.5a3 3 0 0 0 3.8-3.8L15.6 11l-2.6-2.6z"/>',
+    "settings": '<circle cx="12" cy="12" r="3"/><path d="M12 4.5v2M12 17.5v2M4.5 12h2M17.5 12h2M6.4 6.4l1.4 1.4M16.2 16.2l1.4 1.4M17.6 6.4l-1.4 1.4M7.8 16.2l-1.4 1.4"/>',
+    "clip": '<path d="M7 6.5h10v11H7z"/><path d="M9.5 6.5v11M14.5 6.5v11"/><path d="M7 9.5h10M7 14.5h10"/>',
     "sun": '<circle cx="12" cy="12" r="3.2"/><path d="M12 4.5v1.8M12 17.7v1.8M4.5 12h1.8M17.7 12h1.8M6.6 6.6l1.3 1.3M16.1 16.1l1.3 1.3M17.4 6.6l-1.3 1.3M7.9 16.1l-1.3 1.3"/>',
     "moon": '<path d="M15.5 5.2A6.8 6.8 0 1 0 18.8 14 5.4 5.4 0 0 1 15.5 5.2z"/>',
     "system": '<path d="M5 6.5h14v9H5z"/><path d="M9 18.5h6"/><path d="M12 15.5v3"/>',
@@ -58,19 +60,25 @@ def known_icons() -> tuple[str, ...]:
     return tuple(_BODIES)
 
 
-def action_icon(name: str, theme: str) -> QIcon:
-    """Theme-sensitive icon. Missing names return an empty icon."""
+def action_icon(name: str, theme: str, *, role: str = "normal") -> QIcon:
+    """Theme-sensitive icon. `on-primary` matches the primary button's text color."""
     body = _BODIES.get(name)
     icon = QIcon()
     if body is None:
         return icon
     dark = theme == "dark"
-    normal = "#e8eef4" if dark else "#1c2430"
-    active = "#ffffff" if dark else "#0e141b"
-    disabled = "#6e7c8c" if dark else "#8b97a3"
+    if role == "on-primary":
+        normal = "#12161c" if dark else "#f4f7f8"
+        active = "#000000" if dark else "#ffffff"
+        disabled = "#6e7c8c" if dark else "#9aa6b2"
+    else:
+        normal = "#e8eef4" if dark else "#1c2430"
+        active = "#ffffff" if dark else "#0e141b"
+        disabled = "#6e7c8c" if dark else "#8b97a3"
     for size in _SIZES:
         icon.addPixmap(_render(body, normal, size), QIcon.Mode.Normal, QIcon.State.Off)
         icon.addPixmap(_render(body, active, size), QIcon.Mode.Active, QIcon.State.Off)
+        icon.addPixmap(_render(body, active, size), QIcon.Mode.Selected, QIcon.State.Off)
         icon.addPixmap(_render(body, disabled, size), QIcon.Mode.Disabled, QIcon.State.Off)
     return icon
 

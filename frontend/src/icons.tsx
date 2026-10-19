@@ -11,6 +11,11 @@ const PATHS: Record<string, string> = {
   tools: '<path d="M14.5 6.2a3 3 0 0 0-3.8 3.8L5.2 15.5l3.3 3.3 5.5-5.5a3 3 0 0 0 3.8-3.8L15.6 11l-2.6-2.6z"/>',
   save: '<path d="M5 4.5h11.2L19.5 8v11.5a1 1 0 0 1-1 1H5.5a1 1 0 0 1-1-1v-14a1 1 0 0 1 1-1z"/><path d="M8 4.5V9h7"/><path d="M8 20v-5.5h8V20"/>',
   open: '<path d="M3.5 8.5V6.8A1.3 1.3 0 0 1 4.8 5.5h4l1.6 1.8h8.8a1.3 1.3 0 0 1 1.3 1.3v9.1a1.3 1.3 0 0 1-1.3 1.3H4.8a1.3 1.3 0 0 1-1.3-1.3z"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M12 4.5v2M12 17.5v2M4.5 12h2M17.5 12h2M6.4 6.4l1.4 1.4M16.2 16.2l1.4 1.4M17.6 6.4l-1.4 1.4M7.8 16.2l-1.4 1.4"/>',
+  log: '<path d="M7 4.5h8l3 3V19.5H7z"/><path d="M15 4.5V8h3"/><path d="M9.5 12h6M9.5 15.5h4"/>',
+  adjusted: '<path d="M5 8h9M16.5 8h2.5"/><path d="M14 6.2v3.6"/><path d="M5 16h2.5M10 16h9"/><path d="M7.5 14.2v3.6"/>',
+  play: '<path d="M9 7.2v9.6L16.5 12z"/>',
+  still: '<path d="M5 6.5h14v11H5z"/><path d="M8 14.5l2.2-2.4 1.6 1.6 2.2-2.5 2 3.3"/>',
 };
 
 export function Icon({ name }: { name: keyof typeof PATHS }) {

@@ -372,7 +372,7 @@ export function App() {
           <Chip ok={!!caps?.ffmpeg.filters?.vidstabdetect} label="vidstab" />
         </div>
         <button className="ghost" onClick={() => setShowSettings((value) => !value)}>
-          <Icon name="tools" /> Capabilities
+          <Icon name="settings" /> Capabilities
         </button>
       </header>
 
@@ -622,7 +622,7 @@ export function App() {
               </select>
             </label>
             <button type="button" className="ghost" onClick={applyAuto}>
-              Fill vidstab auto values
+              <Icon name="adjusted" /> Fill vidstab auto values
             </button>
             {stabilization === "vidstab" && (
               <div className="grid">
@@ -741,7 +741,7 @@ export function App() {
               </>
             )}
             <button onClick={onBatch} disabled={busy || checkedClips.length === 0 || !destination}>
-              Queue {checkedClips.length} {batchOp === "gyro" ? "gyro" : "export"} job{checkedClips.length === 1 ? "" : "s"}
+              <Icon name={batchOp === "gyro" ? "gyro" : "export"} /> Queue {checkedClips.length} {batchOp === "gyro" ? "gyro" : "export"} job{checkedClips.length === 1 ? "" : "s"}
             </button>
           </div>
           {batchOp === "export" ? (
@@ -777,10 +777,11 @@ export function App() {
                 </div>
                 <div className="job-actions">
                   <button className="ghost" onClick={() => api.cancelBatch(batchId).then(refresh).catch((error: Error) => setNotice(error.message))}>
+                    <Icon name="cancel" />
                     Cancel batch
                   </button>
                   <button className="ghost" onClick={() => api.retryBatch(batchId).then(refresh).catch((error: Error) => setNotice(error.message))}>
-                    Retry failed
+                    <Icon name="retry" /> Retry failed
                   </button>
                 </div>
               </div>
@@ -885,7 +886,7 @@ export function App() {
             }
             disabled={!gyroLog.trim()}
           >
-            Read GCSV
+            <Icon name="log" /> Read GCSV
           </button>
           <button
             className="ghost"
@@ -898,7 +899,7 @@ export function App() {
             }}
             disabled={!selected}
           >
-            Inspect telemetry
+            <Icon name="tools" /> Inspect telemetry
           </button>
         </div>
         {gcsvText && <pre className="mono report">{gcsvText}</pre>}
@@ -945,7 +946,7 @@ export function App() {
                 .catch((error: Error) => setNotice(error.message))
             }
           >
-            Save tool paths
+            <Icon name="settings" /> Save tool paths
           </button>
           <h3>Project file</h3>
           <input aria-label="Project file path" value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder="bench.crafts.json" />

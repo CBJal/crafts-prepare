@@ -75,7 +75,8 @@ def test_window_uses_the_approved_icon_and_repaints_with_the_theme(qapp, tmp_pat
         window.meta_toggle.setChecked(True)
         qapp.processEvents()
         assert window.meta_details.isVisible()
-        assert window.project_chip.text().endswith("Unsaved")
+        assert "New" in window.project_chip.text()
+        assert "Unsaved" not in window.project_chip.text()
     finally:
         window.force_close = True
         window.close()
