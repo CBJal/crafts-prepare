@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QEventLoop, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -588,6 +588,16 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.settings_action)
         tools_menu = self.menuBar().addMenu("Tools")
         tools_menu.addAction(self.settings_action)
+        appearance = tools_menu.addMenu("Appearance")
+        self.theme_group = QActionGroup(self)
+        self.theme_group.setExclusive(True)
+        self.theme_actions = {}
+        for choice in ("system", "light", "dark"):
+            action = appearance.addAction(choice.title())
+            action.setCheckable(True)
+            self.theme_group.addAction(action)
+            action.triggered.connect(lambda _checked=False, value=choice: self.set_theme(value))
+            self.theme_actions[choice] = action
         edit = self.menuBar().addMenu("Edit")
         edit.addAction("Select all", self.select_all_batch, QKeySequence.StandardKey.SelectAll)
         edit.addAction("Clear selection", self.clear_batch)
@@ -625,6 +635,8 @@ class MainWindow(QMainWindow):
     def set_theme(self, choice: str) -> str:
         resolved = apply_theme(self, choice)
         self.state["theme"] = choice
+        for name, action in getattr(self, "theme_actions", {}).items():
+            action.setChecked(name == choice)
         self._paint_icons(resolved)
         self._save_preferences()
         return resolved
@@ -1285,6 +1297,7 @@ class MainWindow(QMainWindow):
                     part
                     for part in (
                         str(job.get("status") or ""),
+                        f"{float(job.get('progress') or 0) * 100:.0f}%",
                         str(job.get("kind") or ""),
                         str((job.get("request") or {}).get("filename") or ""),
                         str(colour.get("pipeline") or ""),

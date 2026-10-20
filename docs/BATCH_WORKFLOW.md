@@ -13,3 +13,5 @@ Single-clip changes stay on that clip. Color Apply copies colour/LUT controls; G
 If an XML file changes or returns after being missing, select its clip and use **Meta → Refresh metadata**. Existing correction settings stay. Use **Save** to keep the project; a missing LUT can be chosen again or cleared. A failed edit is kept until repaired or explicitly discarded.
 
 Install FFmpeg/ffprobe and Gyroflow separately and select their executable paths under **Tools** if needed. Installed use needs no Python, Node.js, or browser. The application is independently developed; it does not implement every Sony-specific correction.
+
+Choose **Tools → Appearance → Light / Dark / System** to change the interface. The choice is kept for the next launch. Export jobs show their actual percentage; **Cancel batch** cancels the current batch.

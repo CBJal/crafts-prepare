@@ -89,7 +89,7 @@ class ExportDialog(QDialog):
         self.queue_button = QPushButton("Export selected")
         self.queue_button.setObjectName("exportConfirm")
         self.queue_button.clicked.connect(self.queued.emit)
-        self.cancel_button = QPushButton("Cancel selected job")
+        self.cancel_button = QPushButton("Cancel batch")
         self.retry_button = QPushButton("Retry failed")
         buttons.addWidget(self.queue_button)
         buttons.addWidget(self.cancel_button)

@@ -210,6 +210,28 @@ def test_dark_checkbox_text_and_wrapped_profile_are_readable(window):
     assert window.look_includes.palette().color(QPalette.ColorRole.WindowText).lightness() < 80
 
 
+def test_visible_appearance_menu_switches_and_restores_the_choice(window, tmp_path):
+    import json
+
+    tools = next(action.menu() for action in window.menuBar().actions() if action.text() == "Tools")
+    appearance = next(action.menu() for action in tools.actions() if action.text() == "Appearance")
+    actions = {action.text(): action for action in appearance.actions()}
+    for name in ("Light", "Dark"):
+        actions[name].trigger()
+        QApplication.processEvents()
+        assert window.property("theme") == name.lower()
+        assert actions[name].isChecked()
+        assert json.loads((tmp_path / "state.json").read_text())["theme"] == name.lower()
+    restored = MainWindow(Service(), state_path=tmp_path / "state.json")
+    try:
+        assert restored.property("theme") == "dark"
+        assert restored.theme_actions["dark"].isChecked()
+    finally:
+        restored.force_close = True
+        restored.close()
+        assert not restored._runner.isRunning()
+
+
 def test_paused_step_uses_the_decoded_adjacent_frame(window, tmp_path):
     from app.preview import make_comparison_proxy
 
