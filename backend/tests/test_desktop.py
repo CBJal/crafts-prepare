@@ -528,9 +528,13 @@ def test_invalid_notes_block_save(qapp, desktop, media_dir: Path, tmp_path: Path
     assert desktop.new_project(discard=True) is False
     assert desktop.open_project_path(str(tmp_path / "missing.crafts.json")) is False
     assert desktop.clips
-    desktop.force_close = True
+    desktop._prompt_discard_edit = lambda: False
     desktop.close()
     assert desktop.isVisible()
+    desktop.force_close = True
+    desktop.close()
+    assert not desktop.isVisible()
+    assert not desktop._runner.isRunning()
 
 
 def test_tool_report_cancel_stops_the_owned_process(qapp, desktop, tmp_path: Path, monkeypatch):

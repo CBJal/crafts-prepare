@@ -91,6 +91,28 @@ class FitLabel(QLabel):
         return QSize(640, 360)
 
 
+class WrappedLabel(QLabel):
+    """Keep wrapped form text tall enough after a panel or DPI resize."""
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        super().setText(text)
+        self._fit_height()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        height = self.heightForWidth(max(1, self.width()))
+        if height >= 0 and self.minimumHeight() != height:
+            self.setMinimumHeight(height)
+
+
 class MainWindow(QMainWindow):
     idle = Signal()
     peer_raised = Signal()
@@ -112,6 +134,7 @@ class MainWindow(QMainWindow):
         self._filling = False
         self._proxy_fallback = False
         self._callbacks: dict[int, object] = {}
+        self._finalizers: dict[int, object] = {}
         self._partial: dict | None = None
         self._import_errors: list[dict] = []
         self._browsed_root: Path | None = None
@@ -151,7 +174,12 @@ class MainWindow(QMainWindow):
         self._filled_id: str | None = None
         self._gyro_geometry: dict[str, dict] = {}
         self._gyro_token = 0
-        self._geometry_hold: set[str] = set()
+        self._geometry_users: dict[tuple[str, int], str] = {}
+        self._metadata_token = 0
+        self._metadata_cancel = None
+        self._frame_token = 0
+        self._frame_cancel = None
+        self._paused_frame_target: float | None = None
         self.comparison_used_gyro = False
         self._recipe_timer = QTimer(self)
         self._recipe_timer.setSingleShot(True)
@@ -358,9 +386,8 @@ class MainWindow(QMainWindow):
 
     def _color_page(self) -> QWidget:
         page, form = self._scroll_form()
-        self.profile_detected = QLabel("No clip.")
-        self.profile_detected.setWordWrap(True)
-        form.addRow("Detected", self.profile_detected)
+        self.profile_detected = WrappedLabel("No clip.")
+        form.addRow(self.profile_detected)
         self.profile = QComboBox()
         self.profile.addItem("Auto", "auto")
         self.profile.addItem("S-Log3 / S-Gamut3.Cine", "slog3_sgamut3cine")
@@ -389,9 +416,9 @@ class MainWindow(QMainWindow):
         self.look_includes = QCheckBox("Look includes camera")
         self.look_includes.setToolTip("The look LUT already includes the camera transform, so automatic normalization stays off.")
         form.addRow("Look", self.look_includes)
-        note = QLabel(
-            "Exposure is stops of scene light after the camera decode, not FFmpeg brightness. "
-            "An input LUT replaces automatic normalization."
+        note = WrappedLabel(
+            "Exposure adjusts scene light. An Input LUT replaces automatic camera conversion. "
+            "A Look LUT is applied afterwards."
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -412,20 +439,29 @@ class MainWindow(QMainWindow):
         self.gyro_strength = QSlider(Qt.Orientation.Horizontal)
         self.gyro_strength.setRange(0, 100)
         self.gyro_strength.setValue(50)
-        form.addRow("Strength", self.gyro_strength)
+        self.gyro_strength_value = QLabel("50%")
+        self.gyro_strength.valueChanged.connect(lambda value: self.gyro_strength_value.setText(f"{value}%"))
+        strength_row = QHBoxLayout()
+        strength_row.addWidget(self.gyro_strength, 1)
+        strength_row.addWidget(self.gyro_strength_value)
+        form.addRow("Strength", strength_row)
         self.gyro_fov = QDoubleSpinBox()
         self.gyro_fov.setRange(0.1, 3.0)
         self.gyro_fov.setSingleStep(0.05)
         self.gyro_fov.setDecimals(2)
         self.gyro_fov.setValue(1.0)
-        form.addRow("FOV", self.gyro_fov)
+        form.addRow("Field of view", self.gyro_fov)
         self.gyro_horizon = QSlider(Qt.Orientation.Horizontal)
         self.gyro_horizon.setRange(0, 100)
-        form.addRow("Horizon %", self.gyro_horizon)
-        note = QLabel(
-            "Strength is Gyroflow smoothness (0–1). Field of view above 1 widens the frame. "
-            "Horizon lock is a percent, and 0 is off. XML names are not gyro samples. "
-            "Sony breathing correction is not available."
+        self.gyro_horizon_value = QLabel("0%")
+        self.gyro_horizon.valueChanged.connect(lambda value: self.gyro_horizon_value.setText(f"{value}%"))
+        horizon_row = QHBoxLayout()
+        horizon_row.addWidget(self.gyro_horizon, 1)
+        horizon_row.addWidget(self.gyro_horizon_value)
+        form.addRow("Horizon lock", horizon_row)
+        note = WrappedLabel(
+            "Higher strength smooths more camera movement. Field of view above 1 keeps more of the frame. "
+            "Horizon lock at 0% leaves the original horizon."
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -433,7 +469,11 @@ class MainWindow(QMainWindow):
         self.gyro_preview_button.setToolTip("Render the current gyro geometry, then compare it with colour applied once.")
         self.gyro_preview_button.clicked.connect(self.update_stabilization_preview)
         form.addRow(self.gyro_preview_button)
-        self.gyro_status = QLabel("Stabilization preview has not been rendered.")
+        self.gyro_apply_button = QPushButton("Apply to selected")
+        self.gyro_apply_button.setToolTip("Apply these stabilization settings to every selected clip. Keep each clip's colour and LUT settings.")
+        self.gyro_apply_button.clicked.connect(self.apply_gyro_to_selected)
+        form.addRow(self.gyro_apply_button)
+        self.gyro_status = WrappedLabel("Stabilization preview has not been rendered.")
         self.gyro_status.setWordWrap(True)
         form.addRow(self.gyro_status)
         return page
@@ -444,6 +484,10 @@ class MainWindow(QMainWindow):
         refresh.setToolTip("Re-read the selected clips and their sidecars. Recipes stay. Re-import does not do this.")
         refresh.clicked.connect(self.refresh_selected_metadata)
         form.addRow(refresh)
+        self.metadata_cancel_button = QPushButton("Cancel refresh")
+        self.metadata_cancel_button.setEnabled(False)
+        self.metadata_cancel_button.clicked.connect(self.cancel_metadata_refresh)
+        form.addRow(self.metadata_cancel_button)
         self.notes = QPlainTextEdit()
         self.notes.textChanged.connect(self._notes_edited)
         self.flag = QComboBox()
@@ -474,6 +518,7 @@ class MainWindow(QMainWindow):
         browse.clicked.connect(lambda: self._browse_into(edit, title))
         clear = QPushButton("Clear")
         clear.clicked.connect(edit.clear)
+        clear.clicked.connect(self._schedule_recipe)
         layout.addWidget(edit, 1)
         layout.addWidget(browse)
         layout.addWidget(clear)
@@ -601,6 +646,8 @@ class MainWindow(QMainWindow):
                 self.inspector_tabs.setTabIcon(index, action_icon(name, theme))
 
     def _folder_chosen(self, folder: str) -> None:
+        if not self._flush_pending_edit():
+            return
         self._remember_folder(folder)
         self.places.show_tree(folder)
         self.import_paths([folder])
@@ -613,6 +660,8 @@ class MainWindow(QMainWindow):
     def import_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Import folder")
         if folder:
+            if not self._flush_pending_edit():
+                return
             self._remember_folder(folder)
             self.places.show_tree(folder)
             self.import_paths([folder])
@@ -620,6 +669,8 @@ class MainWindow(QMainWindow):
     def import_folder_deep(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Import folder and subfolders")
         if folder:
+            if not self._flush_pending_edit():
+                return
             self._remember_folder(folder)
             self.places.show_tree(folder)
             self.import_paths([folder], deep=True)
@@ -632,7 +683,8 @@ class MainWindow(QMainWindow):
         self.places.set_lists(self.state.get("folders") or [], self.state.get("favorites") or [])
 
     def import_paths(self, paths: list[str], *, deep: bool = False) -> None:
-        self._flush_pending_edit()
+        if not self._flush_pending_edit():
+            return
         files: list[Path] = []
         missing: list[str] = []
         directories: list[Path] = []
@@ -1021,7 +1073,8 @@ class MainWindow(QMainWindow):
     def apply_recipe_to_selected(self) -> None:
         if not self._flush_pending_edit():
             return
-        recipe = self.recipe_from_controls()
+        controls = self.recipe_from_controls()
+        recipe = {key: value for key, value in controls.items() if not key.startswith("gyro_")}
         ids = self.selected_ids() or ([self.focused_id()] if self.focused_id() else [])
         if not ids:
             self.statusBar().showMessage("Select at least one clip.", 5000)
@@ -1045,8 +1098,28 @@ class MainWindow(QMainWindow):
         self.input_lut.clear()
         self.look_lut.clear()
         self.look_includes.setChecked(False)
-        self.gyro_enabled.setChecked(False)
         self.apply_recipe_to_selected()
+
+    def apply_gyro_to_selected(self) -> None:
+        if not self._flush_pending_edit():
+            return
+        controls = self.recipe_from_controls()
+        recipe = {key: controls[key] for key in ("gyro_enabled", "gyro_smoothness", "gyro_fov", "gyro_horizon")}
+        ids = self.selected_ids()
+        if not ids:
+            self.statusBar().showMessage("Select at least one clip.", 5000)
+            return
+        try:
+            for clip_id in ids:
+                self.service.update_clip(clip_id, {"recipe": recipe})
+        except CraftsError as exc:
+            self.last_error = exc.message
+            self.statusBar().showMessage(exc.message, 8000)
+            return
+        self.reload_all()
+        self.statusBar().showMessage(f"Stabilization settings applied to {len(ids)} clip(s).", 5000)
+        if self.center.currentIndex() == 1:
+            self.request_comparison()
 
     def commit_editor(self) -> bool:
         clip = self.focused_clip()
@@ -1268,8 +1341,9 @@ class MainWindow(QMainWindow):
         gyro_on = bool(described["recipe"].get("gyro_enabled"))
         geometry = self._current_geometry(clip) if gyro_on else None
         gyro_path = geometry
+        owner = ("compare", token)
         if gyro_path:
-            self._geometry_hold.add(str(gyro_path))
+            self._geometry_users[owner] = str(gyro_path)
         self.preview_status.setText(self._gyro_message(clip) if gyro_on and geometry is None else "Comparison preview is rendering.")
 
         def work(cancel):
@@ -1331,7 +1405,7 @@ class MainWindow(QMainWindow):
             self.viewer_stack.setCurrentIndex(0)
             self._retire_owned_previews()
 
-        self._start(work, done, key="compare")
+        self._start(work, done, key="compare", on_finished=lambda: self._release_geometry(owner))
 
     def _current_geometry(self, clip: dict) -> str | None:
         record = self._gyro_geometry.get(clip["id"]) or {}
@@ -1375,41 +1449,78 @@ class MainWindow(QMainWindow):
         if not ids:
             self.statusBar().showMessage("Select at least one clip.", 5000)
             return
-        try:
-            report = self.service.refresh_metadata(ids)
-        except CraftsError as exc:
-            self.last_error = exc.message
-            self.statusBar().showMessage(exc.message, 8000)
-            return
-        self.clips = self.service.clips()
-        self.reload_all()
-        messages = []
-        for item in report.get("clips") or []:
-            if item.get("status") == "missing":
-                messages.append("A selected source is missing. Its recipe was kept.")
-            assessment = item.get("assessment") or {}
-            messages.extend(str(issue) for issue in assessment.get("issues") or [])
-        self.statusBar().showMessage(" ".join(messages) or "Metadata refreshed. Recipes were kept.", 8000)
+        self._metadata_token += 1
+        token, generation = self._metadata_token, self._project_gen
+        self.statusBar().showMessage(f"Refreshing metadata for {len(ids)} clip(s)…")
+        self.metadata_cancel_button.setEnabled(True)
+
+        def done(report):
+            if generation != self._project_gen or token != self._metadata_token:
+                return
+            self.reload_all()
+            messages = []
+            for item in report.get("clips") or []:
+                if item.get("status") == "missing":
+                    messages.append("A selected source is missing. Its recipe was kept.")
+                messages.extend(str(issue) for issue in (item.get("assessment") or {}).get("issues") or [])
+            self.statusBar().showMessage(" ".join(messages) or "Metadata refreshed. Recipes were kept.", 8000)
+
+        def finished():
+            if token == self._metadata_token:
+                if self._metadata_cancel is not None and self._metadata_cancel.is_set():
+                    self.statusBar().showMessage("Metadata refresh cancelled.", 5000)
+                self._metadata_cancel = None
+                self.metadata_cancel_button.setEnabled(False)
+
+        self._metadata_cancel = self._start(
+            lambda cancel: self.service.refresh_metadata(ids, cancel=cancel), done,
+            key="metadata", on_finished=finished,
+        )
+
+    def cancel_metadata_refresh(self) -> None:
+        if self._metadata_cancel is not None:
+            self._metadata_cancel.set()
+            self.statusBar().showMessage("Stopping metadata refresh…")
 
     def _retire_owned_previews(self) -> None:
         """Drop old owned previews. Never the file the player has open, and never a user export."""
         active = Path(self._compare_path).resolve() if getattr(self, "_compare_path", "") else None
-        held = {Path(item).resolve() for item in self._geometry_hold if item}
-        for record in self._gyro_geometry.values():
-            if record.get("path"):
-                held.add(Path(str(record["path"])).resolve())
+        import re
+
+        held = {Path(item).resolve() for item in self._geometry_users.values() if item}
+        current = self._gyro_geometry.get(self.focused_id()) or {}
+        if current.get("path"):
+            held.add(Path(str(current["path"])).resolve())
         geometry_dir = self.service.data_dir / "gyro-geometry"
         if geometry_dir.is_dir():
-            files = sorted(geometry_dir.glob("*.mov"), key=lambda path: path.stat().st_mtime, reverse=True)
+            files = sorted(
+                (path for path in geometry_dir.glob("*.mov") if re.fullmatch(r"[0-9a-f]{24}-[0-9a-f]{8}\.mov", path.name)),
+                key=lambda path: path.stat().st_mtime, reverse=True,
+            )
             spare = [path for path in files if path.resolve() not in held]
-            for path in spare[8:]:
-                path.unlink(missing_ok=True)
+            remaining = max(0, 4 - sum(path.resolve() in held for path in files))
+            for path in spare[remaining:]:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    continue  # A player/tool may still be releasing it. Retry next time.
+            self._gyro_geometry = {
+                key: record for key, record in self._gyro_geometry.items()
+                if record.get("path") and Path(str(record["path"])).is_file()
+            }
         compares = sorted(self.service.data_dir.glob("compare-*.mp4"), key=lambda path: path.stat().st_mtime, reverse=True)
         for path in compares[6:]:
             if active is not None and path.resolve() == active:
                 continue
-            path.unlink(missing_ok=True)
-            path.with_suffix(".png").unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+                path.with_suffix(".png").unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def _release_geometry(self, owner: tuple[str, int]) -> None:
+        self._geometry_users.pop(owner, None)
+        self._retire_owned_previews()
 
     def update_stabilization_preview(self) -> None:
         if not self._flush_pending_edit():
@@ -1429,11 +1540,17 @@ class MainWindow(QMainWindow):
         self._gyro_token += 1
         token = self._gyro_token
         clip_id = clip["id"]
+        generation = self._project_gen
+        import uuid
+
+        directory = self.service.data_dir / "gyro-geometry"
+        directory.mkdir(parents=True, exist_ok=True)
+        output = directory / f"{key}-{uuid.uuid4().hex[:8]}.mov"
+        owner = ("gyro", token)
+        self._geometry_users[owner] = str(output)
         self.gyro_status.setText("Rendering gyro geometry in the original colour space. Colour is not applied in this stage.")
 
         def work(cancel):
-            import uuid
-
             from ..gyroflow_cli import run_gyroflow
             from ..probe import display_dimensions, normalize_rotation
 
@@ -1442,9 +1559,6 @@ class MainWindow(QMainWindow):
             video = ((fresh.get("probe") or {}).get("video") or [{}])[0]
             width, height = display_dimensions(video)
             rotation = normalize_rotation(video.get("rotation"))
-            directory = self.service.data_dir / "gyro-geometry"
-            directory.mkdir(parents=True, exist_ok=True)
-            output = directory / f"{key}-{uuid.uuid4().hex[:8]}.mov"
             try:
                 result = run_gyroflow(
                     settings=self.service.settings,
@@ -1475,21 +1589,21 @@ class MainWindow(QMainWindow):
             return {"path": str(result.get("output_path") or output), "key": key, "token": token, "clip_id": clip_id}
 
         def done(result: dict) -> None:
-            if result.get("token") != self._gyro_token:
+            if result.get("token") != self._gyro_token or generation != self._project_gen:
                 return
             if result.get("error"):
-                self.gyro_status.setText(str(result["error"]))
+                if self.focused_id() == result["clip_id"]:
+                    self.gyro_status.setText(str(result["error"]))
                 return
             path = str(result.get("path") or "")
             self._gyro_geometry[result["clip_id"]] = {"key": result.get("key"), "path": path}
-            self._geometry_hold.add(path)
-            self.gyro_status.setText("Stabilization geometry is current.")
-            self.playback_result = {"kind": "gyro-geometry", "proxy_path": path, "key": result.get("key")}
             if self.focused_id() == result["clip_id"]:
+                self.playback_result = {"kind": "gyro-geometry", "proxy_path": path, "key": result.get("key")}
+                self._show_gyro_state(self.focused_clip())
                 self.request_comparison()
             self._retire_owned_previews()
 
-        self._start(work, done, key="gyro-preview")
+        self._start(work, done, key="gyro-preview", on_finished=lambda: self._release_geometry(owner))
 
     def _current_seconds(self, clip: dict) -> float:
         if self.player is not None and self.player.position() > 0:
@@ -1513,6 +1627,10 @@ class MainWindow(QMainWindow):
         self._view_gen += 1
         self._still_seq += 1
         self._compare_token += 1
+        self._frame_token = getattr(self, "_frame_token", 0) + 1
+        self._paused_frame_target = None
+        if getattr(self, "_frame_cancel", None) is not None:
+            self._frame_cancel.set()
         self._proxy_fallback = False
         self.still_path = ""
         self.playback_result = None
@@ -1537,7 +1655,10 @@ class MainWindow(QMainWindow):
         image = frame.toImage() if hasattr(frame, "toImage") else None
         if image is None or image.isNull() or self.player is None:
             return
-        seconds = self.player.position() / 1000.0
+        if getattr(self, "_paused_frame_target", None) is not None:
+            return
+        timestamp = frame.startTime() if hasattr(frame, "startTime") else -1
+        seconds = timestamp / 1_000_000 if timestamp >= 0 else self.player.position() / 1000.0
         self.compare.present_split(image, seconds)
         self.still_original.set_source(self.compare._left)
         self.still_adjusted.set_source(self.compare._right)
@@ -1554,6 +1675,10 @@ class MainWindow(QMainWindow):
 
     def play(self) -> None:
         if self.player is not None:
+            self._frame_token += 1
+            self._paused_frame_target = None
+            if self._frame_cancel is not None:
+                self._frame_cancel.set()
             self.player.play()
 
     def pause(self) -> None:
@@ -1563,11 +1688,65 @@ class MainWindow(QMainWindow):
     def step_frame(self, direction: int) -> None:
         if self.player is None:
             return
+        import math
+        import re
+        import uuid
+
+        path = getattr(self, "_compare_path", "")
+        if not path or not Path(path).is_file():
+            return
+        clip = self.focused_clip() or {}
+        video = ((clip.get("probe") or {}).get("video") or [{}])[0] or {}
+        num = int(video.get("frame_rate_num") or 25)
+        den = max(1, int(video.get("frame_rate_den") or 1))
+        fps = num / den if num > 0 else 25.0
+        current = self._paused_frame_target if self._paused_frame_target is not None else self.compare.seconds
+        index = max(0, int(round(current * fps)) + (1 if direction > 0 else -1))
+        duration = self.player.duration() / 1000.0
+        if duration > 0:
+            index = min(index, max(0, math.ceil(duration * fps) - 1))
+        target = index / fps
         self.player.pause()
-        self.player.setPosition(max(0, self.player.position() + direction * self._frame_ms()))
+        self._paused_frame_target = target
+        self.player.setPosition(round(target * 1000))
+        self._frame_token += 1
+        token, generation = self._frame_token, self._project_gen
+        image_path = self.service.data_dir / f".frame-step-{uuid.uuid4().hex}.png"
+
+        def work(cancel):
+            from ..process import run_captured
+
+            ffmpeg, _ffprobe = self.service._tools()
+            code, _out, error = run_captured(
+                [ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "info", "-copyts",
+                 "-ss", f"{target:.9f}", "-i", path, "-vf", "showinfo", "-frames:v", "1",
+                 "-fps_mode", "passthrough", str(image_path)], timeout=30, cancel=cancel,
+            )
+            timestamp = re.search(r"pts_time:([0-9.]+)", error)
+            if code or not image_path.is_file() or timestamp is None:
+                raise CraftsError("The requested frame could not be decoded.", code="preview_frame")
+            return float(timestamp.group(1))
+
+        def done(seconds):
+            if token != self._frame_token or generation != self._project_gen or path != self._compare_path:
+                return
+            image = QPixmap(str(image_path))
+            if image.isNull():
+                return
+            self.compare.present_split(image, seconds)
+            self.still_original.set_source(self.compare._left)
+            self.still_adjusted.set_source(self.compare._right)
+            self._paused_frame_target = seconds
+            self.playback_result = {"kind": "paused-frame", "proxy_path": path, "frame_time_seconds": seconds}
+
+        self._frame_cancel = self._start(work, done, key="frame-step", on_finished=lambda: image_path.unlink(missing_ok=True))
 
     def _seek(self, position: int) -> None:
         if self.player is not None:
+            self._frame_token += 1
+            self._paused_frame_target = None
+            if self._frame_cancel is not None:
+                self._frame_cancel.set()
             self.player.setPosition(position)
 
     def _on_position(self, position: int) -> None:
@@ -1650,9 +1829,10 @@ class MainWindow(QMainWindow):
         path, _filter = QFileDialog.getOpenFileName(self, title, edit.text(), "LUT (*.cube)")
         if path:
             edit.setText(path)
+            self._schedule_recipe()
 
     def is_unsaved(self) -> bool:
-        if self._notes_dirty:
+        if self._notes_dirty or self._pending_edit is not None:
             return True
         if self.service.project_path is not None:
             return False
@@ -1675,9 +1855,7 @@ class MainWindow(QMainWindow):
         return "cancel"
 
     def new_project(self, discard: bool = False) -> bool:
-        if not self._flush_pending_edit():
-            return False
-        if not self.commit_editor():
+        if not self._prepare_to_leave():
             return False
         if self.is_unsaved() and not discard:
             choice = self._prompt_unsaved()
@@ -1706,7 +1884,7 @@ class MainWindow(QMainWindow):
             self.open_project_path(path)
 
     def open_project_path(self, path: str) -> bool:
-        if not self._flush_pending_edit() or not self.commit_editor():
+        if not self._prepare_to_leave():
             return False
         if self.is_unsaved():
             choice = self._prompt_unsaved()
@@ -1732,6 +1910,10 @@ class MainWindow(QMainWindow):
     def _reset_workspace(self) -> None:
         self._project_gen += 1
         self._folder_token += 1
+        self._gyro_token += 1
+        self._metadata_token += 1
+        self._metadata_cancel = None
+        self.metadata_cancel_button.setEnabled(False)
         self._thumbs.cancel()
         self._still_seq += 1
         self._notes_dirty = False
@@ -1742,10 +1924,13 @@ class MainWindow(QMainWindow):
         self._browsed_root = None
         self.grid.clear_selection()
         self._invalidate_viewer()
+        self._gyro_geometry.clear()
+        self._geometry_users.clear()
+        self._retire_owned_previews()
         self.reload_all()
 
     def save_project_interactive(self) -> bool:
-        if not self.commit_editor():
+        if not self._flush_pending_edit() or not self.commit_editor():
             return False
         if self.service.project_path is None:
             return self.save_project_as()
@@ -1868,7 +2053,7 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        if not self._flush_pending_edit() or not self.commit_editor():
+        if not self._prepare_to_leave(discard=self.force_close, allow_discard=True):
             event.ignore()
             return
         if self.is_unsaved() and not self.force_close:
@@ -1911,25 +2096,65 @@ class MainWindow(QMainWindow):
             logging.getLogger(__name__).exception("Window preferences failed during close")
         event.accept()
 
-    def _start(self, fn, on_ok, *, key: str | None = None) -> None:
+    def _discard_editor(self) -> None:
+        self._recipe_timer.stop()
+        self._pending_edit = None
+        self._pending_markers = None
+        self._notes_dirty = False
+        self._fill_focus()
+
+    def _prompt_discard_edit(self) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setText("This edit could not be saved.")
+        box.setInformativeText((self.last_error or "Check the current settings.") + "\nDiscard this edit and continue?")
+        discard = box.addButton("Discard edit", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        return box.clickedButton() is discard
+
+    def _prepare_to_leave(self, *, discard: bool = False, allow_discard: bool = False) -> bool:
+        if discard:
+            self._discard_editor()
+            return True
+        if self._flush_pending_edit() and self.commit_editor():
+            return True
+        if not allow_discard or not self._prompt_discard_edit():
+            return False
+        self._discard_editor()
+        return True
+
+    def _start(self, fn, on_ok, *, key: str | None = None, on_finished=None):
         token = self._token
         self._token += 1
         self._inflight += 1
         self._callbacks[token] = on_ok
-        self._runner.submit(token, fn, key)
+        if on_finished is not None:
+            self._finalizers[token] = on_finished
+        return self._runner.submit(token, fn, key)
+
+    def _finish_task(self, token: int) -> None:
+        finalizer = self._finalizers.pop(token, None)
+        try:
+            if finalizer is not None:
+                finalizer()
+        finally:
+            self._note_finished()
 
     def _task_ok(self, token: int, value) -> None:
         callback = self._callbacks.pop(token, None)
-        if callback and value is not None:
-            callback(value)
-        self._note_finished()
+        try:
+            if callback and value is not None:
+                callback(value)
+        finally:
+            self._finish_task(token)
 
     def _task_fail(self, token: int, message: str) -> None:
         self._callbacks.pop(token, None)
         if message != "cancelled":
             self.last_error = message
             self.statusBar().showMessage(message, 10000)
-        self._note_finished()
+        self._finish_task(token)
 
     def _note_finished(self) -> None:
         self._inflight = max(0, self._inflight - 1)

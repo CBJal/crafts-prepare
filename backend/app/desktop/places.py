@@ -14,7 +14,7 @@ def local_places() -> list[tuple[str, str]]:
     if os.name == "nt":
         for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
             root = Path(f"{letter}:/")
-            if root.exists():
+            if os.path.exists(root):
                 places.append((f"Drive {letter}:", str(root)))
         return places
     places.append(("Computer", "/"))

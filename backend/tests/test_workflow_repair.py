@@ -135,7 +135,9 @@ def test_stale_gyro_geometry_is_not_called_current(qapp, tmp_path, media_dir, mo
 def test_tv_tag_does_not_change_slog_code_reading(tmp_path: Path):
     if not __import__("shutil").which("ffmpeg"):
         pytest.skip("ffmpeg is not installed")
-    code = 598 / 1023
+    # Bright grey stays below Rec.709 clipping in both range interpretations.
+    # A near-white patch can clip both and cannot serve as a negative control.
+    code = 560 / 1023
     value = int(round(code * 65535))
     source = tmp_path / "slog-pc.mp4"
     _ffmpeg(

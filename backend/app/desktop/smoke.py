@@ -151,6 +151,13 @@ def run_smoke(
                 "painted": painted(),
             }
         )
+        recipe = dict(settings.get("recipe") or {})
+        if settings.get("lut"):
+            recipe["look_lut"] = settings["lut"]
+        if recipe and window.clips:
+            for clip in list(window.clips):
+                window.service.update_clip(clip["id"], {"recipe": recipe})
+            window.clips = window.service.clips()
         profiles = []
         for clip in window.clips:
             from .grade import describe_clip
@@ -167,13 +174,6 @@ def run_smoke(
             )
         unresolved = [item for item in profiles if item.get("pipeline") in {None, "", "unknown"} or item.get("sidecar") in {"conflict", "ambiguous", "unsafe"}]
         proof["steps"].append({"step": "profiles", "ok": bool(profiles) and not unresolved, "clips": profiles})
-        recipe = dict(settings.get("recipe") or {})
-        if settings.get("lut"):
-            recipe["look_lut"] = settings["lut"]
-        if recipe and window.clips:
-            for clip in list(window.clips):
-                window.service.update_clip(clip["id"], {"recipe": recipe})
-            window.clips = window.service.clips()
         if window.clips:
             window.focus_clip(window.clips[0]["id"])
         window._show_mode(1)
@@ -252,6 +252,10 @@ def run_smoke(
             )
             if not gyro_compare_ok:
                 code = 2
+        # Focusing the representative gyro clip above (and trim controls) uses
+        # select_only. The export contract is still every imported sample.
+        window.select_all_batch()
+        proof["selected_for_export"] = len(window.selected_ids())
         window.queue_checked_batch("prepare")
         _wait_jobs(app, service, window)
         jobs = _job_rows(service)

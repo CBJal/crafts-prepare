@@ -408,7 +408,7 @@ class Service:
                 return clip
         raise CraftsError("Clip not found.", code="not_found", status=404)
 
-    def refresh_metadata(self, clip_ids: list[str]) -> dict:
+    def refresh_metadata(self, clip_ids: list[str], cancel=None) -> dict:
         """Re-probe and re-pair selected clips in place. Recipes are kept.
 
         Re-import deduplicates by checksum and does not refresh a clip that is
@@ -422,32 +422,47 @@ class Service:
         _ffmpeg, ffprobe = self._tools()
         results = []
         with self.lock:
-            for clip_id in clip_ids:
-                clip = self._clip(clip_id)
-                path = Path(clip["path"])
-                recipe = clip.get("recipe") if isinstance(clip.get("recipe"), dict) else None
-                if not path.is_file():
+            project = self.project
+            selected = [(clip_id, self._clip(clip_id), Path(self._clip(clip_id)["path"])) for clip_id in dict.fromkeys(clip_ids)]
+        changes = []
+        # Probing and hashing must not hold the lock used by UI/queue reads.
+        # Commit the complete refresh only if its project and sources still match.
+        for clip_id, clip, path in selected:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            if not path.is_file():
+                changes.append((clip_id, clip, path, None))
+                continue
+            probed = probe_file(ffprobe, path, cancel=cancel)
+            sidecar = pair_sidecar(path)
+            if sidecar.get("status") == "ok":
+                sidecar["assessment"] = assess_sidecar(sidecar, probed)
+            checksum = sha256_file(path, cancel=cancel)
+            stat = path.stat()
+            changes.append((clip_id, clip, path, (probed, sidecar, checksum, stat)))
+        with self.lock:
+            if self.project is not project or (cancel is not None and cancel.is_set()):
+                raise Cancelled("The metadata refresh was cancelled before replacing any metadata.")
+            if any(self._clip(clip_id) is not clip or Path(clip["path"]) != path for clip_id, clip, path, _data in changes):
+                raise Cancelled("The selected sources changed during metadata refresh.")
+            for clip_id, clip, path, data in changes:
+                recipe_kept = isinstance(clip.get("recipe"), dict)
+                if data is None:
                     side = dict(clip.get("sidecar") or {})
                     side["refresh"] = "missing"
                     side["message"] = "The source file is missing, so metadata was not replaced. The saved recipe was kept."
                     clip["sidecar"] = side
                     clip["source_missing"] = True
-                    results.append({"id": clip_id, "status": "missing", "recipe_kept": recipe is not None})
+                    results.append({"id": clip_id, "status": "missing", "recipe_kept": recipe_kept})
                     continue
-                probed = probe_file(ffprobe, path)
-                sidecar = pair_sidecar(path)
-                if sidecar.get("status") == "ok":
-                    sidecar["assessment"] = assess_sidecar(sidecar, probed)
+                probed, sidecar, checksum, stat = data
                 clip["probe"] = probed
                 clip["sidecar"] = sidecar
-                clip["sha256"] = sha256_file(path)
-                stat = path.stat()
+                clip["sha256"] = checksum
                 clip["size"] = stat.st_size
                 clip["device"] = stat.st_dev
                 clip["inode"] = stat.st_ino
                 clip["source_missing"] = False
-                if recipe is not None:
-                    clip["recipe"] = recipe
                 duration = float(probed.get("duration") or 0)
                 if duration and float(clip.get("trim_out") or 0) > duration + 0.05:
                     clip["trim_out"] = duration
@@ -456,7 +471,7 @@ class Service:
                         "id": clip_id,
                         "status": "refreshed",
                         "assessment": sidecar.get("assessment") or {},
-                        "recipe_kept": recipe is not None,
+                        "recipe_kept": recipe_kept,
                     }
                 )
             self._persist()

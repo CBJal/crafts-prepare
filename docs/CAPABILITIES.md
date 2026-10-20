@@ -1,6 +1,20 @@
 # Capabilities and limits
 
-Status below is what this repository implements. "Verified here" means an automated test in this session, on Linux, with the system ffmpeg. It is not a Windows UI test and not a Sony camera test.
+## Native 0.3 workflow
+
+The installed application is Qt Widgets, with a folder/thumbnail Browse view, a single-clock moving Original/Processed/2-up/Wipe viewer, per-clip corrections, and an Export dialog containing the batch queue. It does not need a browser. See [BATCH_WORKFLOW.md](BATCH_WORKFLOW.md).
+
+- Adjacent Sony XML files identify the per-clip input colour profile. Supported automatic SDR normalization includes S-Log3/S-Gamut3.Cine and HLG/BT.2020. Unknown/conflicting profiles require a deliberate choice; no guessed conversion is applied. XML is not a numeric gyro log.
+- Input LUTs replace automatic normalization; Look LUTs run afterwards. Queued jobs freeze their LUT bytes. Exposure changes scene light. Rec.709 output is an independent transform, not a reproduction of Sony's rendering.
+- One preparation job combines original-space embedded-gyro stabilization, colour/LUT and final encoding. Source-size portrait output uses upright display dimensions. Audio, frame rate and supported 10-bit presets are retained and validated.
+- Color and Gyro each have Apply to selected; applying one panel keeps the other panel's per-clip settings. Metadata refresh is cancellable and does not hold UI reads behind file probing/hashing. Failed edits block folder/project replacement; closing offers an explicit discard route.
+- The native comparison is full length at bounded preview resolution. Paused frame steps decode the requested adjacent frame, with the timestamp reported by the decoder. Preview images are compressed SDR viewing aids, not calibrated HDR or pixel-identical 10-bit masters.
+- Gyro geometry is retained for current/in-flight use and a bounded cache of four owned files; comparison previews retain six recent files plus an active older player file. User sources and exports are not cache-cleanup targets.
+- The Windows installer uses the existing app identity and leaves settings/projects in place. External FFmpeg/ffprobe and Gyroflow remain separately installed dependencies. Lens-breathing correction, Sony algorithm parity and calibrated HDR monitoring are not provided.
+
+## Earlier optional API/web observations
+
+The table below records the earlier Linux/API and optional web interface's observations. Its browser/proxy limits are historical and do not describe the native 0.3 viewer above.
 
 | Feature | Status | Verified here |
 | --- | --- | --- |

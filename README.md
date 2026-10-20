@@ -4,7 +4,7 @@ Open-source local video preparation for Windows and development platforms. The a
 
 <img src="docs/ui/app-icon.png" alt="Crafts Prepare" width="64" height="64">
 
-Crafts Prepare is a local video-preparation bench for inspecting, trimming, adjusting, visually stabilizing, and batch-exporting footage. It runs on your machine. It does not upload media, create an account, or charge for its own features.
+Crafts Prepare prepares camera footage in batches: browse real thumbnails, read each clip's XML colour profile, apply LUTs, stabilize with embedded gyro data, compare before/after, and export. It runs on your machine. It does not upload media, create an account, or charge for its own features. Follow the [native batch workflow](docs/BATCH_WORKFLOW.md).
 
 ![Light browse](docs/ui/workspace-light.png)
 ![Dark browse](docs/ui/workspace-dark.png)
@@ -20,9 +20,13 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) to report ordinary bugs or submit change
 
 ## What you need
 
+The Windows installer includes the native app runtime. Installed use does **not** need Python, Node.js, or a browser. Install/configure FFmpeg and ffprobe separately, and Gyroflow for gyro stabilization; choose their paths under Tools if they are not found automatically.
+
+For running or building from source:
+
 - Windows 10 or later, or another OS with Python 3.12, 3.13, or 3.14
 - Python 3.12, 3.13, or 3.14. Python 3.14 is supported with the pinned wheels in `backend/requirements.lock` (`pydantic` 2.14.1 / `pydantic-core` 2.50.1). Do not install another system Python just to run this app.
-- Node.js 20 or newer, the first time, to build the web UI
+- Node.js 20 or newer only for the optional web UI; native development does not need it
 - ffmpeg and ffprobe on `PATH`, installed by you
 
 Optional:

@@ -163,7 +163,7 @@ def test_compact_transport_stays_on_screen_with_names(qapp, window):
     assert window.inspector_tabs.tabIcon(0).isNull() is False
     assert window.inspector_tabs.tabIcon(2).isNull() is False
     assert window.inspector_tabs.tabText(0) == "Color"
-    assert window.inspector_tabs.tabText(1) == "Stabilization"
+    assert window.inspector_tabs.tabText(1) == "Gyro"
 
 
 def test_project_chip_is_honest_and_elides(qapp, window):

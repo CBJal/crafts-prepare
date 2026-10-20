@@ -395,10 +395,10 @@ def _validate_output(
     if output_color:
         problems = []
         expected = {
-            "color_space": output_color["colorspace"],
-            "color_primaries": output_color["primaries"],
-            "color_transfer": output_color["trc"],
-            "color_range": output_color["range"],
+            field: output_color[key]
+            for field, key in (("color_space", "colorspace"), ("color_primaries", "primaries"),
+                               ("color_transfer", "trc"), ("color_range", "range"))
+            if output_color.get(key)
         }
         for key, want in expected.items():
             if not want:
@@ -411,7 +411,7 @@ def _validate_output(
                 problems.append(f"{key}={video.get(key) or 'missing'}")
         if problems:
             raise CraftsError(
-                "Output colour tags do not match the Rec.709 plan (" + ", ".join(problems) + "). It was not published.",
+                "Output colour tags do not match the requested plan (" + ", ".join(problems) + "). It was not published.",
                 code="invalid_output",
             )
     return {

@@ -81,6 +81,8 @@ QScrollBar::handle:vertical, QScrollBar::handle:horizontal { background: #c5ced6
 QScrollBar::handle:hover { background: #8b97a3; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; background: #f6f7f8; }
 QScrollBar::add-page, QScrollBar::sub-page { background: #f6f7f8; }
+QCheckBox { color: #1a2028; }
+QCheckBox:disabled { color: #8b97a3; }
 QCheckBox::indicator, QTableWidget::indicator {
   width: 16px; height: 16px; border: 1px solid #5c6770; background: #ffffff; border-radius: 3px;
 }
@@ -168,6 +170,8 @@ QScrollBar::handle:vertical, QScrollBar::handle:horizontal { background: #5a5a5a
 QScrollBar::handle:hover { background: #8a8a8a; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; background: #292929; }
 QScrollBar::add-page, QScrollBar::sub-page { background: #292929; }
+QCheckBox { color: #f2f2f2; }
+QCheckBox:disabled { color: #9a9a9a; }
 QCheckBox::indicator, QTableWidget::indicator {
   width: 16px; height: 16px; border: 1px solid #c6c6c6; background: #202020; border-radius: 3px;
 }
