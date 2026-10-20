@@ -11,7 +11,7 @@ from .errors import Cancelled, CraftsError
 from .probe import probe_file
 from .recipe import default_recipe
 from .security import MAX_HASH_BYTES, is_within, resolve_existing
-from .sony_xml import pair_sidecar
+from .sony_xml import assess_sidecar, pair_sidecar
 
 CANDIDATE_EXTENSIONS = {".mp4", ".mov", ".mxf", ".mts", ".m2ts"}
 MAX_FOLDER_FILES = 500
@@ -65,8 +65,15 @@ def file_record(path: Path, ffprobe: str, cancel=None) -> dict:
         "trim_out": probed.get("duration") or 0.0,
         "duplicate": False,
         "recipe": default_recipe(),
-        "sidecar": pair_sidecar(resolved),
+        "sidecar": _with_assessment(pair_sidecar(resolved), probed),
     }
+
+
+def _with_assessment(sidecar: dict, probe: dict) -> dict:
+    checked = dict(sidecar)
+    if checked.get("status") == "ok":
+        checked["assessment"] = assess_sidecar(checked, probe)
+    return checked
 
 
 def import_path(raw: str, ffprobe: str, cancel=None) -> dict:

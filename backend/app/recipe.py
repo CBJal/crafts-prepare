@@ -103,6 +103,37 @@ def normalize_recipe(payload: dict | None, previous: dict | None = None) -> dict
     return base
 
 
+def assert_stored_recipe(recipe: dict) -> dict:
+    """Validate a recipe loaded from a project or a queued snapshot.
+
+    Numeric fields must be finite even when they were not part of a new patch.
+    A LUT path is kept when the file is missing so the project can still open
+    and the missing file can be repaired. Queueing still snapshots bytes it
+    can read.
+    """
+    if not isinstance(recipe, dict):
+        raise CraftsError("A recipe must be an object.", code="bad_recipe")
+    numbers = {
+        key: value
+        for key, value in recipe.items()
+        if key not in {"input_lut", "look_lut", "input_lut_sha256", "look_lut_sha256"}
+    }
+    checked = normalize_recipe(numbers)
+    for key in ("input_lut", "look_lut"):
+        if key not in recipe or recipe.get(key) in (None, ""):
+            continue
+        path = recipe.get(key)
+        if not isinstance(path, str) or not path.strip() or len(path) > 4096 or "\x00" in path:
+            raise CraftsError(f"{key} path is invalid.", code="bad_lut")
+        checked[key] = path
+        digest_key = f"{key}_sha256"
+        digest = recipe.get(digest_key) or ""
+        if digest and (not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
+            raise CraftsError(f"{key} checksum is invalid.", code="bad_lut")
+        checked[digest_key] = digest if path else ""
+    return checked
+
+
 def recipe_fingerprint(recipe: dict) -> str:
     body = json.dumps(recipe, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]

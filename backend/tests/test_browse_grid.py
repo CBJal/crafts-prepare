@@ -76,8 +76,8 @@ def test_thirty_five_clip_grid_themes_and_comparison(qapp, tmp_path, monkeypatch
     shots.mkdir()
     try:
         window.import_paths([str(folder)])
-        assert window.grid.item_count() >= 35
         assert window.wait_until_idle(120000)
+        assert window.grid.item_count() >= 35
         assert len(window.clips) == 35
         assert window.grid.item_count() == 36
         assert any(item.get("error") for item in window.grid._items.values())

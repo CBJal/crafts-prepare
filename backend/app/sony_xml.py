@@ -89,6 +89,7 @@ def parse_sidecar_text(text: str) -> dict:
     conflicts: list[str] = []
     duration = None
     target_duration = None
+    target_umid = ""
     video: dict[str, str] = {}
     device: dict[str, str] = {}
     gyro_announced = False
@@ -98,6 +99,9 @@ def parse_sidecar_text(text: str) -> dict:
             if duration is None:
                 duration = element.get("value")
         if name == "TargetMaterial":
+            for attr in ("umid", "umidRef", "UMID"):
+                if element.get(attr) and not target_umid:
+                    target_umid = str(element.get(attr))
             for child in list(element):
                 if _local(child.tag) == "Duration" and child.get("value"):
                     target_duration = child.get("value")
@@ -137,6 +141,7 @@ def parse_sidecar_text(text: str) -> dict:
         "message": "Sidecar parsed.",
         "duration_frames": _frame_count(duration),
         "target_duration_frames": _frame_count(target_duration),
+        "target_umid": target_umid,
         "video": video,
         "device": {key: device.get(key) for key in ("manufacturer", "modelName", "serialNo") if device.get(key)},
         "gamma_raw": gamma,
@@ -246,6 +251,95 @@ def pair_sidecar(media: Path) -> dict:
     except OSError:
         chosen["sha256"] = ""
     return chosen
+
+
+def _norm_identity(value: str) -> str:
+    return "".join(char for char in value.casefold() if char.isalnum())
+
+
+def _tag_identity(probe: dict | None, names: set[str]) -> str:
+    """Read an embedded identity. Absence is empty, which the caller reports as unknown."""
+    if not isinstance(probe, dict):
+        return ""
+    bags: list[dict] = []
+    tags = probe.get("tags")
+    if isinstance(tags, dict):
+        bags.append(tags)
+    videos = probe.get("video") if isinstance(probe.get("video"), list) else []
+    for video in videos:
+        if isinstance(video, dict) and isinstance(video.get("tags"), dict):
+            bags.append(video["tags"])
+    for bag in bags:
+        for key, value in bag.items():
+            if str(key).casefold() in names and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def _clip_frame_count(video: dict, probe: dict | None) -> int | None:
+    counted = video.get("nb_frames")
+    if isinstance(counted, int) and counted > 0:
+        return counted
+    duration = (probe or {}).get("duration")
+    rate = str(video.get("frame_rate") or "")
+    if duration in (None, "") or "/" not in rate:
+        return None
+    num_s, den_s = rate.split("/", 1)
+    try:
+        seconds = float(duration)
+        fps = int(num_s) / int(den_s)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if seconds <= 0 or fps <= 0:
+        return None
+    return int(round(seconds * fps))
+
+
+def assess_sidecar(sidecar: dict | None, probe: dict | None) -> dict:
+    """Compare sidecar facts with the clip where both sides actually exist.
+
+    A missing embedded serial or material id is ``unknown``. It is not filled
+    in from the filename or from the other clip in the folder. A duration or
+    identity that exists on both sides and disagrees is a mismatch.
+    """
+    sidecar = sidecar if isinstance(sidecar, dict) else {}
+    videos = (probe or {}).get("video") if isinstance(probe, dict) else None
+    video = videos[0] if isinstance(videos, list) and videos and isinstance(videos[0], dict) else {}
+    issues: list[str] = []
+    duration_state = "unavailable"
+    frames = sidecar.get("duration_frames")
+    counted = _clip_frame_count(video, probe if isinstance(probe, dict) else None)
+    if isinstance(frames, int) and counted is not None:
+        if abs(frames - counted) <= 1:
+            duration_state = "match"
+        else:
+            duration_state = "mismatch"
+            issues.append(f"Sidecar duration is {frames} frames and the file has about {counted}.")
+    target_state = "unknown"
+    xml_umid = str(sidecar.get("target_umid") or "")
+    file_umid = _tag_identity(probe if isinstance(probe, dict) else None, {"umid", "umidref", "material_umid", "target_umid"})
+    if xml_umid and file_umid:
+        target_state = "match" if _norm_identity(xml_umid) == _norm_identity(file_umid) else "mismatch"
+        if target_state == "mismatch":
+            issues.append("Target identity in the sidecar does not match the file.")
+    camera_state = "unknown"
+    device = sidecar.get("device") if isinstance(sidecar.get("device"), dict) else {}
+    xml_serial = str(device.get("serialNo") or "")
+    file_serial = _tag_identity(
+        probe if isinstance(probe, dict) else None,
+        {"serial", "serialno", "serial_number", "device_serial"},
+    )
+    if xml_serial and file_serial:
+        camera_state = "match" if _norm_identity(xml_serial) == _norm_identity(file_serial) else "mismatch"
+        if camera_state == "mismatch":
+            issues.append("Camera serial in the sidecar does not match the file.")
+    return {
+        "duration": duration_state,
+        "target": target_state,
+        "camera": camera_state,
+        "file_frame_count": counted,
+        "issues": issues,
+    }
 
 
 def pipeline_from_sidecar(sidecar: dict) -> str | None:

@@ -219,9 +219,39 @@ def run_smoke(
         window.select_all_batch()
         _apply_export(window, settings.get("export") or {})
         gyro_settings = settings.get("gyro") or {}
+        gyro_expect = gyro_settings.get("expect")
         if gyro_settings:
             for clip in list(window.clips):
-                window.service.update_clip(clip["id"], {"recipe": {"gyro_enabled": True}})
+                recipe = {"gyro_enabled": True}
+                if "smoothness" in gyro_settings:
+                    recipe["gyro_smoothness"] = float(gyro_settings["smoothness"])
+                if "fov" in gyro_settings:
+                    recipe["gyro_fov"] = float(gyro_settings["fov"])
+                if "horizon" in gyro_settings:
+                    recipe["gyro_horizon"] = float(gyro_settings["horizon"])
+                window.service.update_clip(clip["id"], {"recipe": recipe})
+            window.clips = window.service.clips()
+        gyro_compare_ok = True
+        if gyro_expect == "succeeded" and window.clips:
+            window.focus_clip(window.clips[0]["id"])
+            window._show_mode(1)
+            window.gyro_enabled.setChecked(True)
+            window.update_stabilization_preview()
+            gyro_compare_ok = wait_signal(
+                lambda: bool(window.comparison_used_gyro) and window.compare.frames_presented > 0,
+                int(gyro_settings.get("timeout_ms") or 180000),
+            )
+            proof["steps"].append(
+                {
+                    "step": "gyro-comparison",
+                    "ok": gyro_compare_ok,
+                    "detail": window.gyro_status.text(),
+                    "preview": window.preview_status.text(),
+                    "geometry": window.playback_result,
+                }
+            )
+            if not gyro_compare_ok:
+                code = 2
         window.queue_checked_batch("prepare")
         _wait_jobs(app, service, window)
         jobs = _job_rows(service)

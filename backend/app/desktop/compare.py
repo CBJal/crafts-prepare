@@ -40,7 +40,7 @@ class CompareView(QWidget):
         self._wipe = 0.5
         self._dragging = False
         self.time_label = QLabel("Same frame")
-        self.time_label.setObjectName("timeLabel")
+        self.time_label.setObjectName("compareTime")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.time_label, 0, Qt.AlignmentFlag.AlignTop)

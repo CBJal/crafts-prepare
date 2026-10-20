@@ -115,7 +115,8 @@ def test_dark_selection_is_not_a_white_row(qapp, window):
     window.resize(1280, 800)
     qapp.processEvents()
     card = window.grid._cards["clip-a"]
-    color = card.grab().toImage().pixelColor(8, 8)
+    # The selection ring is the card chrome. The picture well inside it stays dark.
+    color = card.grab().toImage().pixelColor(1, 1)
     assert color.blue() > color.red()
     assert color.lightness() < 180
     assert not (color.red() > 220 and color.green() > 220 and color.blue() > 220)

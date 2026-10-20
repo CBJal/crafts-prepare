@@ -16,7 +16,6 @@ from ..recipe import recipe_fingerprint
 from .grade import clip_recipe, safe_filters
 
 MAX_PENDING = 3
-MAX_QUEUED = 40
 
 
 def thumbnail_key(clip: dict, *, adjusted: bool, width: int = 320) -> str:
@@ -30,6 +29,7 @@ def thumbnail_key(clip: dict, *, adjusted: bool, width: int = 320) -> str:
             str(sidecar.get("sha256") or ""),
             str(recipe.get("look_lut_sha256") or ""),
             str(recipe.get("input_lut_sha256") or ""),
+            str((((clip.get("probe") or {}).get("video") or [{}])[0] or {}).get("rotation") or 0),
             str(width),
         )
     )
@@ -73,8 +73,8 @@ class ThumbnailHub(QObject):
                 if key in self._inflight or any(item[1] == key for item in self._waiting):
                     continue
                 if len(self._inflight) >= MAX_PENDING:
-                    if len(self._waiting) < MAX_QUEUED:
-                        self._waiting.append((generation, key, clip, adjusted))
+                    # Demand stays queued. A full waiting list is not a reason to drop a clip.
+                    self._waiting.append((generation, key, clip, adjusted))
                     continue
                 self._start_locked(generation, key, clip, adjusted)
 
@@ -103,20 +103,24 @@ class ThumbnailHub(QObject):
         try:
             if generation != self.generation or cancel.is_set():
                 return
-            path, error = self._encode(clip, adjusted=adjusted, key=key, cancel=cancel)
+            path, error = self._encode(clip, adjusted=adjusted, key=key, cancel=cancel, generation=generation)
         except Exception as exc:  # noqa: BLE001
             if generation == self.generation:
                 self.ready.emit(generation, clip_id, "", str(exc)[:180])
             return
         finally:
             with self._lock:
-                self._inflight.pop(key, None)
+                current = self._inflight.get(key)
+                # A newer generation may already own this key. Only the worker
+                # that started it is allowed to remove that entry.
+                if current is not None and current[0] == generation:
+                    self._inflight.pop(key, None)
             self._pump()
         if generation != self.generation or cancel.is_set():
             return
         self.ready.emit(generation, clip_id, path, error)
 
-    def _encode(self, clip: dict, *, adjusted: bool, key: str, cancel: threading.Event) -> tuple[str, str]:
+    def _encode(self, clip: dict, *, adjusted: bool, key: str, cancel: threading.Event, generation: int) -> tuple[str, str]:
         destination = self._cache_path(key)
         if destination.is_file() and destination.stat().st_size > 0:
             return str(destination), ""
@@ -125,7 +129,7 @@ class ThumbnailHub(QObject):
         work = self.service.data_dir / "thumb-src" / key
         filters, files, message = safe_filters(clip, work, adjusted=adjusted, cache=cache)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        partial = destination.with_name(destination.name + f".{key}.partial.jpg")
+        partial = destination.with_name(f".{key}.{generation}.partial.jpg")
         duration = float((clip.get("probe") or {}).get("duration") or 0)
         seconds = min(0.2, max(0.0, duration / 2 if duration else 0.0))
         extract_thumbnail(
@@ -139,11 +143,15 @@ class ThumbnailHub(QObject):
             extra_filters=filters or None,
             stage_files=files or None,
         )
-        if cancel.is_set():
+        if cancel.is_set() or generation != self.generation:
             partial.unlink(missing_ok=True)
             return "", "cancelled"
         if not partial.is_file() or partial.stat().st_size == 0:
             partial.unlink(missing_ok=True)
             return "", "Thumbnail failed"
-        partial.replace(destination)
+        with self._lock:
+            if generation != self.generation or cancel.is_set():
+                partial.unlink(missing_ok=True)
+                return "", "cancelled"
+            partial.replace(destination)
         return str(destination), message

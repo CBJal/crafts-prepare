@@ -10,7 +10,7 @@ from pathlib import Path
 from .errors import Cancelled, CraftsError
 from .filters import FilterSpec, chain_for, detect_chain
 from .presets import PRESETS, conversion_note
-from .probe import Rational, parse_rational, probe_file
+from .probe import Rational, display_dimensions, normalize_rotation, parse_rational, probe_file
 from .process import run_captured
 from .security import exclusive_output, partial_path, publish_exclusive, safe_filename, safe_suffix
 
@@ -41,6 +41,7 @@ def build_export_args(
     crf: int | None,
     filter_chain: str | None,
     output_color: dict | None = None,
+    noautorotate: bool = False,
 ) -> list[str]:
     args = [
         ffmpeg,
@@ -50,6 +51,12 @@ def build_export_args(
         "-progress",
         "pipe:1",
         "-nostats",
+    ]
+    if noautorotate:
+        # Pixels are already upright. A second autorotate would turn them again.
+        args.append("-noautorotate")
+    args.extend(
+        [
         "-i",
         str(source),
         "-ss",
@@ -58,7 +65,8 @@ def build_export_args(
         f"{duration:.6f}",
         "-frames:v",
         str(frames),
-    ]
+        ]
+    )
     if filter_chain:
         # One argv value. A removed file-option form is not used.
         args.extend(["-vf", filter_chain])
@@ -83,18 +91,17 @@ def build_export_args(
     if preset["container"] == "mp4":
         args.extend(["-movflags", "+faststart"])
     if output_color:
-        args.extend(
-            [
-                "-colorspace",
-                str(output_color["colorspace"]),
-                "-color_primaries",
-                str(output_color["primaries"]),
-                "-color_trc",
-                str(output_color["trc"]),
-                "-color_range",
-                str(output_color["range"]),
-            ]
-        )
+        for key, flag in (
+            ("colorspace", "-colorspace"),
+            ("primaries", "-color_primaries"),
+            ("trc", "-color_trc"),
+            ("range", "-color_range"),
+        ):
+            if output_color.get(key):
+                args.extend([flag, str(output_color[key])])
+    # Rotation is applied once, on decode. Do not leave a display matrix that
+    # would rotate the finished pixels a second time.
+    args.extend(["-metadata:s:v:0", "rotate=0"])
     args.extend(["-f", preset["container"], str(partial)])
     return args
 
@@ -143,6 +150,7 @@ def run_export(
     extra_filters: str | None = None,
     stage_files: dict[str, Path] | None = None,
     output_color: dict | None = None,
+    noautorotate: bool = False,
 ) -> dict:
     preset = PRESETS.get(preset_id)
     if preset is None:
@@ -161,6 +169,11 @@ def run_export(
     video = (probe.get("video") or [None])[0]
     if not video:
         raise CraftsError("The clip has no video stream.", code="unreadable_media")
+    if "rotation" not in video:
+        fresh = probe_file(ffprobe, source, cancel=cancel)
+        if fresh.get("video"):
+            probe = fresh
+            video = fresh["video"][0]
     rate = Rational(int(video["frame_rate_num"]), int(video["frame_rate_den"]))
     if rate.num <= 0 or rate.den <= 0:
         raise CraftsError("The source frame rate is not a usable rational.", code="bad_rate")
@@ -244,6 +257,10 @@ def run_export(
         filter_chain = chain_for(spec)
         if extra_filters:
             filter_chain = extra_filters if not filter_chain else f"{extra_filters},{filter_chain}"
+        if not noautorotate and normalize_rotation(video.get("rotation")) in {90, 270} and not filter_chain:
+            # An empty graph can skip display rotation. One no-op filter makes
+            # FFmpeg apply the stored rotation exactly once before encode.
+            filter_chain = "setsar=1"
         chosen_crf = crf if crf is not None else preset.get("crf_default")
         args = build_export_args(
             ffmpeg=ffmpeg,
@@ -259,6 +276,7 @@ def run_export(
             crf=chosen_crf,
             filter_chain=filter_chain or None,
             output_color=output_color,
+            noautorotate=noautorotate,
         )
 
         def on_line(line: str) -> None:
@@ -278,8 +296,8 @@ def run_export(
             frames=frames,
             duration=span,
             spec=spec,
-            source_w=int(video["width"]),
-            source_h=int(video["height"]),
+            source_w=(int(video["width"]) if noautorotate else display_dimensions(video)[0]),
+            source_h=(int(video["height"]) if noautorotate else display_dimensions(video)[1]),
             pix_fmt=preset["pix_fmt"],
             audio=audio,
             output_color=output_color,
@@ -383,6 +401,8 @@ def _validate_output(
             "color_range": output_color["range"],
         }
         for key, want in expected.items():
+            if not want:
+                continue
             got = (video.get(key) or "").casefold()
             if key == "color_range" and not got and (video.get("codec") or "") == "prores":
                 # ProRes does not store color_range. The scale filter still wrote limited-range samples.

@@ -408,6 +408,60 @@ class Service:
                 return clip
         raise CraftsError("Clip not found.", code="not_found", status=404)
 
+    def refresh_metadata(self, clip_ids: list[str]) -> dict:
+        """Re-probe and re-pair selected clips in place. Recipes are kept.
+
+        Re-import deduplicates by checksum and does not refresh a clip that is
+        already in the project. This is the path that repairs a changed or
+        missing sidecar. A missing source is reported and does not wipe the clip.
+        """
+        from .importer import sha256_file
+        from .probe import probe_file
+        from .sony_xml import assess_sidecar, pair_sidecar
+
+        _ffmpeg, ffprobe = self._tools()
+        results = []
+        with self.lock:
+            for clip_id in clip_ids:
+                clip = self._clip(clip_id)
+                path = Path(clip["path"])
+                recipe = clip.get("recipe") if isinstance(clip.get("recipe"), dict) else None
+                if not path.is_file():
+                    side = dict(clip.get("sidecar") or {})
+                    side["refresh"] = "missing"
+                    side["message"] = "The source file is missing, so metadata was not replaced. The saved recipe was kept."
+                    clip["sidecar"] = side
+                    clip["source_missing"] = True
+                    results.append({"id": clip_id, "status": "missing", "recipe_kept": recipe is not None})
+                    continue
+                probed = probe_file(ffprobe, path)
+                sidecar = pair_sidecar(path)
+                if sidecar.get("status") == "ok":
+                    sidecar["assessment"] = assess_sidecar(sidecar, probed)
+                clip["probe"] = probed
+                clip["sidecar"] = sidecar
+                clip["sha256"] = sha256_file(path)
+                stat = path.stat()
+                clip["size"] = stat.st_size
+                clip["device"] = stat.st_dev
+                clip["inode"] = stat.st_ino
+                clip["source_missing"] = False
+                if recipe is not None:
+                    clip["recipe"] = recipe
+                duration = float(probed.get("duration") or 0)
+                if duration and float(clip.get("trim_out") or 0) > duration + 0.05:
+                    clip["trim_out"] = duration
+                results.append(
+                    {
+                        "id": clip_id,
+                        "status": "refreshed",
+                        "assessment": sidecar.get("assessment") or {},
+                        "recipe_kept": recipe is not None,
+                    }
+                )
+            self._persist()
+        return {"clips": results}
+
     def update_clip(self, clip_id: str, patch: dict) -> dict:
         with self.lock:
             clip = self._clip(clip_id)
@@ -1421,6 +1475,10 @@ def _validate_stored_clip(clip: object, seen: set[str]) -> dict:
     checked["markers"] = markers
     checked["trim_in"] = trim_in
     checked["trim_out"] = trim_out
+    if isinstance(clip.get("recipe"), dict):
+        from .recipe import assert_stored_recipe
+
+        checked["recipe"] = assert_stored_recipe(clip["recipe"])
     return checked
 
 
@@ -1673,6 +1731,9 @@ def _validate_prepare_request(request: dict, clip_ids: set[str]) -> None:
     for key in ("input_lut", "look_lut"):
         if recipe.get(key) not in (None, "") and not isinstance(recipe.get(key), str):
             raise CraftsError("Prepare LUT path is invalid.", code="bad_project")
+    from .recipe import assert_stored_recipe
+
+    assert_stored_recipe(recipe)
 
 
 def _validate_gyro_request(request: dict, clip_ids: set[str]) -> None:

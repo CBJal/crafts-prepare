@@ -500,6 +500,13 @@ def run_gyroflow(
             )
             if stabilization:
                 motion["stabilization_written"] = _write_stabilization(project, stabilization)
+            rotation = (output_settings or {}).get("rotation")
+            if rotation is not None:
+                written = _write_video_rotation(project, rotation)
+                motion["stabilization_written"] = {
+                    **(motion.get("stabilization_written") or {}),
+                    **written,
+                }
         # A loaded .gyroflow project or preset overrides CLI --out-params with its
         # own output_folder and output_filename. Rewrite those fields on owned
         # copies so the external tool can only target this job's staging file.
@@ -606,13 +613,16 @@ def run_gyroflow(
 
 
 def _automatic_contract(chosen: dict, settings: dict, media: Path, ffprobe: str, filename: str) -> dict:
+    from .probe import display_dimensions
+
     width = settings.get("width")
     height = settings.get("height")
     if not width or not height:
         probed = probe_file(ffprobe, media)
         video = (probed.get("video") or [None])[0] or {}
-        width = video.get("width")
-        height = video.get("height")
+        # Upright size, not the stored landscape raster. A 90° 3840×2160 clip
+        # is 2160×3840 after one rotation; forcing the stored size center-crops it.
+        width, height = display_dimensions(video)
     if isinstance(width, bool) or isinstance(height, bool) or not isinstance(width, int) or not isinstance(height, int):
         raise CraftsError(
             "Source dimensions could not be read, so the gyro output size was not left to a preset.",
@@ -737,6 +747,29 @@ def _write_stabilization(project: Path, values: dict) -> dict:
     payload["stabilization"] = current
     project.write_text(json.dumps(payload), encoding="utf-8")
     return written
+
+
+def _write_video_rotation(project: Path, rotation) -> dict:
+    """Record display rotation without swapping the stored video_info size.
+
+    Gyroflow 1.6.3 reads ``video_info.rotation`` into ``params.video_rotation``.
+    ``set_output_size`` then treats 90° and 270° as a swapped canvas. The
+    output width and height must be that upright canvas. ``video_info.width``
+    stays the coded size the file actually stores.
+    """
+    from .probe import normalize_rotation
+
+    angle = normalize_rotation(rotation)
+    payload = json.loads(project.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise CraftsError("The exported Gyroflow project is not an object.", code="gyro_stage")
+    info = payload.get("video_info")
+    if not isinstance(info, dict):
+        info = {}
+    info["rotation"] = float(angle)
+    payload["video_info"] = info
+    project.write_text(json.dumps(payload), encoding="utf-8")
+    return {"video_rotation": angle}
 
 
 def _prepare_embedded_project(

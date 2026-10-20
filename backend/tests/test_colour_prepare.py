@@ -37,9 +37,9 @@ def _xml(gamma: str, primaries: str, coding: str, *, gyro: bool = True) -> str:
     </Group>"""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.00">
-  <Duration value="120"/>
+  <Duration value="50"/>
   <TargetMaterial umidRef="060A2B340101010501010D4313000000SYNTHETIC0001">
-    <Duration value="120"/>
+    <Duration value="50"/>
   </TargetMaterial>
   <VideoFormat>
     <VideoFrame captureFps="50p" formatFps="50p" videoCodec="AVC_3840_2160"/>
@@ -81,7 +81,7 @@ def test_sidecar_pairing_cases(tmp_path: Path):
     assert paired["status"] == "ok"
     assert paired["gamma"] == "slog3"
     assert paired["primaries"] == "sgamut3cine"
-    assert paired["duration_frames"] == 120
+    assert paired["duration_frames"] == 50
     assert paired["gyro_announced"] is True
     assert paired["gyro_samples"] is False
     profile = resolve_profile(paired, {"video": [{"color_range": "tv"}]}, "auto")
@@ -346,8 +346,8 @@ def test_cold_cache_cube_writers(tmp_path: Path):
     import threading
 
     plan = build_plan(
-        pipeline="slog3_sgamut3cine",
-        input_range="pc",
+        pipeline="hlg_bt2020",
+        input_range="tv",
         exposure_ev=0,
         contrast=1,
         saturation=1,
@@ -372,7 +372,38 @@ def test_cold_cache_cube_writers(tmp_path: Path):
     assert errors == []
     published = list(cache.glob("technical-*.cube"))
     assert len(published) == 1
-    assert "LUT_3D_SIZE" in published[0].read_text(encoding="utf-8")[:40]
+    with published[0].open("rb") as handle:
+        assert b"LUT_3D_SIZE" in handle.read(40)
+    slog = build_plan(
+        pipeline="slog3_sgamut3cine",
+        input_range="pc",
+        exposure_ev=0,
+        contrast=1,
+        saturation=1,
+        has_input_lut=False,
+        has_look_lut=False,
+        look_includes_camera=False,
+    )
+    slog_errors: list[BaseException] = []
+
+    def slog_once(index: int) -> None:
+        try:
+            ensure_plan_cubes(slog, tmp_path / f"slog-{index}", cache=cache)
+        except BaseException as exc:  # noqa: BLE001
+            slog_errors.append(exc)
+
+    slog_threads = [threading.Thread(target=slog_once, args=(index,)) for index in range(3)]
+    for thread in slog_threads:
+        thread.start()
+    for thread in slog_threads:
+        thread.join()
+    assert slog_errors == []
+    decode = list(cache.glob("slog-decode-*.cube"))
+    encode = list(cache.glob("slog-encode-*.cube"))
+    assert len(decode) == 1
+    assert len(encode) == 1
+    with decode[0].open("rb") as handle:
+        assert b"LUT_1D_SIZE" in handle.read(40)
     assert list(cache.glob("*.tmp")) == []
 
 

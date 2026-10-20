@@ -48,10 +48,16 @@ BT2020_PRIMARIES = ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046))
 SGAMUT3CINE_PRIMARIES = ((0.766, 0.275), (0.225, 0.800), (0.089, -0.087))
 REC709_LUMA = (0.2126, 0.7152, 0.0722)
 BT2020_LUMA = (0.2627, 0.6780, 0.0593)
-# 65 points keeps the S-Log3 knee and the 90% white clip within about 0.01
-# of the reference after trilinear interpolation. 33 points were about 0.03 off
-# near that boundary. The bound is checked on exported pixels, not loosened.
+# HLG still uses a 65³ lattice because its OOTF depends on luma. S-Log3 does
+# not: it is a per-channel curve, an exact matrix, and a per-channel encode.
+# A 65³ S-Log lattice was about 0.017 off near white on Windows, outside the
+# 0.02 patch bound. The 1D tables below are what the S-Log path ships.
 LUT_SIZE = 65
+LUT1D_SIZE = 4096
+# S-Log3 code 1.0 is about 38.4 reflectance. The gamut matrix can raise one
+# channel to roughly twice that. Dividing by 128 keeps the linear sample in
+# 0..1 so the next 1D table is not clipped before the white map.
+SCENE_SCALE = 128.0
 
 
 def _clamp01(value: float) -> float:
@@ -376,16 +382,24 @@ def _cube_lock(path: Path) -> threading.Lock:
         return lock
 
 
-def _cube_ready(path: Path) -> bool:
-    if not path.is_file():
-        return False
+def _header_has(path: Path, marker: str) -> bool:
+    """True when the first 80 bytes contain the LUT size marker.
+
+    Reading the whole cube just to check the header is avoided: a 65³ file
+    is several megabytes, and this check runs on every cache hit.
+    """
     try:
-        if path.stat().st_size < 32:
+        if not path.is_file() or path.stat().st_size < 24:
             return False
-        head = path.read_text(encoding="utf-8")[:80]
+        with path.open("rb") as handle:
+            head = handle.read(80)
     except OSError:
         return False
-    return "LUT_3D_SIZE" in head
+    return marker.encode("ascii") in head
+
+
+def _cube_ready(path: Path) -> bool:
+    return _header_has(path, "LUT_3D_SIZE")
 
 
 def _cached_cube(directory: Path, name: str, function) -> None:
@@ -406,11 +420,112 @@ def _cached_cube(directory: Path, name: str, function) -> None:
             raise CraftsError("The colour LUT was not published.", code="colour")
 
 
-def ensure_plan_cubes(plan: ColourPlan, directory: Path, *, cache: Path | None = None) -> list[str]:
-    """Write owned cubes. Returns filter fragments that must run in ``directory``.
+def write_lut1d(path: Path, function, *, size: int = LUT1D_SIZE) -> None:
+    if not 2 <= size <= 16384:
+        raise CraftsError("LUT size is out of range.", code="colour")
+    step = 1.0 / (size - 1)
+    lines = [f"LUT_1D_SIZE {size}", ""]
+    for index in range(size):
+        value = float(function(index * step))
+        if not math.isfinite(value):
+            value = 0.0
+        value = min(1.0, max(0.0, value))
+        lines.append(f"{value:.8f} {value:.8f} {value:.8f}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    Preserve-input with no grade and no LUT does not insert a filter, so the
-    stored samples are not reinterpreted.
+
+def _lut1d_ready(path: Path) -> bool:
+    return _header_has(path, "LUT_1D_SIZE")
+
+
+def _cached_lut1d(directory: Path, name: str, function) -> None:
+    destination = directory / name
+    lock = _cube_lock(destination)
+    with lock:
+        if _lut1d_ready(destination):
+            return
+        temporary = directory / f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            write_lut1d(temporary, function)
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists() and not _lut1d_ready(destination):
+                temporary.unlink(missing_ok=True)
+        if not _lut1d_ready(destination):
+            raise CraftsError("The colour LUT was not published.", code="colour")
+
+
+def _stage_lut1d(store: Path, directory: Path, cache_name: str, local_name: str, function) -> None:
+    _cached_lut1d(store, cache_name, function)
+    source = store / cache_name
+    target = directory / local_name
+    if source.resolve() == target.resolve():
+        return
+    temporary = directory / f".{local_name}.{uuid.uuid4().hex}.tmp"
+    temporary.write_bytes(source.read_bytes())
+    os.replace(temporary, target)
+
+
+def _matrix_mixer(matrix: tuple[tuple[float, float, float], ...]) -> str:
+    parts = []
+    for prefix, row in zip(("r", "g", "b"), matrix):
+        parts.append(f"{prefix}r={row[0]:.8f}:{prefix}g={row[1]:.8f}:{prefix}b={row[2]:.8f}:{prefix}a=0")
+    return "colorchannelmixer=" + ":".join(parts)
+
+
+def _saturation_mixer(amount: float) -> str:
+    red, green, blue = REC709_LUMA
+    keep = 1.0 - amount
+    rows = (
+        (amount + keep * red, keep * green, keep * blue),
+        (keep * red, amount + keep * green, keep * blue),
+        (keep * red, keep * green, amount + keep * blue),
+    )
+    return _matrix_mixer(rows)
+
+
+def _slog_decode_sample(plan: ColourPlan, code: float) -> float:
+    gain = 2.0 ** plan.exposure_ev
+    linear = max(0.0, slog3_decode(code)) * gain
+    return min(1.0, max(0.0, _contrast(linear, plan.contrast) / SCENE_SCALE))
+
+
+def _slog_display_sample(scaled: float) -> float:
+    return _clamp01(scaled * SCENE_SCALE / SLOG3_WHITE_REFLECTANCE)
+
+
+def _slog_encode_sample(scaled: float) -> float:
+    return rec709_oetf(_slog_display_sample(scaled))
+
+
+def _oetf_sample(value: float) -> float:
+    return rec709_oetf(_clamp01(value))
+
+
+def _slog_fragments(plan: ColourPlan, store: Path, directory: Path) -> list[str]:
+    """S-Log3 once: 1D decode, exact matrix, then 1D Rec.709 encode."""
+    key = plan.cache_key()
+    _stage_lut1d(store, directory, f"slog-decode-{key}.cube", "slog-decode.cube", lambda code: _slog_decode_sample(plan, code))
+    fragments = ["lut1d=file=slog-decode.cube", _matrix_mixer(SGAMUT3CINE_TO_REC709)]
+    if plan.saturation == 1.0:
+        _stage_lut1d(store, directory, f"slog-encode-{key}.cube", "slog-encode.cube", _slog_encode_sample)
+        fragments.append("lut1d=file=slog-encode.cube")
+        return fragments
+    _stage_lut1d(store, directory, f"slog-display-{key}.cube", "slog-display.cube", _slog_display_sample)
+    _stage_lut1d(store, directory, "rec709-oetf.cube", "rec709-oetf.cube", _oetf_sample)
+    fragments.append("lut1d=file=slog-display.cube")
+    fragments.append(_saturation_mixer(plan.saturation))
+    fragments.append("lut1d=file=rec709-oetf.cube")
+    return fragments
+
+
+def ensure_plan_cubes(plan: ColourPlan, directory: Path, *, cache: Path | None = None) -> list[str]:
+    """Write owned tables. Returns filter fragments that must run in ``directory``.
+
+    Preserve-input locks the source range and does not change transfer. S-Log3
+    is a 1D curve plus the exact gamut matrix, so near-white is not a 3D
+    lattice error. HLG stays a 3D lattice because the OOTF is cross-channel.
     """
     if (
         plan.pipeline == "preserve"
@@ -419,7 +534,8 @@ def ensure_plan_cubes(plan: ColourPlan, directory: Path, *, cache: Path | None =
         and not plan.look_name
         and not plan.input_name
     ):
-        return []
+        # Same range in and out, so full-range codes are not rewritten as limited.
+        return [f"scale=in_range={plan.input_range}:out_range={plan.input_range}:flags=accurate_rnd"]
     directory.mkdir(parents=True, exist_ok=True)
     store = cache or directory
     store.mkdir(parents=True, exist_ok=True)
@@ -429,12 +545,12 @@ def ensure_plan_cubes(plan: ColourPlan, directory: Path, *, cache: Path | None =
     else:
         fragments.append("scale=in_range=pc:out_range=pc:flags=accurate_rnd")
     fragments.append("format=gbrpf32le")
-    if plan.technical:
+    if plan.pipeline == "slog3_sgamut3cine" and plan.technical:
+        fragments.extend(_slog_fragments(plan, store, directory))
+    elif plan.technical:
         cached = store / f"technical-{plan.cache_key()}.cube"
         _cached_cube(store, cached.name, lambda rgb: _technical_sample(plan, rgb))
-        if cached.parent != directory:
-            (directory / "technical.cube").write_bytes(cached.read_bytes())
-        elif cached.name != "technical.cube":
+        if cached.resolve() != (directory / "technical.cube").resolve():
             (directory / "technical.cube").write_bytes(cached.read_bytes())
         fragments.append("lut3d=file=technical.cube")
     if plan.input_name:
@@ -444,7 +560,8 @@ def ensure_plan_cubes(plan: ColourPlan, directory: Path, *, cache: Path | None =
     if plan.grade:
         cached = store / f"grade-{plan.cache_key()}.cube"
         _cached_cube(store, cached.name, lambda rgb: _grade_sample(rgb, plan))
-        (directory / "grade-linear.cube").write_bytes(cached.read_bytes())
+        if cached.resolve() != (directory / "grade-linear.cube").resolve():
+            (directory / "grade-linear.cube").write_bytes(cached.read_bytes())
         fragments.append("lut3d=file=grade-linear.cube")
     if plan.look_name and plan.pipeline != "look_includes_camera":
         fragments.append(f"lut3d=file={plan.look_name}")
@@ -464,6 +581,24 @@ def output_tags_for(plan: ColourPlan) -> dict | None:
     if plan.normalizes or plan.pipeline in {"input_lut", "look_includes_camera"}:
         return {"colorspace": "bt709", "primaries": "bt709", "trc": "bt709", "range": "tv"}
     return None
+
+
+def passthrough_tags(probe: dict | None) -> dict | None:
+    """Copy transfer and levels the source actually stores. Missing tags stay omitted."""
+    video = (((probe or {}).get("video") or [{}])[0]) or {}
+    tags: dict[str, str] = {}
+    if video.get("color_space"):
+        tags["colorspace"] = str(video["color_space"])
+    if video.get("color_primaries"):
+        tags["primaries"] = str(video["color_primaries"])
+    if video.get("color_transfer"):
+        tags["trc"] = str(video["color_transfer"])
+    raw = str(video.get("color_range") or "").casefold()
+    if raw in {"pc", "jpeg", "full"}:
+        tags["range"] = "pc"
+    elif raw in {"tv", "mpeg", "limited"}:
+        tags["range"] = "tv"
+    return tags or None
 
 
 def file_sha256(path: Path) -> str:

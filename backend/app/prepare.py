@@ -8,21 +8,21 @@ temporary files and does not publish the requested output.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import threading
 from pathlib import Path
 
-from .colour import build_plan, ensure_plan_cubes, output_tags_for
+from .colour import build_plan, ensure_plan_cubes, file_sha256, output_tags_for, passthrough_tags
 from .errors import Cancelled, CraftsError
 from .export import output_filename, run_export
 from .filters import FilterSpec
 from .gyroflow_cli import run_gyroflow
 from .presets import PRESETS, conversion_note
-from .probe import probe_file
-from .colour import file_sha256
+from .probe import display_dimensions, normalize_rotation, probe_file
 from .recipe import assert_frozen_luts, normalize_recipe, snapshot_lut
 from .security import exclusive_output, resolve_existing, safe_suffix
-from .sony_xml import resolve_profile
+from .sony_xml import assess_sidecar, resolve_profile
 
 
 def _check(cancel: threading.Event) -> None:
@@ -132,6 +132,13 @@ def run_prepare(
         _check(cancel)
         colour_source = source
         colour_probe = probe
+        video = ((probe.get("video") or [None])[0]) or {}
+        if "rotation" not in video:
+            probe = probe_file(ffprobe, source, cancel=cancel)
+            video = ((probe.get("video") or [None])[0]) or {}
+            colour_probe = probe
+        upright_w, upright_h = display_dimensions(video)
+        rotation = normalize_rotation(video.get("rotation"))
         if request.get("gyro_enabled"):
             on_progress(0.02)
             intermediate = work / "gyro-intermediate.mov"
@@ -149,6 +156,9 @@ def run_prepare(
                 output_settings={
                     "format": "prores_422",
                     "audio": bool(request.get("audio", True)) and bool(probe.get("audio")),
+                    "width": upright_w,
+                    "height": upright_h,
+                    "rotation": rotation,
                 },
                 stabilization={
                     "smoothness": recipe["gyro_smoothness"],
@@ -167,11 +177,11 @@ def run_prepare(
             on_progress(0.5)
         _check(cancel)
         _check_sidecar_fingerprint(request, sidecar)
+        _check_sidecar_agreement(sidecar, probe)
         assert_frozen_luts(recipe)
-        input_range = str(profile.get("input_range") or "tv")
-        if colour_source != source:
-            # A limited-range gyro intermediate must not inherit the source's full-range S-Log read.
-            input_range = _range_name(colour_probe, "tv")
+        # Gyroflow 1.6.3 can tag the intermediate TV while preserving code values.
+        # The profile range, not that tag, is the read contract.
+        input_range = colour_input_range(profile)
         plan = build_plan(
             pipeline=str(profile.get("pipeline") or "unknown"),
             input_range=input_range,
@@ -199,6 +209,17 @@ def run_prepare(
             height=request.get("height"),
             stabilization="off",
         )
+        noautorotate = False
+        if colour_source != source:
+            gyro_video = ((colour_probe.get("video") or [None])[0]) or {}
+            gyro_rotation = normalize_rotation(gyro_video.get("rotation"))
+            # Pixels are already the upright frame and a leftover 90/270 tag
+            # would make FFmpeg rotate them a second time.
+            noautorotate = (
+                gyro_rotation in {90, 270}
+                and int(gyro_video.get("width") or 0) == upright_w
+                and int(gyro_video.get("height") or 0) == upright_h
+            )
         result = run_export(
             ffmpeg=ffmpeg,
             ffprobe=ffprobe,
@@ -221,7 +242,8 @@ def run_prepare(
             encoders=encoders,
             extra_filters=",".join(fragments) if fragments else None,
             stage_files=stage_files,
-            output_color=output_tags_for(plan),
+            output_color=output_tags_for(plan) or (passthrough_tags(probe) if plan.pipeline == "preserve" else None),
+            noautorotate=noautorotate,
         )
         published = Path(result["output_path"])
         if work.resolve() in published.resolve().parents or published.resolve() == work.resolve():
@@ -267,14 +289,36 @@ def run_prepare(
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _range_name(probe: dict, fallback: str) -> str:
-    video = ((probe or {}).get("video") or [{}])[0] or {}
-    raw = str(video.get("color_range") or "").casefold()
-    if raw in {"pc", "jpeg", "full"}:
-        return "pc"
-    if raw in {"tv", "mpeg", "limited"}:
-        return "tv"
-    return fallback
+def colour_input_range(profile: dict | None) -> str:
+    """Range used to read code values, including a Gyroflow geometry intermediate.
+
+    A Gyroflow 1.6.3 no-geometry CPU render (``--processing-device -1
+    --no-gpu-decoding``) of a synthetic S-Log fixture tags ProRes as TV and
+    still preserves the source code values exactly. Interpreting that file as
+    full range matches the S-Log formula. Interpreting the same codes as
+    limited range shifts them by about 0.058. The TV tag is not evidence that
+    the codes changed, so the profile's input range stays in force.
+    """
+    return str((profile or {}).get("input_range") or "tv")
+
+
+def gyro_geometry_key(clip: dict, recipe: dict) -> str:
+    """Identity of one original-space geometry render. Colour is not part of it."""
+    video = (((clip.get("probe") or {}).get("video") or [{}])[0]) or {}
+    body = "|".join(
+        (
+            str(clip.get("sha256") or ""),
+            str(clip.get("size") or ""),
+            f"{float(recipe.get('gyro_smoothness') or 0):.6f}",
+            f"{float(recipe.get('gyro_fov') or 0):.6f}",
+            f"{float(recipe.get('gyro_horizon') or 0):.6f}",
+            str(normalize_rotation(video.get("rotation"))),
+            str(video.get("width") or ""),
+            str(video.get("height") or ""),
+            "gyro-geometry-v1",
+        )
+    )
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:24]
 
 
 def _check_sidecar_fingerprint(request: dict, sidecar: dict | None) -> None:
@@ -293,6 +337,18 @@ def _check_sidecar_fingerprint(request: dict, sidecar: dict | None) -> None:
         raise CraftsError(
             "The sidecar changed after this job was queued. Nothing was published. Refresh the clip, then queue it again.",
             code="sidecar_changed",
+        )
+
+
+def _check_sidecar_agreement(sidecar: dict | None, probe: dict | None) -> None:
+    if not isinstance(sidecar, dict) or sidecar.get("status") != "ok":
+        return
+    assessment = assess_sidecar(sidecar, probe)
+    issues = [str(item) for item in assessment.get("issues") or [] if item]
+    if issues:
+        raise CraftsError(
+            " ".join(issues) + " Refresh metadata or repair the sidecar before preparing. Nothing was published.",
+            code="sidecar_mismatch",
         )
 
 
