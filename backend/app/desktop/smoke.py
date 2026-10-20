@@ -133,41 +133,79 @@ def run_smoke(
         if not proof["steps"][-1]["ok"]:
             code = 2
             return code
+        thumbnails = window.grid.item_count()
+        proof["steps"].append({"step": "thumbnails", "ok": thumbnails == len(window.clips) and thumbnails > 0, "count": thumbnails})
+        profiles = []
+        for clip in window.clips:
+            from .grade import describe_clip
+
+            described = describe_clip(clip)
+            profiles.append(
+                {
+                    "name": clip.get("name"),
+                    "sidecar": (described["sidecar"] or {}).get("status"),
+                    "pipeline": (described["profile"] or {}).get("pipeline"),
+                    "source": (described["profile"] or {}).get("source"),
+                    "message": (described["profile"] or {}).get("message"),
+                }
+            )
+        proof["steps"].append({"step": "profiles", "ok": bool(profiles) and all(item.get("pipeline") for item in profiles), "clips": profiles})
         if window.clips:
             window.focus_clip(window.clips[0]["id"])
+        window._show_mode(1)
         window.request_playback()
         window.wait_until_idle(90000)
         playback = _observe_playback(window, wait_signal)
-        window.request_still(False)
+        window.request_comparison()
         window.wait_until_idle(90000)
-        window.request_still(True)
-        window.wait_until_idle(90000)
+        comparison_ok = (
+            abs(window.compare.seconds - window._current_seconds(window.clips[0])) < 0.05
+            if window.clips
+            else False
+        ) and not window.still_original._source.isNull() and not window.still_adjusted._source.isNull()
         grab("viewer")
-        proof["steps"].append({"step": "viewer", "ok": bool(window.still_path) and playback["advanced"], "playback": playback, "still": window.still_path, "detail": window.last_error})
+        proof["steps"].append(
+            {
+                "step": "viewer",
+                "ok": bool(window.still_path) and playback["advanced"],
+                "playback": playback,
+                "still": window.still_path,
+                "detail": window.last_error,
+            }
+        )
+        proof["steps"].append(
+            {
+                "step": "comparison",
+                "ok": comparison_ok,
+                "seconds": window.compare.seconds,
+                "mode": window.compare.mode,
+                "detail": window.preview_status.text(),
+            }
+        )
         window.destination.setText(str(output))
         window.select_all_batch()
         _apply_export(window, settings.get("export") or {})
-        window.queue_checked_batch("export")
-        _apply_gyro(window, settings.get("gyro") or {})
-        window.queue_checked_batch("gyro")
+        gyro_settings = settings.get("gyro") or {}
+        if gyro_settings:
+            for clip in list(window.clips):
+                window.service.update_clip(clip["id"], {"recipe": {"gyro_enabled": True}})
+        window.queue_checked_batch("prepare")
         _wait_jobs(app, service, window)
         jobs = _job_rows(service)
         expectations = settings.get("expect") or {}
-        export_ok = [item for item in jobs if item["kind"] == "export" and item["status"] == "succeeded" and item["honest"]]
-        gyro_rows = [item for item in jobs if item["kind"] == "gyroflow"]
-        gyro_expect = (settings.get("gyro") or {}).get("expect")
-        gyro_good = [item for item in gyro_rows if item["status"] == "succeeded" and item["honest"]]
+        prepare_rows = [item for item in jobs if item["kind"] == "prepare"]
+        prepare_ok = [item for item in prepare_rows if item["status"] == "succeeded" and item["honest"]]
+        gyro_expect = gyro_settings.get("expect")
         min_export = int(expectations.get("min_export_succeeded", len(paths)))
         if gyro_expect == "succeeded":
-            min_gyro = int(expectations.get("min_gyro_succeeded", len(paths)))
-            gyro_ok = len(gyro_good) >= min_gyro and len(gyro_rows) >= min_gyro
+            queue_ok = len(prepare_ok) >= int(expectations.get("min_gyro_succeeded", len(paths)))
         elif gyro_expect == "failed":
-            gyro_ok = bool(gyro_rows) and all(item["status"] == "failed" for item in gyro_rows)
+            queue_ok = bool(prepare_rows) and all(item["status"] == "failed" for item in prepare_rows)
+            queue_ok = queue_ok and not any(Path(str(item.get("output_path") or "")).is_file() for item in prepare_rows)
         else:
-            gyro_ok = True
-        queue_ok = bool(jobs) and len(export_ok) >= min_export and all(item["honest"] for item in jobs) and gyro_ok
+            queue_ok = bool(prepare_rows) and len(prepare_ok) >= min_export and all(item["honest"] for item in jobs)
         grab("queue")
-        proof["steps"].append({"step": "queue", "ok": queue_ok, "jobs": jobs, "export_succeeded": len(export_ok)})
+        proof["steps"].append({"step": "queue", "ok": queue_ok, "jobs": jobs, "export_succeeded": len(prepare_ok)})
         after = {str(path): _sha256(path) for path in paths if path.is_file()}
         proof["source_sha256_before"] = before
         proof["source_sha256_after"] = after

@@ -30,7 +30,12 @@ QListWidget, QTableWidget, QPlainTextEdit, QLineEdit, QSpinBox, QDoubleSpinBox, 
 }
 QTableWidget { gridline-color: #e4e9ee; alternate-background-color: #f3f6f8; }
 QTableWidget::item:hover { background: #e6ebf0; color: #1a2028; }
-QTableWidget::item:selected, QTableWidget::item:selected:hover { background: #2a3340; color: #f7f8f9; }
+QTableWidget::item:selected, QTableWidget::item:selected:hover { background: #1d5fd0; color: #ffffff; }
+QFrame#clipCard { background: #ffffff; border: 1px solid #d7dde3; border-radius: 8px; }
+QFrame#clipCard[selected="true"] { background: #1d5fd0; border: 1px solid #1d5fd0; }
+QFrame#clipCard[selected="true"] QLabel { color: #ffffff; }
+QFrame#clipCard QLabel#cardImage, QFrame#clipCard[selected="true"] QLabel#cardImage { background: #10141a; color: #d5dde6; }
+QFrame#modeSwitch { background: #ffffff; border: 1px solid #d7dde3; border-radius: 8px; }
 QHeaderView::section { background: #f6f7f8; color: #5c6770; padding: 6px; border: 0; border-bottom: 1px solid #d7dde3; }
 QPushButton {
   background: #ffffff; color: #1a2028; border: 1px solid #c9d1d8; border-radius: 6px; padding: 6px 10px;
@@ -106,7 +111,12 @@ QListWidget, QTableWidget, QPlainTextEdit, QLineEdit, QSpinBox, QDoubleSpinBox, 
 }
 QTableWidget { gridline-color: #2a323c; alternate-background-color: #151b22; }
 QTableWidget::item:hover { background: #24303c; color: #e8eef4; }
-QTableWidget::item:selected, QTableWidget::item:selected:hover { background: #3d4b5c; color: #f4f7fa; }
+QTableWidget::item:selected, QTableWidget::item:selected:hover { background: #2f6fed; color: #ffffff; }
+QFrame#clipCard { background: #1c232c; border: 1px solid #313a46; border-radius: 8px; }
+QFrame#clipCard[selected="true"] { background: #2f6fed; border: 1px solid #2f6fed; }
+QFrame#clipCard[selected="true"] QLabel { color: #ffffff; }
+QFrame#clipCard QLabel#cardImage, QFrame#clipCard[selected="true"] QLabel#cardImage { background: #10141a; color: #d5dde6; }
+QFrame#modeSwitch { background: #171c23; border: 1px solid #313a46; border-radius: 8px; }
 QHeaderView::section { background: #171c23; color: #9aa6b2; padding: 6px; border: 0; border-bottom: 1px solid #2c343e; }
 QPushButton {
   background: #222a34; color: #e8eef4; border: 1px solid #313a46; border-radius: 6px; padding: 6px 10px;

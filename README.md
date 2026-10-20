@@ -6,8 +6,9 @@ Open-source local video preparation for Windows and development platforms. The a
 
 Crafts Prepare is a local video-preparation bench for inspecting, trimming, adjusting, visually stabilizing, and batch-exporting footage. It runs on your machine. It does not upload media, create an account, or charge for its own features.
 
-![Light workspace](docs/ui/workspace-light.png)
-![Dark workspace](docs/ui/workspace-dark.png)
+![Light browse](docs/ui/workspace-light.png)
+![Dark browse](docs/ui/workspace-dark.png)
+![Comparison](docs/ui/view-compare.png)
 
 It is an independent app. Sony Catalyst Prepare is a separate product. Public Catalyst help pages were used as a feature checklist only. This repository does not contain Sony code, Sony artwork, or camera footage.
 
@@ -33,7 +34,7 @@ Crafts Prepare does not download or redistribute those tools. A missing tool is 
 
 ## Windows installer
 
-Version 0.2.1 is a native Qt desktop application. The approved silver C mark is `assets/brand/app-icon.png` and `assets/brand/app-icon.ico`. `packaging/make_icon.py` copies that ICO into `packaging/icon.ico`. It does not draw a substitute. See `docs/BRANDING.md`. It does not open a browser and it does not start the loopback web server. `python -m app` is still the optional development web UI and still needs Node the first time you build `frontend/dist`.
+Version 0.3.0 is a native Qt desktop application. The approved silver C mark is `assets/brand/app-icon.png` and `assets/brand/app-icon.ico`. `packaging/make_icon.py` copies that ICO into `packaging/icon.ico`. It does not draw a substitute. See `docs/BRANDING.md`. It does not open a browser and it does not start the loopback web server. `python -m app` is still the optional development web UI and still needs Node the first time you build `frontend/dist`.
 
 On a Windows x64 build machine that already has Python 3.12–3.14 and Inno Setup 6:
 
@@ -46,11 +47,11 @@ The script does not download Python, Inno Setup, FFmpeg, or Gyroflow, and it doe
 - `packaging\output\<yyyyMMdd-HHmmss>\dist\CraftsPrepare\CraftsPrepare.exe`
 - `packaging\output\<yyyyMMdd-HHmmss>\work\`
 - `packaging\output\<yyyyMMdd-HHmmss>\licenses\` — Python, Qt/LGPL, PySide6, and PyInstaller license texts
-- `packaging\output\<yyyyMMdd-HHmmss>\installer\CraftsPrepare-Setup-0.2.1.exe`
+- `packaging\output\<yyyyMMdd-HHmmss>\installer\CraftsPrepare-Setup-0.3.0.exe`
 - `packaging\output\<yyyyMMdd-HHmmss>\installer\SHA256SUMS.txt`
 - `packaging\output\<yyyyMMdd-HHmmss>\installer\build-info.json`
 
-Pass `-OutputRoot` to choose that directory. If it already exists, the script stops and leaves it in place. `CraftsPrepare.exe` carries FileVersion and ProductVersion `0.2.1`. The build is unsigned. Windows may show a SmartScreen prompt until you sign the installer yourself.
+Pass `-OutputRoot` to choose that directory. If it already exists, the script stops and leaves it in place. `CraftsPrepare.exe` carries FileVersion and ProductVersion `0.3.0`. The build is unsigned. Windows may show a SmartScreen prompt until you sign the installer yourself.
 
 The installer uses the same AppId as 0.1.0, so it upgrades `%LOCALAPPDATA%\Programs\Crafts Prepare` and leaves `%LOCALAPPDATA%\CraftsPrepare` settings in place. Uninstall removes program files only. Saved projects stay where you put them.
 
@@ -64,7 +65,7 @@ An installed smoke test is off unless you pass `--smoke`. It drives the real win
 & "$env:LOCALAPPDATA\Programs\Crafts Prepare\CraftsPrepare.exe" --smoke --sample C:\clips\a.mp4 --sample C:\clips\b.mp4 --output C:\clips\out --report C:\clips\out\smoke.json --screenshots C:\clips\out\shots --config C:\clips\smoke.json
 ```
 
-Example `smoke.json` for 10-bit sources that need an acknowledged ProRes export:
+Example `smoke.json` for a preparation export. Gyro is part of the same job when `gyro.expect` is set. `expect: "failed"` is only a negative control and must not leave a finished file:
 
 ```json
 {
@@ -80,14 +81,9 @@ Example `smoke.json` for 10-bit sources that need an acknowledged ProRes export:
     "trim_out": 1.2
   },
   "gyro": {
-    "format": "prores_422",
-    "audio": false,
-    "width": 640,
-    "height": 360,
-    "suffix": "_gyro",
-    "expect": "succeeded"
+    "expect": "failed"
   },
-  "expect": {"min_export_succeeded": 2, "min_gyro_succeeded": 2}
+  "expect": {"min_export_succeeded": 2}
 }
 ```
 
@@ -131,7 +127,15 @@ cd backend && python -m pytest
 
 Tests generate short synthetic videos with the local ffmpeg. They skip a preset when that encoder is missing and print the skip reason. They do not use camera files.
 
-## Using the bench
+## Using the native app
+
+Browse is the first screen. The left column is places and the folder tree, the center is a thumbnail grid, and the right column is metadata. Export is at the top right and opens the queue. View is the correction screen: one transport, Original / Processed / 2-up / wipe of the same frame, and Color, Stabilization, and Metadata.
+
+Each clip keeps its own recipe. A Sony `C0001M01.XML` or `C0001.XML` beside the clip is paired automatically. S-Log3 / S-Gamut3.Cine and HLG / BT.2020 normalize to a documented Rec.709 SDR pipeline. An unknown profile is preserved until you choose one. Exposure is stops of scene light, not an FFmpeg brightness control. An input LUT replaces that normalization. A look LUT runs after it.
+
+Export selected queues one preparation job per clip. When gyro is enabled, Gyroflow renders embedded motion first and FFmpeg then applies colour, LUT, and the final encode. The intermediate is not published. A failed or cancelled stage does not leave a finished file.
+
+The optional web UI (`python -m app`) is still the earlier bench.
 
 1. Type a file or folder path and choose Import. Supported containers are whatever ffprobe can decode. `.mp4`, `.mov`, `.mxf`, `.mts`, and `.m2ts` are the folder candidates.
 2. Read the inspector. Data streams are listed as ffprobe saw them. An empty data list is not a claim that the file has no gyro.

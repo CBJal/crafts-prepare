@@ -18,7 +18,14 @@ The Gyroflow CLI progress lines (`Rendering progress: current/total frames (perc
 
 Public v1.6.3 `src/cli.rs` merges `--out-params` into the default output object, and the comment on those defaults says the project file overrides them. Public `src/rendering/render_queue.rs` then replaces render options from the loaded project's `output` object (`output_folder` as a file URI or absolute path, then `output_filename`). A preset with an `output` object is applied after that. `output_path` remains a backwards-compatible field read before those two. This repository does not copy that implementation.
 
-## Local observation (this implementation session)
+## Local observation (0.3.0 rebuild)
+
+- Ubuntu, Python 3.12.3, system ffmpeg. The backend suite was 148 passed, 2 skipped (Windows share lock; crafts-telemetry binary not built). That is not a Windows UI certification and not a Sony camera test.
+- S-Log3 code 420 decodes to reflectance 0.18 and code 598 is about 90% reflectance. Mapping that 90% reflectance to Rec.709 reference white produces code (1, 1, 1). HLG signal 0.75, after the BT.2100 inverse OETF and reference OOTF, is about 0.203 display-linear, which this pipeline maps to Rec.709 white.
+- A synthetic combined job ran the Gyroflow test double, then FFmpeg colour. The published file was tagged bt709 and the gyro intermediate was removed. A failed gyro stage published nothing.
+- Offscreen Qt screenshots of the production window showed a 35-clip thumbnail grid, mixed sidecar profiles, an unreadable tile, and a two-up comparison of the same frame. Those screenshots are in `docs/ui/`.
+
+## Local observation (earlier session)
 
 - Ubuntu ffmpeg 6.1.1-3ubuntu5, GPL build, with libx264, libx265, prores_ks, dnxhd, vidstab, deshake, lut3d, and eq.
 - Official Gyroflow 1.6.3 `Gyroflow-linux64.tar.gz` was downloaded from the GitHub release and was not committed. Its SHA-256 is `98625e3ce318964d49d3c66f2dc302a9e6c4c138233d9aa6cbd986f687c421c3`. The release notes do not attach a separate checksum file. `--version` prints debug lines and then `Gyroflow v1.6.3 (gh2453)`. On a synthetic 320×180 clip, the unmodified exported project queued `project-output/from-project.mp4` even though `--out-params` named a different folder, and began `from-project.mp4.tmp` there. After the adapter staged that project, the same binary queued `stage/staged.mp4` and began `staged.mp4.tmp` there. The original project bytes were unchanged. No finished video file was produced: OpenCL and GPU are unavailable here, and the process was stopped during frame 1 of 10. A relative `videofile` and gyro `filepath` were rewritten to absolute paths; Gyroflow then opened the gyro URL beside the original project. A preset launch exited before writing video. No camera file was used.

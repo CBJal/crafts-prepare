@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -39,6 +40,7 @@ def build_export_args(
     audio: bool,
     crf: int | None,
     filter_chain: str | None,
+    output_color: dict | None = None,
 ) -> list[str]:
     args = [
         ffmpeg,
@@ -80,6 +82,19 @@ def build_export_args(
         args.append("-an")
     if preset["container"] == "mp4":
         args.extend(["-movflags", "+faststart"])
+    if output_color:
+        args.extend(
+            [
+                "-colorspace",
+                str(output_color["colorspace"]),
+                "-color_primaries",
+                str(output_color["primaries"]),
+                "-color_trc",
+                str(output_color["trc"]),
+                "-color_range",
+                str(output_color["range"]),
+            ]
+        )
     args.extend(["-f", preset["container"], str(partial)])
     return args
 
@@ -125,6 +140,9 @@ def run_export(
     cancel: threading.Event,
     on_progress,
     encoders: dict,
+    extra_filters: str | None = None,
+    stage_files: dict[str, Path] | None = None,
+    output_color: dict | None = None,
 ) -> dict:
     preset = PRESETS.get(preset_id)
     if preset is None:
@@ -186,6 +204,10 @@ def run_export(
 
             shutil.copyfile(validate_lut(spec.lut_path), work / "grade.cube")
             spec.lut_name = "grade.cube"
+        for name, staged in (stage_files or {}).items():
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+                raise CraftsError("Internal colour filename is not safe.", code="bad_lut")
+            shutil.copyfile(staged, work / name)
         if spec.stabilization == "vidstab":
             detect = detect_chain(shakiness, accuracy, "transforms.trf")
             detect_args = [
@@ -220,6 +242,8 @@ def run_export(
                 )
             spec.trf_name = "transforms.trf"
         filter_chain = chain_for(spec)
+        if extra_filters:
+            filter_chain = extra_filters if not filter_chain else f"{extra_filters},{filter_chain}"
         chosen_crf = crf if crf is not None else preset.get("crf_default")
         args = build_export_args(
             ffmpeg=ffmpeg,
@@ -234,6 +258,7 @@ def run_export(
             audio=audio,
             crf=chosen_crf,
             filter_chain=filter_chain or None,
+            output_color=output_color,
         )
 
         def on_line(line: str) -> None:
@@ -257,6 +282,7 @@ def run_export(
             source_h=int(video["height"]),
             pix_fmt=preset["pix_fmt"],
             audio=audio,
+            output_color=output_color,
         )
         published = publish_exclusive(partial, final, source)
         return {
@@ -313,6 +339,7 @@ def _validate_output(
     source_h: int,
     pix_fmt: str,
     audio: bool,
+    output_color: dict | None = None,
 ) -> dict:
     probed = probe_file(ffprobe, path)
     video = (probed.get("video") or [None])[0]
@@ -347,6 +374,23 @@ def _validate_output(
         raise CraftsError("Output is missing the requested audio stream.", code="invalid_output")
     if not audio and has_audio:
         raise CraftsError("Output contains audio even though audio was turned off.", code="invalid_output")
+    if output_color:
+        problems = []
+        expected = {
+            "color_space": output_color["colorspace"],
+            "color_primaries": output_color["primaries"],
+            "color_transfer": output_color["trc"],
+            "color_range": output_color["range"],
+        }
+        for key, want in expected.items():
+            got = (video.get(key) or "").casefold()
+            if got != str(want).casefold():
+                problems.append(f"{key}={video.get(key) or 'missing'}")
+        if problems:
+            raise CraftsError(
+                "Output colour tags do not match the Rec.709 plan (" + ", ".join(problems) + "). It was not published.",
+                code="invalid_output",
+            )
     return {
         "duration": got_duration,
         "requested_duration": duration,

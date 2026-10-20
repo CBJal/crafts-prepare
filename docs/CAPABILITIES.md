@@ -24,7 +24,7 @@ Status below is what this repository implements. "Verified here" means an automa
 | Exposure and saturation via `eq` | Implemented | Same filter string for the still and the export |
 | `.cube` LUT via `lut3d` | Implemented | The UI has a LUT path field. The file is copied to `grade.cube` in a job directory and referenced by that safe name, so spaces, apostrophes, and Windows drive letters are not placed in the filter graph. FFmpeg 6 export of that path was tested here |
 | HDR display matching | Not implemented | |
-| Sony color transforms | Not implemented | |
+| Sony color transforms | S-Log3/S-Gamut3.Cine and HLG/BT.2020 to documented Rec.709 | Numerical patches and an FFmpeg LUT render on Linux. Not a Sony look LUT |
 | vidstab two-pass | Implemented when the filters exist | Synthetic shake: white-square centroid spread dropped. That is a motion measurement, not a quality grade |
 | deshake fallback | Implemented and labeled as visual fallback | Export ran. Stabilization quality was not scored |
 | Gyroflow CLI adapter | Implemented, including a Gyro panel in the UI | A `.gyroflow` project or preset is copied into the job staging directory. When that file has an output section, its folder (file URI), filename, and legacy output path are pointed at the owned staging file before launch, because Gyroflow 1.6.3 uses the project output instead of `--out-params`. A preset output section is rewritten the same way. Relative media and gyro paths are resolved from the original project directory. Absolute paths and file URIs, including percent-encoding, are left unchanged. An `output_folder_bookmark` is dropped on the copy only. Official Linux Gyroflow 1.6.3 (not bundled) confirmed the path choice on a synthetic clip: the unmodified project queued its stored folder, and the staged copy queued the staging file. That run did not finish a video file; this machine has no OpenCL or GPU. No camera footage was used |
@@ -36,7 +36,7 @@ Status below is what this repository implements. "Verified here" means an automa
 | Queue cancel, retry, collision, failed ffmpeg | Implemented | Yes |
 | Windows process-tree kill | Code path uses `taskkill /F /T` with `CREATE_NO_WINDOW` | Not executed on Windows. Linux process-group kill was tested |
 | Native desktop | PySide6 Qt Widgets | Library, viewer, inspector, and queue. No embedded browser and no loopback UI server in the installed app. The optional web UI remains available with `python -m app` |
-| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup, version 0.2.1, same install id as 0.1.0. This Linux session did not run PyInstaller or Inno Setup. FFmpeg and Gyroflow programs are not inside the package. Qt playback libraries, when the wheel includes them, are separate from those programs |
+| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup, version 0.3.0, same install id as 0.1.0. This Linux session did not run PyInstaller or Inno Setup. FFmpeg and Gyroflow programs are not inside the package. Qt playback libraries, when the wheel includes them, are separate from those programs |
 | Accounts, payments, cloud upload | Not implemented | |
 
 Preset pixel formats:

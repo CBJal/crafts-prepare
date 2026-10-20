@@ -99,15 +99,15 @@ def test_make_icon_copies_the_approved_artwork(tmp_path: Path):
 def test_version_resource_matches_the_app_version(tmp_path: Path):
     module = _load("write_version_info", "packaging/write_version_info.py")
     destination = tmp_path / "file_version_info.txt"
-    assert module.write_version_info(destination) == "0.2.1"
+    assert module.write_version_info(destination) == "0.3.0"
     text = destination.read_text(encoding="utf-8")
-    assert "filevers=(0, 2, 1, 0)" in text
-    assert "prodvers=(0, 2, 1, 0)" in text
-    assert "FileVersion" in text and "0.2.1" in text
+    assert "filevers=(0, 3, 0, 0)" in text
+    assert "prodvers=(0, 3, 0, 0)" in text
+    assert "FileVersion" in text and "0.3.0" in text
     assert "ProductVersion" in text
     assert "InternalName" in text and "CraftsPrepare" in text
     committed = (ROOT / "packaging" / "file_version_info.txt").read_text(encoding="utf-8")
-    assert "FileVersion" in committed and "0.2.1" in committed
+    assert "FileVersion" in committed and "0.3.0" in committed
 
 
 def test_runtime_license_texts_are_copied(tmp_path: Path):

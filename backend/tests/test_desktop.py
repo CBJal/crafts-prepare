@@ -84,21 +84,20 @@ def test_project_roundtrip_and_paused_jobs_do_not_resume(qapp, desktop, media_di
     assert document["clips"][0]["sha256"]
 
 
-def test_focus_and_batch_checks_are_separate(qapp, desktop, media_dir: Path):
+def test_one_selection_model_supports_range_and_count(qapp, desktop, media_dir: Path):
     desktop.import_paths([str(media_dir / "h264_8.mp4"), str(media_dir / "hevc_10.mp4")])
     assert desktop.wait_until_idle(30000)
     assert len(desktop.clips) == 2
     desktop.focus_clip(desktop.clips[0]["id"])
     assert desktop.focused_id() == desktop.clips[0]["id"]
-    assert desktop.checked_ids() == []
+    assert desktop.checked_ids() == [desktop.clips[0]["id"]]
     desktop.select_all_batch()
     assert desktop.checked_ids() == [clip["id"] for clip in desktop.clips]
-    assert desktop.focused_id() == desktop.clips[0]["id"]
-    assert desktop.batch_count.text().startswith("2 of 2")
+    assert desktop.batch_count.text() == "2 selected"
     desktop.clear_batch()
     assert desktop.checked_ids() == []
-    assert desktop.focused_id() == desktop.clips[0]["id"]
-    assert desktop.batch_count.text().startswith("0 of 2")
+    assert desktop.focused_id() is None
+    assert desktop.batch_count.text() == "0 selected"
 
 
 def test_theme_persists(qapp, desktop):
@@ -159,13 +158,15 @@ def test_checked_gyro_batch_records_a_real_failure_without_gyroflow(qapp, deskto
     desktop.queue_checked_batch("gyro")
     assert desktop.last_batch_id
     job = desktop.service.jobs()[-1]
-    assert job["kind"] == "gyroflow"
-    assert job["request"]["automatic"] is True
-    assert job["request"]["output_settings"]["format"] == "h264_mp4"
+    assert job["kind"] == "prepare"
+    assert job["request"]["gyro_enabled"] is True
+    assert job["request"]["recipe"]["profile"]
     desktop.service.drain()
     finished = desktop.service.jobs()[-1]
     assert finished["status"] == "failed"
     assert finished["status"] != "succeeded"
+    assert list(tmp_path.glob("*.mp4")) == []
+    assert list(tmp_path.glob("*.mov")) == []
 
 
 def test_second_instance_message_raises_the_window(qapp, desktop):
@@ -375,14 +376,16 @@ def test_smoke_harness_uses_the_real_window(qapp, tmp_path: Path, media_dir: Pat
     )
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["http_server_started"] is False
-    assert payload["version"] == "0.2.1"
+    assert payload["version"] == "0.3.0"
     steps = {item["step"]: item for item in payload["steps"]}
     assert steps["import"]["ok"] is True
     assert steps["project"]["ok"] is True
     assert steps["viewer"]["ok"] is True
     assert steps["queue"]["ok"] is True
-    assert any(item["kind"] == "export" and item["status"] == "succeeded" for item in steps["queue"]["jobs"])
-    assert any(item["kind"] == "gyroflow" and item["status"] == "failed" for item in steps["queue"]["jobs"])
+    assert any(item["kind"] == "prepare" and item["status"] == "succeeded" for item in steps["queue"]["jobs"])
+    assert steps["thumbnails"]["ok"] is True
+    assert steps["comparison"]["ok"] is True
+    assert steps["profiles"]["ok"] is True
     assert any(Path(item["path"]).is_file() and item["width"] > 0 for item in payload["screenshots"])
     assert code == 0
     qapp.processEvents()

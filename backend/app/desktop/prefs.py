@@ -38,9 +38,13 @@ def load_state(path: Path | None = None) -> dict:
     if theme not in {"light", "dark", "system"}:
         theme = "system"
     recent = [item for item in payload.get("recent") or [] if isinstance(item, str)]
+    folders = [item for item in payload.get("folders") or [] if isinstance(item, str)]
+    favorites = [item for item in payload.get("favorites") or [] if isinstance(item, str)]
     return {
         "theme": theme,
         "recent": recent[:MAX_RECENT],
+        "folders": folders[:MAX_RECENT],
+        "favorites": favorites[:MAX_RECENT],
         "geometry": payload.get("geometry") if isinstance(payload.get("geometry"), str) else "",
         "window_state": payload.get("window_state") if isinstance(payload.get("window_state"), str) else "",
     }
@@ -75,9 +79,13 @@ def save_state(payload: dict, path: Path | None = None) -> None:
     destination = path or state_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
     recent = [item for item in payload.get("recent") or [] if isinstance(item, str)]
+    folders = [item for item in payload.get("folders") or [] if isinstance(item, str)]
+    favorites = [item for item in payload.get("favorites") or [] if isinstance(item, str)]
     body = {
         "theme": payload.get("theme") if payload.get("theme") in {"light", "dark", "system"} else "system",
         "recent": recent[:MAX_RECENT],
+        "folders": folders[:MAX_RECENT],
+        "favorites": favorites[:MAX_RECENT],
         "geometry": payload.get("geometry") or "",
         "window_state": payload.get("window_state") or "",
     }

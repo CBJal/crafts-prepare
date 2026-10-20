@@ -434,6 +434,7 @@ def run_gyroflow(
     on_progress,
     automatic: bool = False,
     output_settings: dict | None = None,
+    stabilization: dict | None = None,
 ) -> dict:
     executable = discover_executable(settings.get("gyroflow") or "gyroflow")
     if not executable:
@@ -497,6 +498,8 @@ def run_gyroflow(
                 cancel,
                 on_progress,
             )
+            if stabilization:
+                motion["stabilization_written"] = _write_stabilization(project, stabilization)
         # A loaded .gyroflow project or preset overrides CLI --out-params with its
         # own output_folder and output_filename. Rewrite those fields on owned
         # copies so the external tool can only target this job's staging file.
@@ -596,6 +599,7 @@ def run_gyroflow(
                 )
             ),
             "motion_samples": motion.get("samples"),
+            "stabilization_written": motion.get("stabilization_written") or {},
         }
     finally:
         _remove_owned_staging(staging_dir, final)
@@ -678,6 +682,33 @@ def _assert_rendered_contract(probed: dict, expected: dict) -> None:
             + "). It was not published.",
             code="gyro_output_mismatch",
         )
+
+
+def _write_stabilization(project: Path, values: dict) -> dict:
+    """Record requested Gyroflow stabilization fields on an owned project copy.
+
+    The keys are the public Gyroflow project fields ``smoothness``, ``fov``, and
+    ``horizon_lock_amount``. Writing them is not a claim that every Gyroflow
+    build honors them; the job result lists exactly the fields written.
+    """
+    payload = json.loads(project.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise CraftsError("The exported Gyroflow project is not an object.", code="gyro_stage")
+    current = payload.get("stabilization")
+    if not isinstance(current, dict):
+        current = {}
+    written = {}
+    for key in ("smoothness", "fov", "horizon_lock_amount"):
+        if key not in values or values[key] is None:
+            continue
+        number = float(values[key])
+        if not math.isfinite(number):
+            raise CraftsError("Gyro stabilization values must be finite.", code="bad_recipe")
+        current[key] = number
+        written[key] = number
+    payload["stabilization"] = current
+    project.write_text(json.dumps(payload), encoding="utf-8")
+    return written
 
 
 def _prepare_embedded_project(

@@ -9,7 +9,9 @@ from pathlib import Path
 
 from .errors import Cancelled, CraftsError
 from .probe import probe_file
+from .recipe import default_recipe
 from .security import MAX_HASH_BYTES, is_within, resolve_existing
+from .sony_xml import pair_sidecar
 
 CANDIDATE_EXTENSIONS = {".mp4", ".mov", ".mxf", ".mts", ".m2ts"}
 MAX_FOLDER_FILES = 500
@@ -62,6 +64,8 @@ def file_record(path: Path, ffprobe: str, cancel=None) -> dict:
         "trim_in": 0.0,
         "trim_out": probed.get("duration") or 0.0,
         "duplicate": False,
+        "recipe": default_recipe(),
+        "sidecar": pair_sidecar(resolved),
     }
 
 
@@ -72,6 +76,50 @@ def import_path(raw: str, ffprobe: str, cancel=None) -> dict:
     if resolved.is_file():
         return {"clips": [file_record(resolved, ffprobe, cancel=cancel)], "skipped": [], "root": str(resolved.parent)}
     raise CraftsError("Path is neither a file nor a folder.", code="bad_path")
+
+
+def list_media_paths(root: Path) -> list[Path]:
+    """List candidate media without hashing or probing."""
+    root = root.resolve(strict=True)
+    found: list[Path] = []
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(dirpath)
+        depth = len(current.relative_to(root).parts)
+        if depth >= MAX_DEPTH:
+            dirnames[:] = []
+        kept = []
+        for name in dirnames:
+            candidate = current / name
+            if candidate.is_symlink():
+                try:
+                    target = candidate.resolve(strict=True)
+                except OSError:
+                    continue
+                if not is_within(target, root):
+                    continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in filenames:
+            candidate = current / name
+            if candidate.suffix.lower() not in CANDIDATE_EXTENSIONS:
+                continue
+            seen += 1
+            if seen > MAX_FOLDER_FILES:
+                return found
+            if candidate.is_symlink():
+                try:
+                    target = candidate.resolve(strict=True)
+                except OSError:
+                    continue
+                if not is_within(target, root):
+                    continue
+                found.append(target)
+            else:
+                resolved = candidate.resolve(strict=True)
+                if is_within(resolved, root):
+                    found.append(resolved)
+    return found
 
 
 def import_folder(root: Path, ffprobe: str, cancel=None) -> dict:
