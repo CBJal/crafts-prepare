@@ -22,6 +22,7 @@ from .gcsv import parse_gcsv_file
 from .gyroflow_cli import gyro_format, run_gyroflow
 from .importer import import_path
 from .prepare import plan_prepare_clip, run_prepare
+from .recipe import freeze_lut_paths
 from .presets import PRESETS, conversion_note, preset_availability
 from .preview import PROXY_LIMIT_SECONDS, browser_playable, extract_thumbnail, make_proxy
 from .probe import discover_executable
@@ -690,6 +691,12 @@ class Service:
                         plan = self._plan_gyro_clip(clip, shared, destination, suffix)
                     else:
                         plan = plan_prepare_clip(clip, shared, destination, suffix)
+                        plan["request"]["recipe"] = freeze_lut_paths(
+                            plan["request"]["recipe"],
+                            self.data_dir / "lut-snapshots",
+                        )
+                        sidecar = clip.get("sidecar") if isinstance(clip.get("sidecar"), dict) else {}
+                        plan["request"]["sidecar_sha256"] = str(sidecar.get("sha256") or "")
                     key = str(Path(plan["output"]).resolve(strict=False))
                     if key in claimed:
                         raise CraftsError(

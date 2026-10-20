@@ -32,6 +32,11 @@ _PRIMARIES = {
     "bt2020": "rec2020",
     "rec709": "rec709",
 }
+_LABEL = {
+    "slog3_sgamut3cine": "S-Log3",
+    "hlg_bt2020": "HLG",
+    "preserve": "Preserve input",
+}
 _CODING = {
     "rec709": "rec709",
     "rec2020": "rec2020",
@@ -233,6 +238,13 @@ def pair_sidecar(media: Path) -> dict:
     chosen = usable[0]
     chosen["paths"] = [str(path) for path in found]
     chosen["paired_name"] = Path(chosen["path"]).name
+    try:
+        from .colour import file_sha256
+
+        chosen["sha256"] = file_sha256(Path(chosen["path"]))
+        chosen["size"] = Path(chosen["path"]).stat().st_size
+    except OSError:
+        chosen["sha256"] = ""
     return chosen
 
 
@@ -295,7 +307,7 @@ def resolve_profile(sidecar: dict | None, probe: dict | None, override: str) -> 
             "source": "override",
             "input_range": "pc" if override == "slog3_sgamut3cine" else range_name,
             "status": "override",
-            "message": f"Using the profile selected for this clip ({override}). Automatic detection was not used.",
+            "message": f"Using the { _LABEL.get(override, override) } profile selected for this clip.",
             "xml_pipeline": xml_pipeline,
             "tag_pipeline": tag_pipeline,
         }
@@ -327,8 +339,8 @@ def resolve_profile(sidecar: dict | None, probe: dict | None, override: str) -> 
             "input_range": range_name,
             "status": "conflict",
             "message": (
-                f"The sidecar says {xml_pipeline.replace('_', ' ')} but the video tags say "
-                f"{tag_pipeline.replace('_', ' ')}. Choose a profile for this clip. Neither was applied."
+                f"The sidecar says {_LABEL.get(xml_pipeline, xml_pipeline)} but the video tags say "
+                f"{_LABEL.get(tag_pipeline, tag_pipeline)}. Choose a profile for this clip. Neither was applied."
             ),
             "xml_pipeline": xml_pipeline,
             "tag_pipeline": tag_pipeline,
@@ -339,7 +351,7 @@ def resolve_profile(sidecar: dict | None, probe: dict | None, override: str) -> 
             "source": "xml",
             "input_range": "pc" if xml_pipeline == "slog3_sgamut3cine" else range_name,
             "status": "ok",
-            "message": f"Profile {xml_pipeline} came from this clip's sidecar.",
+            "message": f"{_LABEL.get(xml_pipeline, xml_pipeline)} came from this clip's sidecar.",
             "tag_pipeline": tag_pipeline,
         }
     if tag_pipeline:
@@ -348,7 +360,7 @@ def resolve_profile(sidecar: dict | None, probe: dict | None, override: str) -> 
             "source": "tags",
             "input_range": "pc" if tag_pipeline == "slog3_sgamut3cine" else range_name,
             "status": "ok",
-            "message": f"No usable sidecar. Profile {tag_pipeline} came from this clip's video tags.",
+            "message": f"No usable sidecar. {_LABEL.get(tag_pipeline, tag_pipeline)} came from this clip's video tags.",
             "xml_pipeline": None,
         }
     if sidecar.get("status") == "missing":

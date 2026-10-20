@@ -78,6 +78,33 @@ def import_path(raw: str, ffprobe: str, cancel=None) -> dict:
     raise CraftsError("Path is neither a file nor a folder.", code="bad_path")
 
 
+def list_directory_media(root: Path) -> list[Path]:
+    """Media files in this directory only, sorted by name. Subfolders are not walked."""
+    root = root.resolve(strict=True)
+    found: list[Path] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise CraftsError(f"The folder could not be listed. {exc}", code="bad_path") from exc
+    for candidate in entries:
+        if not candidate.is_file() or candidate.suffix.lower() not in CANDIDATE_EXTENSIONS:
+            continue
+        if candidate.is_symlink():
+            try:
+                target = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if not is_within(target, root):
+                continue
+            found.append(target)
+        else:
+            resolved = candidate.resolve(strict=True)
+            if is_within(resolved, root):
+                found.append(resolved)
+    found.sort(key=lambda path: path.name.casefold())
+    return found
+
+
 def list_media_paths(root: Path) -> list[Path]:
     """List candidate media without hashing or probing."""
     root = root.resolve(strict=True)

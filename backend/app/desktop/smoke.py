@@ -133,8 +133,24 @@ def run_smoke(
         if not proof["steps"][-1]["ok"]:
             code = 2
             return code
-        thumbnails = window.grid.item_count()
-        proof["steps"].append({"step": "thumbnails", "ok": thumbnails == len(window.clips) and thumbnails > 0, "count": thumbnails})
+        def painted() -> int:
+            count = 0
+            for key, pix in window.grid._pixmaps.items():
+                if str(key).startswith(("error", "pending")):
+                    continue
+                if pix is not None and not pix.isNull():
+                    count += 1
+            return count
+
+        wait_signal(lambda: painted() >= len(window.clips) and len(window.clips) > 0, 30000)
+        proof["steps"].append(
+            {
+                "step": "thumbnails",
+                "ok": painted() == len(window.clips) and len(window.clips) > 0,
+                "count": len(window.clips),
+                "painted": painted(),
+            }
+        )
         profiles = []
         for clip in window.clips:
             from .grade import describe_clip
@@ -149,20 +165,37 @@ def run_smoke(
                     "message": (described["profile"] or {}).get("message"),
                 }
             )
-        proof["steps"].append({"step": "profiles", "ok": bool(profiles) and all(item.get("pipeline") for item in profiles), "clips": profiles})
+        unresolved = [item for item in profiles if item.get("pipeline") in {None, "", "unknown"} or item.get("sidecar") in {"conflict", "ambiguous", "unsafe"}]
+        proof["steps"].append({"step": "profiles", "ok": bool(profiles) and not unresolved, "clips": profiles})
+        recipe = dict(settings.get("recipe") or {})
+        if settings.get("lut"):
+            recipe["look_lut"] = settings["lut"]
+        if recipe and window.clips:
+            for clip in list(window.clips):
+                window.service.update_clip(clip["id"], {"recipe": recipe})
+            window.clips = window.service.clips()
         if window.clips:
             window.focus_clip(window.clips[0]["id"])
         window._show_mode(1)
-        window.request_playback()
-        window.wait_until_idle(90000)
-        playback = _observe_playback(window, wait_signal)
         window.request_comparison()
-        window.wait_until_idle(90000)
-        comparison_ok = (
-            abs(window.compare.seconds - window._current_seconds(window.clips[0])) < 0.05
-            if window.clips
-            else False
-        ) and not window.still_original._source.isNull() and not window.still_adjusted._source.isNull()
+        window.wait_until_idle(120000)
+        start_frames = window.compare.frames_presented
+        start_seconds = window.compare.seconds
+        window.play()
+
+        def comparison_moved() -> bool:
+            return (
+                window.compare.same_time()
+                and window.compare.frames_presented > start_frames
+                and window.compare.seconds > start_seconds + 0.02
+                and not window.compare._left.isNull()
+                and not window.compare._right.isNull()
+            )
+
+        wait_signal(comparison_moved, 8000)
+        window.pause()
+        playback = _observe_playback(window, wait_signal)
+        comparison_ok = window.compare.same_time() and comparison_moved()
         grab("viewer")
         proof["steps"].append(
             {

@@ -57,7 +57,9 @@ QLabel#timeLabel { font-family: "Cascadia Mono", "Consolas", "Liberation Mono", 
 QTabWidget::pane { border: 0; background: #f6f7f8; }
 QTabBar::tab { background: #f6f7f8; color: #5c6770; padding: 8px 12px; border: 0; border-bottom: 2px solid transparent; }
 QTabBar::tab:selected { color: #1a2028; border-bottom: 2px solid #2a3340; }
-QScrollArea { border: 0; background: #f6f7f8; }
+QScrollArea, QTreeWidget, QTreeView, QListWidget, QWidget#gridHost, QWidget#placesPanel {
+  border: 0; background: #f6f7f8; color: #1a2028;
+}
 QSlider::groove:horizontal { height: 4px; background: #d0d7de; border-radius: 2px; }
 QSlider::handle:horizontal { width: 12px; margin: -5px 0; background: #2a3340; border-radius: 6px; }
 QStackedWidget#viewerStack, QLabel#stillLabel, QVideoWidget#videoWidget, QLabel#videoWidget {
@@ -138,7 +140,9 @@ QLabel#timeLabel { font-family: "Cascadia Mono", "Consolas", "Liberation Mono", 
 QTabWidget::pane { border: 0; background: #171c23; }
 QTabBar::tab { background: #171c23; color: #9aa6b2; padding: 8px 12px; border: 0; border-bottom: 2px solid transparent; }
 QTabBar::tab:selected { color: #e8eef4; border-bottom: 2px solid #d5dde6; }
-QScrollArea { border: 0; background: #171c23; }
+QScrollArea, QTreeWidget, QTreeView, QListWidget, QWidget#gridHost, QWidget#placesPanel {
+  border: 0; background: #171c23; color: #e8eef4;
+}
 QSlider::groove:horizontal { height: 4px; background: #313a46; border-radius: 2px; }
 QSlider::handle:horizontal { width: 12px; margin: -5px 0; background: #d5dde6; border-radius: 6px; }
 QStackedWidget#viewerStack, QLabel#stillLabel, QVideoWidget#videoWidget, QLabel#videoWidget {

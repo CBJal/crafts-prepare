@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QRect, Qt
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtGui import QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QWidget
+
+
+def _sample(pixmap: QPixmap) -> tuple[int, int, int]:
+    if pixmap.isNull():
+        return (0, 0, 0)
+    image = pixmap.toImage()
+    color = image.pixelColor(max(0, image.width() // 2), max(0, image.height() // 2))
+    return (color.red(), color.green(), color.blue())
 
 
 def _fit(pixmap: QPixmap, width: int, height: int) -> QPixmap:
@@ -23,6 +31,10 @@ class CompareView(QWidget):
         self.setMinimumHeight(180)
         self.mode = "split"
         self.seconds = 0.0
+        self.left_seconds = 0.0
+        self.right_seconds = 0.0
+        self.frames_presented = 0
+        self._paired = False
         self._left = QPixmap()
         self._right = QPixmap()
         self._wipe = 0.5
@@ -37,8 +49,36 @@ class CompareView(QWidget):
         self._left = left
         self._right = right
         self.seconds = float(seconds)
+        self.left_seconds = self.seconds
+        self.right_seconds = self.seconds
+        self._paired = not left.isNull() and not right.isNull()
+        self.frames_presented += 1
         self.time_label.setText(f"Both sides {self.seconds:.3f}s")
         self.update()
+
+    def present_split(self, image: QImage | QPixmap, seconds: float) -> None:
+        """Split one side-by-side frame so both halves share that timestamp."""
+        if isinstance(image, QPixmap):
+            image = image.toImage()
+        if image.isNull() or image.width() < 4 or image.height() < 2:
+            self._paired = False
+            return
+        half = image.width() // 2
+        left = image.copy(0, 0, half, image.height())
+        right = image.copy(half, 0, image.width() - half, image.height())
+        self._left = QPixmap.fromImage(left)
+        self._right = QPixmap.fromImage(right)
+        self.seconds = float(seconds)
+        self.left_seconds = self.seconds
+        self.right_seconds = self.seconds
+        self._paired = True
+        self.frames_presented += 1
+        self.time_label.setText(f"Both sides {self.seconds:.3f}s")
+        self.still_original_path = ""
+        self.update()
+
+    def center_colors(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        return (_sample(self._left), _sample(self._right))
 
     def set_mode(self, mode: str) -> None:
         if mode in {"split", "wipe", "original", "processed"}:
@@ -46,7 +86,12 @@ class CompareView(QWidget):
             self.update()
 
     def same_time(self) -> bool:
-        return True
+        return (
+            self._paired
+            and self.left_seconds == self.right_seconds
+            and not self._left.isNull()
+            and not self._right.isNull()
+        )
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)

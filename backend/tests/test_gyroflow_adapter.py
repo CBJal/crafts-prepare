@@ -178,6 +178,9 @@ for arg in sys.argv:
     except Exception:
         continue
     documents.append((arg, data))
+    dump = os.environ.get("GYRO_DUMP")
+    if dump and isinstance(data, dict):
+        Path(dump).write_text(json.dumps(data), encoding="utf-8")
     chosen = from_document(data)
     if chosen is None:
         continue

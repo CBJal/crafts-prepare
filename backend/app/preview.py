@@ -175,3 +175,87 @@ def make_proxy(
     finally:
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
+
+
+def make_comparison_proxy(
+    *,
+    ffmpeg: str,
+    source: Path,
+    destination: Path,
+    colour_filter: str,
+    stage_files: dict | None = None,
+    right_source: Path | None = None,
+    cancel=None,
+) -> Path:
+    """One file whose left half is the original and whose right half is processed.
+
+    Both halves are frames of the same clock. A new path is required so a file
+    that is already open for playback is not replaced.
+    """
+    if destination.exists():
+        raise CraftsError("Comparison preview path already exists.", code="collision")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.stem + ".writing.mp4")
+    work = destination.parent / f".compare-cubes-{destination.stem}"
+    work.mkdir(parents=True, exist_ok=True)
+    for name, staged in (stage_files or {}).items():
+        if not isinstance(name, str) or "/" in name or "\\" in name or name.startswith("."):
+            raise CraftsError("Internal preview filename is not safe.", code="bad_lut")
+        shutil.copyfile(staged, work / name)
+    right_chain = colour_filter if colour_filter else "setsar=1"
+    geometry = "scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    if right_source is None:
+        graph = (
+            f"[0:v]split[a][b];"
+            f"[a]{geometry}[l];"
+            f"[b]{right_chain},{geometry}[r];"
+            f"[l][r]hstack=inputs=2[v]"
+        )
+        inputs = ["-i", str(source)]
+    else:
+        graph = (
+            f"[0:v]{geometry}[l];"
+            f"[1:v]{right_chain},{geometry}[r];"
+            f"[l][r]hstack=inputs=2[v]"
+        )
+        inputs = ["-i", str(source), "-i", str(right_source)]
+    args = [
+        ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        *inputs,
+        "-filter_complex",
+        graph,
+        "-map",
+        "[v]",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        str(partial),
+    ]
+    try:
+        code, _stdout, stderr = run_captured(args, timeout=60 * 30, cancel=cancel, cwd=str(work))
+        if cancel is not None and cancel.is_set():
+            partial.unlink(missing_ok=True)
+            from .errors import Cancelled
+
+            raise Cancelled()
+        if code != 0 or not partial.is_file() or partial.stat().st_size == 0:
+            partial.unlink(missing_ok=True)
+            raise CraftsError("Comparison preview failed. " + (stderr or "")[-500:], code="ffmpeg_failed")
+        os.replace(partial, destination)
+        return destination
+    finally:
+        partial.unlink(missing_ok=True)
+        shutil.rmtree(work, ignore_errors=True)

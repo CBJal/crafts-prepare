@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from .colour import file_sha256
@@ -35,6 +36,8 @@ def _number(label: str, value, low: float, high: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CraftsError(f"{label} must be a number.", code="bad_recipe")
     number = float(value)
+    if not math.isfinite(number):
+        raise CraftsError(f"{label} must be a finite number.", code="bad_recipe")
     if number < low or number > high:
         raise CraftsError(f"{label} must be between {low:g} and {high:g}.", code="bad_recipe")
     return number
@@ -84,9 +87,11 @@ def normalize_recipe(payload: dict | None, previous: dict | None = None) -> dict
     if "gyro_smoothness" in payload:
         base["gyro_smoothness"] = _number("Gyro strength", payload["gyro_smoothness"], 0.0, 1.0)
     if "gyro_fov" in payload:
-        base["gyro_fov"] = _number("Gyro crop", payload["gyro_fov"], 1.0, 1.5)
+        # Gyroflow 1.6.3 FOV slider is 0.1–3. Values above 1 widen the frame.
+        base["gyro_fov"] = _number("Field of view", payload["gyro_fov"], 0.1, 3.0)
     if "gyro_horizon" in payload:
-        base["gyro_horizon"] = _number("Horizon lock", payload["gyro_horizon"], 0.0, 1.0)
+        # Gyroflow 1.6.3 horizon lock amount is a percent, 0–100. Zero is off.
+        base["gyro_horizon"] = _number("Horizon lock", payload["gyro_horizon"], 0.0, 100.0)
     if "input_lut" in payload:
         path, digest = _lut_field(str(payload.get("input_lut") or ""), str(payload.get("input_lut_sha256") or base["input_lut_sha256"]), "Input LUT")
         base["input_lut"] = path
@@ -125,6 +130,45 @@ def lut_status(recipe: dict) -> list[str]:
         if expected and current != expected:
             notes.append(f"{label} changed since it was selected.")
     return notes
+
+
+def freeze_lut_paths(recipe: dict, directory: Path) -> dict:
+    """Copy LUT bytes now. Later edits to the user's file do not change this recipe."""
+    frozen = dict(recipe)
+    directory.mkdir(parents=True, exist_ok=True)
+    for key, name in (("input_lut", "input.cube"), ("look_lut", "look.cube")):
+        raw = str(recipe.get(key) or "")
+        if not raw:
+            frozen[key] = ""
+            frozen[f"{key}_sha256"] = ""
+            continue
+        digest = file_sha256(validate_lut(raw))
+        destination = directory / f"{digest}-{name}"
+        if not destination.is_file():
+            snapshot_lut(raw, directory, destination.name)
+        if file_sha256(destination) != digest:
+            raise CraftsError(f"{name} snapshot does not match the file that was queued.", code="lut_changed")
+        frozen[f"{key}_source"] = raw
+        frozen[key] = str(destination)
+        frozen[f"{key}_sha256"] = digest
+    return frozen
+
+
+def assert_frozen_luts(recipe: dict) -> None:
+    for key, label in (("input_lut", "Input LUT"), ("look_lut", "Look LUT")):
+        raw = str(recipe.get(key) or "")
+        expected = str(recipe.get(f"{key}_sha256") or "")
+        if not raw and not expected:
+            continue
+        path = Path(raw) if raw else None
+        if path is None or not path.is_file():
+            raise CraftsError(f"{label} snapshot is missing. The queued file was not read again.", code="lut_changed")
+        current = file_sha256(path)
+        if expected and current != expected:
+            raise CraftsError(
+                f"{label} no longer matches the fingerprint stored when the job was queued.",
+                code="lut_changed",
+            )
 
 
 def snapshot_lut(path: str, directory: Path, name: str) -> dict:

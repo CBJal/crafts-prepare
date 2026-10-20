@@ -242,6 +242,7 @@ def test_combined_job_applies_colour_after_gyro_and_failures_do_not_publish(tmp_
     monkeypatch.setenv("GYRO_MEDIA", str(media_dir / "h264_8.mp4"))
     monkeypatch.setenv("GYRO_MODE", "ok")
     monkeypatch.setenv("GYRO_ENCODE", "match")
+    monkeypatch.setenv("GYRO_DUMP", str(tmp_path / "gyro-project.json"))
     monkeypatch.setenv("CRAFTS_DISABLE_WORKER", "1")
     monkeypatch.setenv("CRAFTS_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setenv("CRAFTS_DATA_DIR", str(tmp_path / "cache"))
@@ -284,7 +285,13 @@ def test_combined_job_applies_colour_after_gyro_and_failures_do_not_publish(tmp_
     assert job["result"]["colour"]["look_lut_sha256"] == file_sha256(look)
     assert job["result"]["gyro"]["applied"] is True
     assert job["result"]["gyro"]["intermediate_published"] is False
-    assert job["result"]["gyro"]["stabilization_written"]["smoothness"] == pytest.approx(0.25)
+    dumped = json.loads((tmp_path / "gyro-project.json").read_text(encoding="utf-8"))
+    params = dumped["stabilization"]["smoothing_params"]
+    smoothness = next(item["value"] for item in params if item["name"] == "smoothness")
+    assert smoothness == pytest.approx(0.25)
+    assert dumped["stabilization"]["fov"] == pytest.approx(1.2)
+    assert dumped["stabilization"]["horizon_lock_amount"] == pytest.approx(0.4)
+    assert "smoothness" not in dumped["stabilization"] or isinstance(dumped["stabilization"].get("smoothing_params"), list)
     assert list(destination.glob(".crafts-prepare-*")) == []
     assert list(destination.glob("gyro-intermediate.*")) == []
     assert file_sha256(media) == before
@@ -326,6 +333,121 @@ def test_combined_job_applies_colour_after_gyro_and_failures_do_not_publish(tmp_
     assert failed["status"] == "failed"
     assert list(failed_dir.glob("*.mp4")) == []
     assert list(failed_dir.glob("*.mov")) == []
+
+
+def test_nan_recipe_is_rejected():
+    from app.recipe import normalize_recipe
+
+    with pytest.raises(CraftsError):
+        normalize_recipe({"exposure_ev": float("nan")})
+
+
+def test_cold_cache_cube_writers(tmp_path: Path):
+    import threading
+
+    plan = build_plan(
+        pipeline="slog3_sgamut3cine",
+        input_range="pc",
+        exposure_ev=0,
+        contrast=1,
+        saturation=1,
+        has_input_lut=False,
+        has_look_lut=False,
+        look_includes_camera=False,
+    )
+    cache = tmp_path / "cache"
+    errors: list[BaseException] = []
+
+    def once(index: int) -> None:
+        try:
+            ensure_plan_cubes(plan, tmp_path / f"job-{index}", cache=cache)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=once, args=(index,)) for index in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    published = list(cache.glob("technical-*.cube"))
+    assert len(published) == 1
+    assert "LUT_3D_SIZE" in published[0].read_text(encoding="utf-8")[:40]
+    assert list(cache.glob("*.tmp")) == []
+
+
+def test_queued_lut_hash_survives_a_later_edit(tmp_path: Path, media_dir: Path, monkeypatch):
+    if not __import__("shutil").which("ffmpeg"):
+        pytest.skip("ffmpeg is not installed")
+    monkeypatch.setenv("CRAFTS_DISABLE_WORKER", "1")
+    monkeypatch.setenv("CRAFTS_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("CRAFTS_DATA_DIR", str(tmp_path / "cache"))
+    cube = tmp_path / "half.cube"
+    cube.write_text(
+        "LUT_3D_SIZE 2\n0 0 0\n0.5 0 0\n0 1 0\n0.5 1 0\n0 0 1\n0.5 0 1\n0 1 1\n0.5 1 1\n",
+        encoding="utf-8",
+    )
+    queued_hash = file_sha256(cube)
+    service = Service()
+    media = tmp_path / "clip.mp4"
+    media.write_bytes((media_dir / "h264_8.mp4").read_bytes())
+    clip = service.import_media(str(media))["added"][0]
+    service.update_clip(clip["id"], {"recipe": {"profile": "preserve", "look_includes_camera": True, "look_lut": str(cube)}})
+    destination = tmp_path / "out"
+    destination.mkdir()
+    queued = service.enqueue_batch(
+        {
+            "operation": "prepare",
+            "clip_ids": [clip["id"]],
+            "destination_dir": str(destination),
+            "suffix": "_lut",
+            "prepare": {"preset_id": "h264_mp4", "audio": False, "acknowledge_bit_depth_conversion": True},
+        }
+    )
+    stored = queued["queued"][0]["request"]["recipe"]["look_lut_sha256"]
+    assert stored == queued_hash
+    cube.write_text(
+        "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        encoding="utf-8",
+    )
+    assert file_sha256(cube) != stored
+    service.drain()
+    job = service.jobs()[-1]
+    assert job["status"] == "succeeded", job
+    assert job["result"]["colour"]["look_lut_sha256"] == stored
+
+
+def test_compare_split_frame_moves_and_shares_time():
+    pytest.importorskip("PySide6")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtGui import QColor, QImage, QPainter
+    from PySide6.QtWidgets import QApplication
+
+    from app.desktop.compare import CompareView
+
+    QApplication.instance() or QApplication([])
+    view = CompareView()
+
+    def frame(left: QColor, right: QColor) -> QImage:
+        image = QImage(80, 20, QImage.Format.Format_RGB32)
+        painter = QPainter(image)
+        painter.fillRect(0, 0, 40, 20, left)
+        painter.fillRect(40, 0, 40, 20, right)
+        painter.end()
+        return image
+
+    view.present_split(frame(QColor("red"), QColor("blue")), 0.0)
+    first = view.center_colors()
+    assert view.same_time()
+    assert view.seconds == 0.0
+    view.present_split(frame(QColor("green"), QColor("yellow")), 0.04)
+    second = view.center_colors()
+    assert view.same_time()
+    assert view.left_seconds == view.right_seconds == pytest.approx(0.04)
+    assert first != second
+    assert view.frames_presented >= 2
 
 
 def test_unknown_profile_is_not_guessed(tmp_path: Path):

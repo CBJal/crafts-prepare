@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,7 +48,10 @@ BT2020_PRIMARIES = ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046))
 SGAMUT3CINE_PRIMARIES = ((0.766, 0.275), (0.225, 0.800), (0.089, -0.087))
 REC709_LUMA = (0.2126, 0.7152, 0.0722)
 BT2020_LUMA = (0.2627, 0.6780, 0.0593)
-LUT_SIZE = 33
+# 65 points keeps the S-Log3 knee and the 90% white clip within about 0.01
+# of the reference after trilinear interpolation. 33 points were about 0.03 off
+# near that boundary. The bound is checked on exported pixels, not loosened.
+LUT_SIZE = 65
 
 
 def _clamp01(value: float) -> float:
@@ -343,7 +349,7 @@ def _grade_sample(rgb: tuple[float, float, float], plan: ColourPlan) -> tuple[fl
 
 
 def write_cube(path: Path, function, *, size: int = LUT_SIZE) -> None:
-    if not 2 <= size <= 64:
+    if not 2 <= size <= 65:
         raise CraftsError("LUT size is out of range.", code="colour")
     step = 1.0 / (size - 1)
     lines = [f"LUT_3D_SIZE {size}", ""]
@@ -356,13 +362,48 @@ def write_cube(path: Path, function, *, size: int = LUT_SIZE) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+_CUBE_GUARD = threading.Lock()
+_CUBE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _cube_lock(path: Path) -> threading.Lock:
+    key = str(path)
+    with _CUBE_GUARD:
+        lock = _CUBE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CUBE_LOCKS[key] = lock
+        return lock
+
+
+def _cube_ready(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        if path.stat().st_size < 32:
+            return False
+        head = path.read_text(encoding="utf-8")[:80]
+    except OSError:
+        return False
+    return "LUT_3D_SIZE" in head
+
+
 def _cached_cube(directory: Path, name: str, function) -> None:
+    """One writer per cache key. The temp name is unique. Readers only see a finished cube."""
     destination = directory / name
-    if destination.is_file() and destination.stat().st_size > 0:
-        return
-    temporary = directory / f".{name}.{hashlib.sha256(name.encode()).hexdigest()[:8]}.tmp"
-    write_cube(temporary, function)
-    temporary.replace(destination)
+    lock = _cube_lock(destination)
+    with lock:
+        if _cube_ready(destination):
+            return
+        temporary = directory / f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            write_cube(temporary, function)
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists() and not _cube_ready(destination):
+                temporary.unlink(missing_ok=True)
+        if not _cube_ready(destination):
+            raise CraftsError("The colour LUT was not published.", code="colour")
 
 
 def ensure_plan_cubes(plan: ColourPlan, directory: Path, *, cache: Path | None = None) -> list[str]:
@@ -408,8 +449,14 @@ def ensure_plan_cubes(plan: ColourPlan, directory: Path, *, cache: Path | None =
     if plan.look_name and plan.pipeline != "look_includes_camera":
         fragments.append(f"lut3d=file={plan.look_name}")
     if plan.normalizes or plan.pipeline in {"input_lut", "look_includes_camera"}:
-        fragments.append("scale=in_range=pc:out_range=tv:flags=accurate_rnd")
-        fragments.append("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709")
+        # Tag the LUT output as full-range Rec.709 RGB, then convert to YUV with
+        # the Rec.709 matrix. Doing the tag only after an automatic RGB->YUV
+        # conversion lets FFmpeg keep a BT.2020 matrix and mislabel the pixels.
+        fragments.append("setparams=range=pc:colorspace=bt709:color_primaries=bt709:color_trc=bt709")
+        fragments.append(
+            "scale=in_range=pc:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709:flags=accurate_rnd"
+        )
+        fragments.append("setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709")
     return fragments
 
 

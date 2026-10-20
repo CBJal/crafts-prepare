@@ -10,6 +10,17 @@ from ..recipe import default_recipe
 from ..sony_xml import resolve_profile
 
 
+def profile_label(pipeline: str | None) -> str:
+    return {
+        "hlg_bt2020": "HLG",
+        "slog3_sgamut3cine": "S-Log3",
+        "preserve": "Preserve",
+        "unknown": "Unknown",
+        "input_lut": "LUT",
+        "look_includes_camera": "Look",
+    }.get(pipeline or "", "Unknown")
+
+
 def clip_recipe(clip: dict) -> dict:
     recipe = clip.get("recipe")
     if isinstance(recipe, dict):

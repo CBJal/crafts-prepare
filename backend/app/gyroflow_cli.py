@@ -684,12 +684,16 @@ def _assert_rendered_contract(probed: dict, expected: dict) -> None:
         )
 
 
-def _write_stabilization(project: Path, values: dict) -> dict:
-    """Record requested Gyroflow stabilization fields on an owned project copy.
+_SMOOTHNESS_NAMES = ("smoothness", "smoothness_pitch", "smoothness_yaw", "smoothness_roll")
 
-    The keys are the public Gyroflow project fields ``smoothness``, ``fov``, and
-    ``horizon_lock_amount``. Writing them is not a claim that every Gyroflow
-    build honors them; the job result lists exactly the fields written.
+
+def _write_stabilization(project: Path, values: dict) -> dict:
+    """Update an owned Gyroflow 1.6 project without dropping readout or lens fields.
+
+    Strength is ``stabilization.smoothing_params`` entries named ``smoothness``
+    (0–1, the value DefaultAlgo.set_parameter reads). Horizon lock amount is the
+    public 0–100 percent slider. FOV follows the 0.1–3 slider: higher FOV widens
+    the frame. An unused ``stabilization.smoothness`` key is not written.
     """
     payload = json.loads(project.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -697,15 +701,39 @@ def _write_stabilization(project: Path, values: dict) -> dict:
     current = payload.get("stabilization")
     if not isinstance(current, dict):
         current = {}
-    written = {}
-    for key in ("smoothness", "fov", "horizon_lock_amount"):
-        if key not in values or values[key] is None:
-            continue
-        number = float(values[key])
-        if not math.isfinite(number):
-            raise CraftsError("Gyro stabilization values must be finite.", code="bad_recipe")
-        current[key] = number
-        written[key] = number
+    written: dict = {}
+    if values.get("smoothness") is not None:
+        number = float(values["smoothness"])
+        if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+            raise CraftsError("Gyro smoothness must be between 0 and 1.", code="bad_recipe")
+        params = current.get("smoothing_params")
+        if not isinstance(params, list):
+            params = []
+        seen: set[str] = set()
+        for item in params:
+            if isinstance(item, dict) and item.get("name") in _SMOOTHNESS_NAMES:
+                item["value"] = number
+                seen.add(str(item["name"]))
+        for name in _SMOOTHNESS_NAMES:
+            if name not in seen:
+                params.append({"name": name, "value": number})
+        current["smoothing_params"] = params
+        current.pop("smoothness", None)
+        written["smoothing_params"] = [
+            {"name": name, "value": number} for name in _SMOOTHNESS_NAMES
+        ]
+    if values.get("fov") is not None:
+        fov = float(values["fov"])
+        if not math.isfinite(fov) or not 0.1 <= fov <= 3.0:
+            raise CraftsError("Gyro field of view must be between 0.1 and 3.", code="bad_recipe")
+        current["fov"] = fov
+        written["fov"] = fov
+    if values.get("horizon_lock_amount") is not None:
+        amount = float(values["horizon_lock_amount"])
+        if not math.isfinite(amount) or not 0.0 <= amount <= 100.0:
+            raise CraftsError("Horizon lock is a percent from 0 to 100.", code="bad_recipe")
+        current["horizon_lock_amount"] = amount
+        written["horizon_lock_amount"] = amount
     payload["stabilization"] = current
     project.write_text(json.dumps(payload), encoding="utf-8")
     return written

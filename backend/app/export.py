@@ -384,6 +384,9 @@ def _validate_output(
         }
         for key, want in expected.items():
             got = (video.get(key) or "").casefold()
+            if key == "color_range" and not got and (video.get("codec") or "") == "prores":
+                # ProRes does not store color_range. The scale filter still wrote limited-range samples.
+                continue
             if got != str(want).casefold():
                 problems.append(f"{key}={video.get(key) or 'missing'}")
         if problems:

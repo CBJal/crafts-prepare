@@ -53,6 +53,43 @@ def _luminance(pixmap) -> float:
     return total / count if count else 0.0
 
 
+def test_qt_scale_factor_is_the_screen_dpr(tmp_path: Path):
+    script = tmp_path / "dpi_check.py"
+    script.write_text(
+        "import os\n"
+        "os.environ['QT_QPA_PLATFORM'] = 'offscreen'\n"
+        "os.environ['QT_SCALE_FACTOR'] = '1.5'\n"
+        "os.environ['CRAFTS_DISABLE_WORKER'] = '1'\n"
+        f"os.environ['CRAFTS_SETTINGS_PATH'] = {str(tmp_path / 'settings.json')!r}\n"
+        f"os.environ['CRAFTS_DATA_DIR'] = {str(tmp_path / 'cache')!r}\n"
+        f"os.environ['CRAFTS_LOG_PATH'] = {str(tmp_path / 'app.log')!r}\n"
+        "from PySide6.QtWidgets import QApplication\n"
+        "from app.desktop.window import MainWindow\n"
+        "from app.service import Service\n"
+        "app = QApplication([])\n"
+        "window = MainWindow(Service())\n"
+        "window.resize(1280, 800)\n"
+        "window.show()\n"
+        "app.processEvents()\n"
+        "ratio = app.devicePixelRatio()\n"
+        "point = window.export_button.mapTo(window, window.export_button.rect().center())\n"
+        "assert abs(ratio - 1.5) < 0.05, ratio\n"
+        "assert 0 <= point.x() <= window.width()\n"
+        "assert window.export_button.isVisible()\n"
+        "window.force_close = True\n"
+        "window.close()\n"
+        "print('dpi-ok', ratio)\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["QT_SCALE_FACTOR"] = "1.5"
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    completed = __import__("subprocess").run([__import__("sys").executable, str(script)], cwd=str(Path(__file__).resolve().parents[1]), env=env, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "dpi-ok 1.5" in completed.stdout
+
+
 def test_light_shell_is_not_black_and_stylesheet_names_the_surface(qapp, window):
     window.set_theme("light")
     qapp.processEvents()

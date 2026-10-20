@@ -19,7 +19,8 @@ from .filters import FilterSpec
 from .gyroflow_cli import run_gyroflow
 from .presets import PRESETS, conversion_note
 from .probe import probe_file
-from .recipe import normalize_recipe, snapshot_lut
+from .colour import file_sha256
+from .recipe import assert_frozen_luts, normalize_recipe, snapshot_lut
 from .security import exclusive_output, resolve_existing, safe_suffix
 from .sony_xml import resolve_profile
 
@@ -165,9 +166,15 @@ def run_prepare(
             colour_probe = probe_file(ffprobe, colour_source, cancel=cancel)
             on_progress(0.5)
         _check(cancel)
+        _check_sidecar_fingerprint(request, sidecar)
+        assert_frozen_luts(recipe)
+        input_range = str(profile.get("input_range") or "tv")
+        if colour_source != source:
+            # A limited-range gyro intermediate must not inherit the source's full-range S-Log read.
+            input_range = _range_name(colour_probe, "tv")
         plan = build_plan(
             pipeline=str(profile.get("pipeline") or "unknown"),
-            input_range=str(profile.get("input_range") or "tv"),
+            input_range=input_range,
             exposure_ev=float(recipe["exposure_ev"]),
             contrast=float(recipe["contrast"]),
             saturation=float(recipe["saturation"]),
@@ -258,6 +265,35 @@ def run_prepare(
         return result
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _range_name(probe: dict, fallback: str) -> str:
+    video = ((probe or {}).get("video") or [{}])[0] or {}
+    raw = str(video.get("color_range") or "").casefold()
+    if raw in {"pc", "jpeg", "full"}:
+        return "pc"
+    if raw in {"tv", "mpeg", "limited"}:
+        return "tv"
+    return fallback
+
+
+def _check_sidecar_fingerprint(request: dict, sidecar: dict | None) -> None:
+    expected = str(request.get("sidecar_sha256") or "")
+    if not expected:
+        return
+    current = sidecar if isinstance(sidecar, dict) else {}
+    path = str(current.get("path") or "")
+    if not path or not Path(path).is_file():
+        raise CraftsError(
+            "The paired sidecar is missing. Refresh the clip metadata before preparing it.",
+            code="sidecar_changed",
+        )
+    digest = file_sha256(Path(path))
+    if digest != expected:
+        raise CraftsError(
+            "The sidecar changed after this job was queued. Nothing was published. Refresh the clip, then queue it again.",
+            code="sidecar_changed",
+        )
 
 
 def _colour_span(request: dict, colour_probe: dict, *, same_file: bool) -> tuple[float, float]:

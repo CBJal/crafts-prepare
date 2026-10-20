@@ -34,8 +34,8 @@ from PySide6.QtWidgets import (
 
 from ..errors import Cancelled, CraftsError
 from ..filters import FilterSpec
-from ..importer import list_media_paths
-from ..preview import PROXY_LIMIT_SECONDS, extract_thumbnail, make_proxy
+from ..importer import list_directory_media, list_media_paths
+from ..preview import PROXY_LIMIT_SECONDS, extract_thumbnail, make_comparison_proxy, make_proxy
 from ..recipe import default_recipe, lut_status, recipe_fingerprint
 from ..service import new_project
 from ..version import APP_NAME
@@ -43,7 +43,7 @@ from .brand import load_app_icon
 from .compare import CompareView
 from .dialogs import AboutDialog, SettingsDialog, TextDialog
 from .export_dialog import ExportDialog
-from .grade import describe_clip, safe_filters
+from .grade import describe_clip, profile_label, safe_filters
 from .grid import ThumbnailGrid
 from .icons import action_icon
 from .places import PlacesPanel
@@ -146,6 +146,19 @@ class MainWindow(QMainWindow):
         self._refresh_timer.setInterval(700)
         self._refresh_timer.timeout.connect(self.refresh_queue)
         self._refresh_timer.start()
+        self._recipe_timer = QTimer(self)
+        self._recipe_timer.setSingleShot(True)
+        self._recipe_timer.setInterval(200)
+        self._recipe_timer.timeout.connect(self._commit_focused_recipe)
+        for widget in (self.exposure, self.contrast, self.saturation, self.gyro_fov):
+            widget.valueChanged.connect(self._schedule_recipe)
+        self.profile.currentIndexChanged.connect(self._schedule_recipe)
+        self.gyro_enabled.toggled.connect(self._schedule_recipe)
+        self.gyro_strength.valueChanged.connect(self._schedule_recipe)
+        self.gyro_horizon.valueChanged.connect(self._schedule_recipe)
+        self.look_includes.toggled.connect(self._schedule_recipe)
+        self.input_lut.editingFinished.connect(self._schedule_recipe)
+        self.look_lut.editingFinished.connect(self._schedule_recipe)
         self._import_timer = QTimer(self)
         self._import_timer.setInterval(150)
         self._import_timer.timeout.connect(self._paint_partial)
@@ -159,12 +172,16 @@ class MainWindow(QMainWindow):
             from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
             from PySide6.QtMultimediaWidgets import QVideoWidget
 
+            from PySide6.QtMultimedia import QVideoSink
+
             self.player = QMediaPlayer(self)
             self.audio_output = QAudioOutput(self)
             self.video = QVideoWidget()
             self.video.setObjectName("videoWidget")
+            self.frame_sink = QVideoSink(self)
             self.player.setAudioOutput(self.audio_output)
-            self.player.setVideoOutput(self.video)
+            self.player.setVideoSink(self.frame_sink)
+            self.frame_sink.videoFrameChanged.connect(self._on_compare_frame)
             self.player.positionChanged.connect(self._on_position)
             self.player.durationChanged.connect(self._on_duration)
             self.player.errorOccurred.connect(self._on_player_error)
@@ -228,6 +245,10 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("inspectorPage")
         layout = QVBoxLayout(page)
+        self.browse_preview = FitLabel("No clip")
+        self.browse_preview.setMinimumHeight(120)
+        self.browse_preview.setMaximumHeight(180)
+        layout.addWidget(self.browse_preview)
         self.meta_summary = QLabel("Select a clip.")
         self.meta_summary.setWordWrap(True)
         self.meta_summary.setObjectName("metadataLabel")
@@ -371,15 +392,19 @@ class MainWindow(QMainWindow):
         self.gyro_strength.setRange(0, 100)
         self.gyro_strength.setValue(50)
         form.addRow("Strength", self.gyro_strength)
-        self.gyro_crop = QSlider(Qt.Orientation.Horizontal)
-        self.gyro_crop.setRange(0, 50)
-        form.addRow("Crop", self.gyro_crop)
+        self.gyro_fov = QDoubleSpinBox()
+        self.gyro_fov.setRange(0.1, 3.0)
+        self.gyro_fov.setSingleStep(0.05)
+        self.gyro_fov.setDecimals(2)
+        self.gyro_fov.setValue(1.0)
+        form.addRow("Field of view", self.gyro_fov)
         self.gyro_horizon = QSlider(Qt.Orientation.Horizontal)
         self.gyro_horizon.setRange(0, 100)
-        form.addRow("Horizon", self.gyro_horizon)
+        form.addRow("Horizon lock %", self.gyro_horizon)
         note = QLabel(
-            "Gyroflow reads this clip's embedded motion. XML names are not samples. "
-            "Visual stabilization is not substituted. Sony breathing correction is not available."
+            "Strength is Gyroflow smoothness (0–1). Field of view above 1 widens the frame. "
+            "Horizon lock is a percent, and 0 is off. XML names are not gyro samples. "
+            "Sony breathing correction is not available."
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -476,6 +501,7 @@ class MainWindow(QMainWindow):
             file_menu.addAction(action)
             toolbar.addAction(action)
         file_menu.addAction("Import files…", self.import_files)
+        file_menu.addAction("Import folder and subfolders…", self.import_folder_deep)
         file_menu.addAction("New", self.new_project)
         self.recent_menu = file_menu.addMenu("Recent")
         self._rebuild_recent()
@@ -547,11 +573,8 @@ class MainWindow(QMainWindow):
                 self.inspector_tabs.setTabIcon(index, action_icon(name, theme))
 
     def _folder_chosen(self, folder: str) -> None:
-        folders = [item for item in self.state.get("folders") or [] if item != folder]
-        folders.insert(0, folder)
-        self.state["folders"] = folders[:8]
-        self._save_preferences()
-        self.places.set_lists(self.state.get("folders") or [], self.state.get("favorites") or [])
+        self._remember_folder(folder)
+        self.places.show_tree(folder)
         self.import_paths([folder])
 
     def import_files(self) -> None:
@@ -562,22 +585,40 @@ class MainWindow(QMainWindow):
     def import_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Import folder")
         if folder:
+            self._remember_folder(folder)
+            self.places.show_tree(folder)
             self.import_paths([folder])
 
-    def import_paths(self, paths: list[str]) -> None:
+    def import_folder_deep(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Import folder and subfolders")
+        if folder:
+            self._remember_folder(folder)
+            self.places.show_tree(folder)
+            self.import_paths([folder], deep=True)
+
+    def _remember_folder(self, folder: str) -> None:
+        folders = [item for item in self.state.get("folders") or [] if item != folder]
+        folders.insert(0, folder)
+        self.state["folders"] = folders[:8]
+        self._save_preferences()
+        self.places.set_lists(self.state.get("folders") or [], self.state.get("favorites") or [])
+
+    def import_paths(self, paths: list[str], *, deep: bool = False) -> None:
         files: list[Path] = []
         missing: list[str] = []
         for raw in paths:
             path = Path(raw)
             if path.is_dir():
                 try:
-                    files.extend(list_media_paths(path))
-                except OSError as exc:
+                    listed = list_media_paths(path) if deep else list_directory_media(path)
+                    files.extend(listed)
+                except (OSError, CraftsError) as exc:
                     missing.append(f"{raw} ({exc})")
             elif path.is_file():
                 files.append(path.resolve())
             else:
                 missing.append(raw)
+        files.sort(key=lambda item: item.name.casefold())
         if len(paths) == 1 and Path(paths[0]).is_dir():
             self._browsed_root = Path(paths[0]).resolve()
         self._folder_token += 1
@@ -656,8 +697,8 @@ class MainWindow(QMainWindow):
                 continue
             items.append({"id": "pending:" + str(path), "name": path.name, "meta": "Reading", "error": ""})
         self.grid.set_items(items)
-        for clip in added:
-            self._thumbs.submit(clip, adjusted=True)
+        if added:
+            self._thumbs.request(added, adjusted=True)
 
     def _shown_clips(self) -> list[dict]:
         root = self._browsed_root
@@ -670,6 +711,7 @@ class MainWindow(QMainWindow):
             except (ValueError, OSError):
                 continue
             shown.append(clip)
+        shown.sort(key=lambda clip: str(clip.get("name") or "").casefold())
         return shown
 
     def _card_item(self, clip: dict) -> dict:
@@ -683,33 +725,15 @@ class MainWindow(QMainWindow):
         if sidecar.get("status") == "ok":
             badges.append("XML")
         elif sidecar.get("status") not in {None, "missing"}:
-            badges.append(str(sidecar.get("status")))
-        data_streams = (clip.get("summary") or {}).get("data_streams")
-        if data_streams is None:
-            data_streams = len((clip.get("probe") or {}).get("data") or [])
-        if data_streams:
-            badges.append("data")
-        if sidecar.get("gyro_announced"):
-            badges.append("gyro announced")
-        recipe = described["recipe"]
-        if any(
-            (
-                recipe.get("profile") not in {None, "auto"},
-                recipe.get("exposure_ev"),
-                recipe.get("input_lut"),
-                recipe.get("look_lut"),
-                recipe.get("gyro_enabled"),
-            )
-        ):
-            badges.append("adjusted")
+            badges.append(str(sidecar.get("status")).replace("_", " "))
+        label = profile_label(str(profile.get("pipeline") or ""))
+        if label not in {"Unknown", "Preserve"}:
+            badges.append(label)
+        elif profile.get("status") == "preserve":
+            badges.append("Preserve")
         text = f"{float(duration or 0):.1f}s"
         if badges:
             text += "  " + " ".join(badges)
-        pipeline = profile.get("pipeline")
-        if pipeline and pipeline not in {"unknown", "preserve"}:
-            text += f"  {pipeline}"
-        elif profile.get("status") == "preserve":
-            text += "  preserve"
         return {"id": clip["id"], "name": clip.get("name") or Path(clip["path"]).name, "meta": text, "error": ""}
 
     def _thumb_ready(self, generation: int, clip_id: str, path: str, error: str) -> None:
@@ -734,8 +758,7 @@ class MainWindow(QMainWindow):
         self._update_count()
         self._refresh_project_chip()
         self.places.set_lists(self.state.get("folders") or [], self.state.get("favorites") or [])
-        for clip in shown:
-            self._thumbs.submit(clip, adjusted=True)
+        self._thumbs.request(shown, adjusted=True)
         self._fill_focus()
 
     def _selection_changed(self) -> None:
@@ -767,7 +790,11 @@ class MainWindow(QMainWindow):
         return None
 
     def focus_clip(self, clip_id: str) -> None:
+        previous = self.focused_id()
+        if previous and previous != clip_id:
+            self._commit_focused_recipe(preview=False)
         self._invalidate_viewer()
+        self._gyro_preview_for = getattr(self, "_gyro_preview_for", {})
         self.grid.select_only(clip_id)
         self._fill_focus()
 
@@ -803,12 +830,15 @@ class MainWindow(QMainWindow):
                 lines.append(" ".join(str(part) for part in sidecar["device"].values()))
             lines.extend(lut_status(recipe))
             self.meta_summary.setText("\n".join(line for line in lines if line))
+            preview = self.grid._pixmaps.get(clip["id"])
+            if isinstance(preview, QPixmap) and not preview.isNull():
+                self.browse_preview.set_source(preview)
             self.meta_details.setPlainText(
                 f"{clip.get('path')}\nsha256 {clip.get('sha256')}\n"
                 f"gamma {sidecar.get('gamma_raw') or '-'}  primaries {sidecar.get('primaries_raw') or '-'}\n"
                 f"tags {video.get('color_transfer')} / {video.get('color_primaries')} / {video.get('color_range')}"
             )
-            self.profile_detected.setText(profile.get("message") or "")
+            self.profile_detected.setText(profile.get("message") or profile_label(str(profile.get("pipeline") or "")))
             index = self.profile.findData(recipe.get("profile") or "auto")
             if index >= 0:
                 self.profile.setCurrentIndex(index)
@@ -819,9 +849,12 @@ class MainWindow(QMainWindow):
             self.look_lut.setText(recipe.get("look_lut") or "")
             self.look_includes.setChecked(bool(recipe.get("look_includes_camera")))
             self.gyro_enabled.setChecked(bool(recipe.get("gyro_enabled")))
-            self.gyro_strength.setValue(int(round(float(recipe.get("gyro_smoothness") or 0.5) * 100)))
-            self.gyro_crop.setValue(int(round((float(recipe.get("gyro_fov") or 1) - 1) * 100)))
-            self.gyro_horizon.setValue(int(round(float(recipe.get("gyro_horizon") or 0) * 100)))
+            smoothness = recipe.get("gyro_smoothness")
+            self.gyro_strength.setValue(int(round(float(0.5 if smoothness is None else smoothness) * 100)))
+            fov = recipe.get("gyro_fov")
+            self.gyro_fov.setValue(float(1.0 if fov is None else fov))
+            horizon = recipe.get("gyro_horizon")
+            self.gyro_horizon.setValue(int(round(float(0 if horizon is None else horizon))))
             self.notes.setPlainText(clip.get("notes") or "")
             flag_index = self.flag.findData(clip.get("flag") or "")
             if flag_index >= 0:
@@ -848,9 +881,31 @@ class MainWindow(QMainWindow):
             "look_includes_camera": self.look_includes.isChecked(),
             "gyro_enabled": self.gyro_enabled.isChecked(),
             "gyro_smoothness": self.gyro_strength.value() / 100,
-            "gyro_fov": 1 + (self.gyro_crop.value() / 100),
-            "gyro_horizon": self.gyro_horizon.value() / 100,
+            "gyro_fov": self.gyro_fov.value(),
+            "gyro_horizon": float(self.gyro_horizon.value()),
         }
+
+    def _schedule_recipe(self, *_args) -> None:
+        if self._filling:
+            return
+        self._recipe_timer.start()
+
+    def _commit_focused_recipe(self, preview: bool = True) -> bool:
+        clip = self.focused_clip()
+        if clip is None or self._filling:
+            return True
+        try:
+            updated = self.service.update_clip(clip["id"], {"recipe": self.recipe_from_controls()})
+        except CraftsError as exc:
+            self.last_error = exc.message
+            self.statusBar().showMessage(exc.message, 6000)
+            return False
+        self.clips = self.service.clips()
+        if preview and self.center.currentIndex() == 1:
+            self.request_comparison()
+        elif preview:
+            self._thumbs.request([updated], adjusted=True)
+        return True
 
     def apply_recipe_to_selected(self) -> None:
         recipe = self.recipe_from_controls()
@@ -957,7 +1012,7 @@ class MainWindow(QMainWindow):
         self.queue_checked_batch("prepare")
 
     def queue_checked_batch(self, operation: str) -> None:
-        if not self.commit_editor():
+        if not self._commit_focused_recipe(preview=False) or not self.commit_editor():
             return
         ids = self.selected_ids()
         if not ids and self.focused_id():
@@ -1056,7 +1111,7 @@ class MainWindow(QMainWindow):
         self.export_dialog.jobs.setPlainText("\n".join(lines))
 
     def request_playback(self) -> None:
-        self._request_proxy(force=False, processed=self.compare_mode.currentData() == "processed")
+        self.request_comparison()
 
     def request_still(self, adjusted: bool) -> None:
         clip = self.focused_clip()
@@ -1094,45 +1149,69 @@ class MainWindow(QMainWindow):
             return
         self._compare_token += 1
         token = self._compare_token
-        seconds = self._current_seconds(clip)
-        self.preview_status.setText("Comparison updating.")
+        position = self.player.position() if self.player is not None else 0
+        described = describe_clip(clip)
+        pipeline = str(described["profile"].get("pipeline") or "")
+        gyro_on = bool(described["recipe"].get("gyro_enabled"))
+        gyro_path = (getattr(self, "_gyro_preview_for", {}) or {}).get(clip["id"])
+        self.preview_status.setText("Comparison preview is rendering.")
 
         def work(cancel):
             ffmpeg, _ffprobe = self.service._tools()
-            duration = float((clip.get("probe") or {}).get("duration") or 0)
-            paths = {"seconds": seconds, "message": ""}
-            for adjusted, name in ((False, "original"), (True, "processed")):
-                if cancel is not None and cancel.is_set():
-                    raise Cancelled()
-                directory = self.service.data_dir / "compare-src" / f"{clip['id']}-{name}"
-                filters, files, message = safe_filters(clip, directory, adjusted=adjusted, cache=self.service.data_dir / "colour-cache")
-                destination = self.service.data_dir / f"compare-{clip['id']}-{name}-{token}.jpg"
-                extract_thumbnail(
-                    ffmpeg=ffmpeg,
-                    source=Path(clip["path"]),
-                    seconds=seconds,
-                    destination=destination,
-                    spec=FilterSpec(),
-                    duration=duration,
-                    cancel=cancel,
-                    extra_filters=filters or None,
-                    stage_files=files or None,
-                )
-                paths[name] = str(destination)
-                paths["message"] = message
-            return paths
+            directory = self.service.data_dir / "compare-src" / clip["id"]
+            filters, files, message = safe_filters(clip, directory, adjusted=True, cache=self.service.data_dir / "colour-cache")
+            if pipeline in {"slog3_sgamut3cine", "hlg_bt2020"} and not filters:
+                raise CraftsError(message or "The processed comparison was not built.", code="colour_unresolved")
+            right = Path(gyro_path) if gyro_on and gyro_path and Path(gyro_path).is_file() else None
+            destination = self.service.data_dir / f"compare-{clip['id']}-{token}.mp4"
+            make_comparison_proxy(
+                ffmpeg=ffmpeg,
+                source=Path(clip["path"]),
+                destination=destination,
+                colour_filter=filters,
+                stage_files=files or None,
+                right_source=right,
+                cancel=cancel,
+            )
+            prime = destination.with_suffix(".png")
+            from ..process import run_captured
 
-        def done(paths: dict) -> None:
-            if token != self._compare_token:
+            run_captured(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-ss", "0", "-i", str(destination), "-frames:v", "1", str(prime)],
+                timeout=60,
+                cancel=cancel,
+            )
+            return {
+                "path": str(destination),
+                "prime": str(prime),
+                "message": message,
+                "gyro": bool(right),
+                "pipeline": pipeline,
+                "token": token,
+            }
+
+        def done(result: dict) -> None:
+            if result.get("token") != self._compare_token or self.player is None:
                 return
-            left = QPixmap(paths["original"])
-            right = QPixmap(paths["processed"])
-            self.still_original.set_source(left)
-            self.still_adjusted.set_source(right)
-            self.compare.set_pair(left, right, float(paths["seconds"]))
-            self.still_path = paths["processed"]
-            stale = "Stabilization preview has not been updated." if self.gyro_enabled.isChecked() else ""
-            self.preview_status.setText(" ".join(part for part in (paths.get("message"), stale, "Both sides use this frame.") if part))
+            prime = QPixmap(result.get("prime") or "")
+            if not prime.isNull():
+                self.compare.present_split(prime, position / 1000.0)
+                self.still_original.set_source(self.compare._left)
+                self.still_adjusted.set_source(self.compare._right)
+            self._compare_path = result["path"]
+            self.player.setVideoSink(self.frame_sink)
+            self.player.setSource(QUrl.fromLocalFile(result["path"]))
+            self.player.setPosition(position)
+            self.still_path = result["path"]
+            self.playback_result = {"kind": "comparison", "proxy_path": result["path"], "limited": False}
+            if gyro_on and not result.get("gyro"):
+                note = "Colour preview is current. Stabilization preview has not been updated."
+            elif result.get("gyro"):
+                note = "Both sides follow one clock. The processed side is the Gyroflow preview plus colour."
+            else:
+                note = "Both sides follow one clock."
+            self.preview_status.setText(" ".join(part for part in (result.get("message"), note) if part))
+            self.viewer_stack.setCurrentIndex(0)
 
         self._start(work, done, key="compare")
 
@@ -1198,10 +1277,13 @@ class MainWindow(QMainWindow):
             if result.get("error"):
                 self.gyro_status.setText(str(result["error"]))
                 return
-            self.gyro_status.setText("Stabilization preview is ready and uses Gyroflow output.")
-            self.playback_result = {"kind": "gyro-preview", "proxy_path": result.get("output_path")}
-            if self.player is not None and result.get("output_path"):
-                self.player.setSource(QUrl.fromLocalFile(str(result["output_path"])))
+            path = str(result.get("output_path") or "")
+            self._gyro_preview_for = getattr(self, "_gyro_preview_for", {})
+            if clip is not None and path:
+                self._gyro_preview_for[clip["id"]] = path
+            self.gyro_status.setText("Stabilization preview is ready. Comparison will use that Gyroflow output.")
+            self.playback_result = {"kind": "gyro-preview", "proxy_path": path}
+            self.request_comparison()
 
         self._start(work, done, key="gyro-preview")
 
@@ -1233,6 +1315,8 @@ class MainWindow(QMainWindow):
         self.still_original.set_source(QPixmap())
         self.still_adjusted.set_source(QPixmap())
         self.compare.set_pair(QPixmap(), QPixmap(), 0.0)
+        self.compare._paired = False
+        self.compare.frames_presented = 0
         if self.player is not None:
             self.player.stop()
             self.player.setSource(QUrl())
@@ -1241,14 +1325,28 @@ class MainWindow(QMainWindow):
             self.time_label.setText("0:00.0 / 0:00.0")
 
     def _compare_mode_changed(self) -> None:
-        mode = self.compare_mode.currentData()
-        self.compare.set_mode("split" if mode == "split" else "wipe" if mode == "wipe" else "split")
-        if mode in {"original", "processed"} and self.video is not None:
-            self.viewer_stack.setCurrentWidget(self.video)
-            self.request_playback()
-        else:
-            self.viewer_stack.setCurrentIndex(0)
-            self.request_comparison()
+        mode = str(self.compare_mode.currentData() or "split")
+        self.compare.set_mode(mode if mode in {"split", "wipe", "original", "processed"} else "split")
+        self.viewer_stack.setCurrentIndex(0)
+
+    def _on_compare_frame(self, frame) -> None:
+        image = frame.toImage() if hasattr(frame, "toImage") else None
+        if image is None or image.isNull() or self.player is None:
+            return
+        seconds = self.player.position() / 1000.0
+        self.compare.present_split(image, seconds)
+        self.still_original.set_source(self.compare._left)
+        self.still_adjusted.set_source(self.compare._right)
+        self.still_path = getattr(self, "_compare_path", "") or self.still_path
+
+    def _frame_ms(self) -> int:
+        clip = self.focused_clip()
+        video = (((clip or {}).get("probe") or {}).get("video") or [{}])[0] or {}
+        num = int(video.get("frame_rate_num") or 25)
+        den = int(video.get("frame_rate_den") or 1)
+        if num <= 0:
+            return 40
+        return max(1, int(round(1000 * den / num)))
 
     def play(self) -> None:
         if self.player is not None:
@@ -1262,13 +1360,11 @@ class MainWindow(QMainWindow):
         if self.player is None:
             return
         self.player.pause()
-        self.player.setPosition(max(0, self.player.position() + direction * 40))
-        self.request_comparison()
+        self.player.setPosition(max(0, self.player.position() + direction * self._frame_ms()))
 
     def _seek(self, position: int) -> None:
         if self.player is not None:
             self.player.setPosition(position)
-        self.request_comparison()
 
     def _on_position(self, position: int) -> None:
         self.time_label.setText(self._format_time(position))
