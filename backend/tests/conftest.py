@@ -17,6 +17,39 @@ def client(tmp_path, monkeypatch):
         yield test_client
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _close_qt_before_interpreter_shutdown():
+    """Stop player threads before Qt tears the process down."""
+    yield
+    try:
+        from PySide6.QtWidgets import QApplication
+    except Exception:
+        return
+    application = QApplication.instance()
+    if application is None:
+        return
+    from PySide6.QtCore import QThread, QUrl
+
+    for widget in list(application.topLevelWidgets()):
+        player = getattr(widget, "player", None)
+        if player is not None:
+            player.stop()
+            player.setVideoSink(None)
+            player.setSource(QUrl())
+        runner = getattr(widget, "_runner", None)
+        if runner is not None and runner.isRunning():
+            runner.shutdown(timeout=2)
+        thumbs = getattr(widget, "_thumbs", None)
+        if thumbs is not None:
+            thumbs.shutdown()
+        widget.close()
+        widget.deleteLater()
+    application.processEvents()
+    lingering = [thread.objectName() or type(thread).__name__ for thread in application.findChildren(QThread) if thread.isRunning()]
+    if lingering:
+        print("QT_THREADS_STILL_RUNNING", lingering)
+
+
 @pytest.fixture(scope="session")
 def media_dir(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("media")

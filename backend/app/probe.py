@@ -73,6 +73,40 @@ def parse_rational(value: str | None) -> Rational | None:
     return Rational(num // divisor, den // divisor)
 
 
+def normalize_rotation(value) -> int:
+    """Map a display angle to 0, 90, 180, or 270. Unknown values stay 0."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number):
+        return 0
+    quarters = int(round(number / 90.0)) % 4
+    return (quarters * 90) % 360
+
+
+def display_dimensions(video: dict | None) -> tuple[int, int]:
+    """Pixel size after one display rotation. Missing rotation is stored size."""
+    video = video or {}
+    width = int(video.get("width") or 0)
+    height = int(video.get("height") or 0)
+    if normalize_rotation(video.get("rotation")) in {90, 270}:
+        return height, width
+    return width, height
+
+
+def _stream_rotation(stream: dict) -> int:
+    tags = stream.get("tags") or {}
+    if isinstance(tags, dict):
+        for key, value in tags.items():
+            if str(key).casefold() in {"rotate", "rotation"}:
+                return normalize_rotation(value)
+    for side in stream.get("side_data_list") or []:
+        if isinstance(side, dict) and "rotation" in side:
+            return normalize_rotation(side.get("rotation"))
+    return 0
+
+
 def bit_depth_for(pix_fmt: str | None, raw_bits: int | None) -> int | None:
     if raw_bits and raw_bits > 0:
         return raw_bits
@@ -131,6 +165,10 @@ def describe_probe(payload: dict) -> dict:
             except (TypeError, ValueError):
                 raw_bits_i = None
             pix = stream.get("pix_fmt")
+            rotation = _stream_rotation(stream)
+            coded_w = _int(stream.get("width")) or 0
+            coded_h = _int(stream.get("height")) or 0
+            display_w, display_h = (coded_h, coded_w) if rotation in {90, 270} else (coded_w, coded_h)
             videos.append(
                 {
                     "index": stream.get("index"),
@@ -139,6 +177,9 @@ def describe_probe(payload: dict) -> dict:
                     "profile": stream.get("profile"),
                     "width": stream.get("width"),
                     "height": stream.get("height"),
+                    "rotation": rotation,
+                    "display_width": display_w,
+                    "display_height": display_h,
                     "pix_fmt": pix,
                     "bit_depth": bit_depth_for(pix, raw_bits_i),
                     "color_space": stream.get("color_space"),

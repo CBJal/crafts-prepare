@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 from .errors import Cancelled, CraftsError
 from .filters import FilterSpec, chain_for, detect_chain
 from .presets import PRESETS, conversion_note
-from .probe import Rational, parse_rational, probe_file
+from .probe import Rational, display_dimensions, normalize_rotation, parse_rational, probe_file
 from .process import run_captured
 from .security import exclusive_output, partial_path, publish_exclusive, safe_filename, safe_suffix
 
@@ -39,6 +40,8 @@ def build_export_args(
     audio: bool,
     crf: int | None,
     filter_chain: str | None,
+    output_color: dict | None = None,
+    noautorotate: bool = False,
 ) -> list[str]:
     args = [
         ffmpeg,
@@ -48,6 +51,12 @@ def build_export_args(
         "-progress",
         "pipe:1",
         "-nostats",
+    ]
+    if noautorotate:
+        # Pixels are already upright. A second autorotate would turn them again.
+        args.append("-noautorotate")
+    args.extend(
+        [
         "-i",
         str(source),
         "-ss",
@@ -56,7 +65,8 @@ def build_export_args(
         f"{duration:.6f}",
         "-frames:v",
         str(frames),
-    ]
+        ]
+    )
     if filter_chain:
         # One argv value. A removed file-option form is not used.
         args.extend(["-vf", filter_chain])
@@ -80,6 +90,18 @@ def build_export_args(
         args.append("-an")
     if preset["container"] == "mp4":
         args.extend(["-movflags", "+faststart"])
+    if output_color:
+        for key, flag in (
+            ("colorspace", "-colorspace"),
+            ("primaries", "-color_primaries"),
+            ("trc", "-color_trc"),
+            ("range", "-color_range"),
+        ):
+            if output_color.get(key):
+                args.extend([flag, str(output_color[key])])
+    # Rotation is applied once, on decode. Do not leave a display matrix that
+    # would rotate the finished pixels a second time.
+    args.extend(["-metadata:s:v:0", "rotate=0"])
     args.extend(["-f", preset["container"], str(partial)])
     return args
 
@@ -125,6 +147,10 @@ def run_export(
     cancel: threading.Event,
     on_progress,
     encoders: dict,
+    extra_filters: str | None = None,
+    stage_files: dict[str, Path] | None = None,
+    output_color: dict | None = None,
+    noautorotate: bool = False,
 ) -> dict:
     preset = PRESETS.get(preset_id)
     if preset is None:
@@ -143,6 +169,11 @@ def run_export(
     video = (probe.get("video") or [None])[0]
     if not video:
         raise CraftsError("The clip has no video stream.", code="unreadable_media")
+    if "rotation" not in video:
+        fresh = probe_file(ffprobe, source, cancel=cancel)
+        if fresh.get("video"):
+            probe = fresh
+            video = fresh["video"][0]
     rate = Rational(int(video["frame_rate_num"]), int(video["frame_rate_den"]))
     if rate.num <= 0 or rate.den <= 0:
         raise CraftsError("The source frame rate is not a usable rational.", code="bad_rate")
@@ -186,6 +217,10 @@ def run_export(
 
             shutil.copyfile(validate_lut(spec.lut_path), work / "grade.cube")
             spec.lut_name = "grade.cube"
+        for name, staged in (stage_files or {}).items():
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+                raise CraftsError("Internal colour filename is not safe.", code="bad_lut")
+            shutil.copyfile(staged, work / name)
         if spec.stabilization == "vidstab":
             detect = detect_chain(shakiness, accuracy, "transforms.trf")
             detect_args = [
@@ -220,6 +255,12 @@ def run_export(
                 )
             spec.trf_name = "transforms.trf"
         filter_chain = chain_for(spec)
+        if extra_filters:
+            filter_chain = extra_filters if not filter_chain else f"{extra_filters},{filter_chain}"
+        if not noautorotate and normalize_rotation(video.get("rotation")) in {90, 270} and not filter_chain:
+            # An empty graph can skip display rotation. One no-op filter makes
+            # FFmpeg apply the stored rotation exactly once before encode.
+            filter_chain = "setsar=1"
         chosen_crf = crf if crf is not None else preset.get("crf_default")
         args = build_export_args(
             ffmpeg=ffmpeg,
@@ -234,6 +275,8 @@ def run_export(
             audio=audio,
             crf=chosen_crf,
             filter_chain=filter_chain or None,
+            output_color=output_color,
+            noautorotate=noautorotate,
         )
 
         def on_line(line: str) -> None:
@@ -253,10 +296,11 @@ def run_export(
             frames=frames,
             duration=span,
             spec=spec,
-            source_w=int(video["width"]),
-            source_h=int(video["height"]),
+            source_w=(int(video["width"]) if noautorotate else display_dimensions(video)[0]),
+            source_h=(int(video["height"]) if noautorotate else display_dimensions(video)[1]),
             pix_fmt=preset["pix_fmt"],
             audio=audio,
+            output_color=output_color,
         )
         published = publish_exclusive(partial, final, source)
         return {
@@ -313,6 +357,7 @@ def _validate_output(
     source_h: int,
     pix_fmt: str,
     audio: bool,
+    output_color: dict | None = None,
 ) -> dict:
     probed = probe_file(ffprobe, path)
     video = (probed.get("video") or [None])[0]
@@ -347,6 +392,28 @@ def _validate_output(
         raise CraftsError("Output is missing the requested audio stream.", code="invalid_output")
     if not audio and has_audio:
         raise CraftsError("Output contains audio even though audio was turned off.", code="invalid_output")
+    if output_color:
+        problems = []
+        expected = {
+            field: output_color[key]
+            for field, key in (("color_space", "colorspace"), ("color_primaries", "primaries"),
+                               ("color_transfer", "trc"), ("color_range", "range"))
+            if output_color.get(key)
+        }
+        for key, want in expected.items():
+            if not want:
+                continue
+            got = (video.get(key) or "").casefold()
+            if key == "color_range" and not got and (video.get("codec") or "") == "prores":
+                # ProRes does not store color_range. The scale filter still wrote limited-range samples.
+                continue
+            if got != str(want).casefold():
+                problems.append(f"{key}={video.get(key) or 'missing'}")
+        if problems:
+            raise CraftsError(
+                "Output colour tags do not match the requested plan (" + ", ".join(problems) + "). It was not published.",
+                code="invalid_output",
+            )
     return {
         "duration": got_duration,
         "requested_duration": duration,

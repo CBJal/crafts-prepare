@@ -1,106 +1,58 @@
-"""Native main window. It calls Service directly and does not open a browser."""
+"""Browse, adjust, and export. One selection model and one preparation queue."""
 
 from __future__ import annotations
 
-import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEventLoop, QSize, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QPixmap
+from PySide6.QtCore import QEventLoop, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
-    QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
-    QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSlider,
-    QSpinBox,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
+    QStackedWidget,
+    QStatusBar,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
-from ..errors import CraftsError
+from ..errors import Cancelled, CraftsError
 from ..filters import FilterSpec
-from ..presets import PRESETS, conversion_note
-from ..preview import PROXY_LIMIT_SECONDS
+from ..importer import list_directory_media, list_media_paths
+from ..preview import PROXY_LIMIT_SECONDS, extract_thumbnail, make_comparison_proxy, make_proxy
+from ..recipe import default_recipe, lut_status, recipe_fingerprint
 from ..service import new_project
 from ..version import APP_NAME
+from .brand import load_app_icon
+from .compare import CompareView
 from .dialogs import AboutDialog, SettingsDialog, TextDialog
+from .export_dialog import ExportDialog
+from .grade import describe_clip, profile_label, safe_filters
+from .grid import ThumbnailGrid
+from .icons import action_icon
+from .places import PlacesPanel
 from .prefs import load_state, remember_project, save_state
 from .theme import apply_theme
+from .thumbs import ThumbnailHub
 from .workers import TaskRunner
 
 _ACTIVE = {"queued", "running"}
-
-_ICON_FOR_LABEL = {
-    "New": "new",
-    "Open…": "open",
-    "Save": "save",
-    "Save as…": "save-as",
-    "Import files…": "import",
-    "Import folder…": "import-folder",
-    "Select all": "select",
-    "Select all for batch": "select",
-    "Clear": "clear",
-    "Clear batch checks": "clear",
-    "Playback": "playback",
-    "Original": "still",
-    "Adjusted": "adjusted",
-    "Play": "play",
-    "Pause": "pause",
-    "Frame −": "frame-back",
-    "Frame +": "frame-forward",
-    "Set in": "mark-in",
-    "Set out": "mark-out",
-    "Save notes": "save",
-    "Add marker at playhead": "marker",
-    "Remove marker": "clear",
-    "LUT…": "browse",
-    "Folder…": "browse",
-    "Preset…": "browse",
-    "Browse": "browse",
-    "Export focused clip": "export",
-    "Export checked clips": "export",
-    "Gyro checked clips": "gyro",
-    "Parse GCSV": "log",
-    "Inspect telemetry": "tools",
-    "Queue manual gyro": "gyro",
-    "Copy path": "copy",
-    "Technical details": "about",
-    "Cancel job": "cancel",
-    "Retry job": "retry",
-    "Cancel batch": "cancel",
-    "Retry failed": "retry",
-    "External programs…": "tools",
-    "Clip": "clip",
-    "Refresh tool report": "retry",
-    "Light": "sun",
-    "Dark": "moon",
-    "System": "system",
-    "Reset layout": "layout",
-    "About": "about",
-    "Preview limits": "help",
-    "Log folder": "log",
-    "Licenses": "about",
-}
 
 
 class FitLabel(QLabel):
@@ -139,6 +91,28 @@ class FitLabel(QLabel):
         return QSize(640, 360)
 
 
+class WrappedLabel(QLabel):
+    """Keep wrapped form text tall enough after a panel or DPI resize."""
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        super().setText(text)
+        self._fit_height()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        height = self.heightForWidth(max(1, self.width()))
+        if height >= 0 and self.minimumHeight() != height:
+            self.setMinimumHeight(height)
+
+
 class MainWindow(QMainWindow):
     idle = Signal()
     peer_raised = Signal()
@@ -155,176 +129,213 @@ class MainWindow(QMainWindow):
         self._view_gen = 0
         self._project_gen = 0
         self._still_seq = 0
+        self._folder_token = 0
         self._notes_dirty = False
-        self._proxy_fallback = False
-        self._scheme_connected = False
-        self._laid_out = False
-        self._callbacks: dict[int, object] = {}
-        self._runner = TaskRunner()
-        self._runner.succeeded.connect(self._task_ok)
-        self._runner.failed.connect(self._task_fail)
-        self._runner.start()
         self._filling = False
+        self._proxy_fallback = False
+        self._callbacks: dict[int, object] = {}
+        self._finalizers: dict[int, object] = {}
+        self._partial: dict | None = None
+        self._import_errors: list[dict] = []
+        self._browsed_root: Path | None = None
+        self._pending_markers: list | None = None
+        self._compare_token = 0
         self.still_path = ""
         self.playback_result: dict | None = None
         self.last_error = ""
         self.force_close = False
         self.last_batch_id = ""
-        self._lock_message_shown = False
+        self.player_error = ""
         self.setWindowTitle(APP_NAME)
+        icon = load_app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         self.resize(1280, 800)
         self.setMinimumSize(960, 640)
         self.setAcceptDrops(True)
+        self._runner = TaskRunner()
+        self._runner.succeeded.connect(self._task_ok)
+        self._runner.failed.connect(self._task_fail)
+        self._runner.start()
+        self._thumbs = ThumbnailHub(service)
+        self._thumbs.ready.connect(self._thumb_ready)
         self._build_player()
-        self._build_library()
-        self._build_viewer()
-        self._build_inspector()
-        self._build_queue()
+        self._build_shell()
         self._build_actions()
-        self.set_theme(self.state["theme"])
+        self.set_theme(self.state.get("theme") or "system")
         self._restore_window()
         self.reload_all()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(700)
         self._refresh_timer.timeout.connect(self.refresh_queue)
         self._refresh_timer.start()
+        self._pending_edit: tuple[str, dict] | None = None
+        self._selection_guard = False
+        self._filled_id: str | None = None
+        self._gyro_geometry: dict[str, dict] = {}
+        self._gyro_token = 0
+        self._geometry_users: dict[tuple[str, int], str] = {}
+        self._metadata_token = 0
+        self._metadata_cancel = None
+        self._frame_token = 0
+        self._frame_cancel = None
+        self._paused_frame_target: float | None = None
+        self.comparison_used_gyro = False
+        self._recipe_timer = QTimer(self)
+        self._recipe_timer.setSingleShot(True)
+        self._recipe_timer.setInterval(200)
+        self._recipe_timer.timeout.connect(self._commit_focused_recipe)
+        for widget in (self.exposure, self.contrast, self.saturation, self.gyro_fov):
+            widget.valueChanged.connect(self._schedule_recipe)
+        self.profile.currentIndexChanged.connect(self._schedule_recipe)
+        self.gyro_enabled.toggled.connect(self._schedule_recipe)
+        self.gyro_strength.valueChanged.connect(self._schedule_recipe)
+        self.gyro_horizon.valueChanged.connect(self._schedule_recipe)
+        self.look_includes.toggled.connect(self._schedule_recipe)
+        self.input_lut.editingFinished.connect(self._schedule_recipe)
+        self.look_lut.editingFinished.connect(self._schedule_recipe)
+        self._import_timer = QTimer(self)
+        self._import_timer.setInterval(150)
+        self._import_timer.timeout.connect(self._paint_partial)
         self._start(lambda cancel: self.service.capabilities(cancel=cancel), self._apply_capabilities, key="caps")
 
     def _build_player(self) -> None:
         self.player = None
-        self.audio = None
+        self.audio_output = None
         self.video = None
         try:
             from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
             from PySide6.QtMultimediaWidgets import QVideoWidget
 
+            from PySide6.QtMultimedia import QVideoSink
+
             self.player = QMediaPlayer(self)
-            self.audio = QAudioOutput(self)
+            self.audio_output = QAudioOutput(self)
             self.video = QVideoWidget()
             self.video.setObjectName("videoWidget")
-            self.player.setAudioOutput(self.audio)
-            self.player.setVideoOutput(self.video)
+            self.frame_sink = QVideoSink(self)
+            self.player.setAudioOutput(self.audio_output)
+            self.player.setVideoSink(self.frame_sink)
+            self.frame_sink.videoFrameChanged.connect(self._on_compare_frame)
             self.player.positionChanged.connect(self._on_position)
             self.player.durationChanged.connect(self._on_duration)
             self.player.errorOccurred.connect(self._on_player_error)
-        except Exception as exc:  # noqa: BLE001 — stills still work without a playback device
+        except Exception as exc:  # noqa: BLE001
             self.player_error = str(exc)
-        else:
-            self.player_error = ""
 
-    def _build_library(self) -> None:
-        dock = QDockWidget("Library", self)
-        dock.setObjectName("libraryDock")
-        body = QWidget()
-        body.setObjectName("libraryBody")
-        layout = QVBoxLayout(body)
-        controls = QHBoxLayout()
-        select_all = QPushButton("Select all")
-        select_all.setObjectName("selectAllButton")
-        select_all.clicked.connect(self.select_all_batch)
-        select_all.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        clear = QPushButton("Clear")
-        clear.setObjectName("clearChecksButton")
-        clear.clicked.connect(self.clear_batch)
-        clear.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self.batch_count = QLabel("0 of 0 selected")
-        self.batch_count.setObjectName("batchCount")
-        self.batch_count.setMinimumWidth(0)
-        controls.addWidget(select_all)
-        controls.addWidget(clear)
-        controls.addStretch(1)
-        layout.addLayout(controls)
-        layout.addWidget(self.batch_count)
-        self.library = QTableWidget(0, 4)
-        self.library_empty = QLabel("No clips yet. Import files or a folder.")
-        self.library_empty.setObjectName("libraryEmpty")
-        self.library_empty.setWordWrap(True)
-        layout.addWidget(self.library_empty)
-        self.library.setObjectName("libraryTable")
-        self.library.setHorizontalHeaderLabels(["Batch", "Clip", "Flag", "Duration"])
-        self.library.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.library.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.library.setWordWrap(False)
-        self.library.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.library.verticalHeader().setVisible(False)
-        header = self.library.horizontalHeader()
-        header.setSectionResizeMode(0, header.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, header.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, header.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, header.ResizeMode.ResizeToContents)
-        self.library_dock = dock
-        self.library.currentCellChanged.connect(self._focus_changed)
-        self.library.itemChanged.connect(self._check_changed)
-        layout.addWidget(self.library)
-        dock.setWidget(body)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+    def _build_shell(self) -> None:
+        shell = QWidget()
+        shell.setObjectName("viewerShell")
+        self.setCentralWidget(shell)
+        outer = QVBoxLayout(shell)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.splitter = QSplitter()
+        self.splitter.setObjectName("browserSplit")
+        outer.addWidget(self.splitter, 1)
+        self.places = PlacesPanel()
+        self.places.setMinimumWidth(180)
+        self.places.setMaximumWidth(280)
+        self.places.folder_chosen.connect(self._folder_chosen)
+        self.splitter.addWidget(self.places)
+        self.center = QStackedWidget()
+        self.center.addWidget(self._build_browse())
+        self.center.addWidget(self._build_view())
+        self.splitter.addWidget(self.center)
+        self.right = QStackedWidget()
+        self.right.setMinimumWidth(240)
+        self.right.setMaximumWidth(360)
+        self.right.addWidget(self._build_browse_meta())
+        self.right.addWidget(self._build_corrections())
+        self.splitter.addWidget(self.right)
+        self.splitter.setSizes([220, 900, 320])
+        self.splitter.setStretchFactor(1, 1)
+        self.setStatusBar(QStatusBar())
+        self._show_mode(0)
 
-    def _build_viewer(self) -> None:
-        from PySide6.QtWidgets import QStackedWidget
+    def _build_browse(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        row = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Filter filenames")
+        self.size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.size_slider.setRange(140, 240)
+        self.size_slider.setValue(180)
+        self.size_slider.setFixedWidth(120)
+        self.batch_count = QLabel("0 selected")
+        row.addWidget(self.search, 1)
+        row.addWidget(QLabel("Size"))
+        row.addWidget(self.size_slider)
+        row.addWidget(self.batch_count)
+        layout.addLayout(row)
+        self.grid = ThumbnailGrid()
+        self.grid.selection_changed.connect(self._selection_changed)
+        self.grid.activated.connect(self._open_adjust)
+        self.search.textChanged.connect(self.grid.set_filter)
+        self.size_slider.valueChanged.connect(self.grid.set_card_width)
+        layout.addWidget(self.grid, 1)
+        return page
 
-        center = QWidget()
-        center.setObjectName("viewerShell")
-        layout = QVBoxLayout(center)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(8)
-        header = QHBoxLayout()
-        self.brand_mark = QLabel()
-        self.brand_mark.setObjectName("brandMark")
-        self.brand_mark.setFixedSize(28, 28)
-        self.brand_title = QLabel(APP_NAME)
-        self.brand_title.setObjectName("brandTitle")
-        self.project_chip = QLabel("New")
-        self.project_chip.setObjectName("projectChip")
-        self.project_chip.setMaximumWidth(200)
-        self.project_chip.setMinimumWidth(0)
-        self.project_chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        header.addWidget(self.brand_mark)
-        header.addWidget(self.brand_title)
-        header.addWidget(self.project_chip)
-        header.addStretch(1)
-        layout.addLayout(header)
-        self.playback_note = QLabel("No clip.")
-        self.playback_note.setObjectName("playbackNote")
-        self.playback_note.setWordWrap(True)
-        layout.addWidget(self.playback_note)
-        modes = QHBoxLayout()
-        self.view_playback = QPushButton("Playback")
-        self.view_original = QPushButton("Original")
-        self.view_adjusted = QPushButton("Adjusted")
-        self.view_adjusted.setObjectName("adjustedStillButton")
-        self.view_playback.clicked.connect(lambda: self._show_view(0))
-        self.view_original.clicked.connect(lambda: self._show_view(1))
-        self.view_adjusted.clicked.connect(lambda: self._show_view(2))
-        for button in (self.view_playback, self.view_original, self.view_adjusted):
-            modes.addWidget(button)
-        modes.addStretch(1)
-        layout.addLayout(modes)
+    def _build_browse_meta(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("inspectorPage")
+        layout = QVBoxLayout(page)
+        self.browse_preview = FitLabel("No clip")
+        self.browse_preview.setMinimumHeight(96)
+        self.browse_preview.setMaximumHeight(160)
+        layout.addWidget(self.browse_preview)
+        self.meta_summary = QLabel("Select a clip.")
+        self.meta_summary.setWordWrap(True)
+        self.meta_summary.setObjectName("metadataLabel")
+        layout.addWidget(self.meta_summary)
+        self.meta_toggle = QPushButton("Details")
+        self.meta_toggle.setCheckable(True)
+        self.meta_toggle.toggled.connect(lambda checked: self.meta_details.setVisible(checked))
+        layout.addWidget(self.meta_toggle)
+        self.meta_details = QPlainTextEdit()
+        self.meta_details.setReadOnly(True)
+        self.meta_details.setVisible(False)
+        self.meta_details.setMaximumHeight(160)
+        layout.addWidget(self.meta_details)
+        layout.addStretch(1)
+        return page
+
+    def _build_view(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
         self.viewer_stack = QStackedWidget()
         self.viewer_stack.setObjectName("viewerStack")
+        self.compare = CompareView()
+        self.still_original = FitLabel("Original")
+        self.still_adjusted = FitLabel("Processed")
+        self.still_original.hide()
+        self.still_adjusted.hide()
+        holder = QWidget()
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.addWidget(self.compare, 1)
+        holder_layout.addWidget(self.still_original)
+        holder_layout.addWidget(self.still_adjusted)
+        self.viewer_stack.addWidget(holder)
         if self.video is not None:
             self.viewer_stack.addWidget(self.video)
-        else:
-            missing = QLabel(self.player_error or "Playback is unavailable on this machine.")
-            missing.setObjectName("videoWidget")
-            missing.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.viewer_stack.addWidget(missing)
-        self.still_original = self._still_page("Original still")
-        self.still_adjusted = self._still_page("Adjusted still")
-        self.still_label = self.still_adjusted
-        self.viewer_stack.addWidget(self.still_original)
-        self.viewer_stack.addWidget(self.still_adjusted)
         layout.addWidget(self.viewer_stack, 1)
         transport = QHBoxLayout()
-        transport.setSpacing(4)
-        self.play_button = self._transport_button("Play", "play", self.play, "playButton")
-        self.pause_button = self._transport_button("Pause", "pause", self.pause, "pauseButton")
+        self.play_button = self._transport_button("Play", "play", self.play)
+        self.pause_button = self._transport_button("Pause", "pause", self.pause)
         self.frame_back_button = self._transport_button("Previous frame", "frame-back", lambda: self.step_frame(-1))
         self.frame_forward_button = self._transport_button("Next frame", "frame-forward", lambda: self.step_frame(1))
         self.mark_in_button = self._transport_button("Set trim in", "mark-in", lambda: self.set_trim_from_player("in"))
         self.mark_out_button = self._transport_button("Set trim out", "mark-out", lambda: self.set_trim_from_player("out"))
+        self.scrub = QSlider(Qt.Orientation.Horizontal)
+        self.scrub.sliderMoved.connect(self._seek)
         self.time_label = QLabel("0:00.0 / 0:00.0")
         self.time_label.setObjectName("timeLabel")
-        self.time_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+        self.compare_mode = QComboBox()
+        for label, value in (("Original", "original"), ("Processed", "processed"), ("2-up", "split"), ("Wipe", "wipe")):
+            self.compare_mode.addItem(label, value)
+        self.compare_mode.setCurrentIndex(2)
+        self.compare_mode.currentIndexChanged.connect(self._compare_mode_changed)
         for button in (
             self.play_button,
             self.pause_button,
@@ -334,752 +345,603 @@ class MainWindow(QMainWindow):
             self.mark_out_button,
         ):
             transport.addWidget(button)
-        transport.addStretch(1)
-        transport_host = QWidget()
-        transport_host.setObjectName("transportHost")
-        transport_host.setLayout(transport)
-        self.time_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-        transport_row = QHBoxLayout()
-        transport_row.addWidget(transport_host, 1)
-        transport_row.addWidget(self.time_label)
-        layout.addLayout(transport_row)
-        self.scrub = QSlider(Qt.Orientation.Horizontal)
-        self.scrub.setObjectName("scrubSlider")
-        self.scrub.setRange(0, 0)
-        self.scrub.sliderMoved.connect(self._seek)
-        layout.addWidget(self.scrub)
-        self.setCentralWidget(center)
+        transport.addWidget(self.scrub, 1)
+        transport.addWidget(self.time_label)
+        transport.addWidget(self.compare_mode)
+        layout.addLayout(transport)
+        self.playback_note = QLabel("Original and processed stay on the same frame.")
+        self.playback_note.setObjectName("playbackNote")
+        self.playback_note.setWordWrap(True)
+        layout.addWidget(self.playback_note)
+        self.filmstrip = QLabel("")
+        self.filmstrip.setObjectName("muted")
+        self.filmstrip.setWordWrap(True)
+        layout.addWidget(self.filmstrip)
+        self.preview_status = QLabel("")
+        self.preview_status.setWordWrap(True)
+        layout.addWidget(self.preview_status)
+        return page
 
-    def _still_page(self, text: str) -> FitLabel:
-        return FitLabel(text)
+    def _build_corrections(self) -> QWidget:
+        self.inspector_tabs = QTabWidget()
+        self.inspector_tabs.addTab(self._color_page(), "Color")
+        self.inspector_tabs.addTab(self._stab_page(), "Gyro")
+        self.inspector_tabs.addTab(self._meta_page(), "Meta")
+        self.inspector_tabs.setUsesScrollButtons(True)
+        return self.inspector_tabs
 
-    def _transport_button(self, name: str, icon: str, slot, object_name: str | None = None) -> QPushButton:
-        button = QPushButton()
-        button.setObjectName(object_name or "transportButton")
-        button.setProperty("iconName", icon)
-        button.setAccessibleName(name)
-        button.setToolTip(name)
-        button.setFixedSize(36, 32)
-        button.clicked.connect(slot)
-        return button
-
-    def _show_view(self, index: int) -> None:
-        self.viewer_stack.setCurrentIndex(index)
-        if index == 1:
-            self.request_still(False)
-        elif index == 2:
-            self.request_still(True)
-
-    def _build_inspector(self) -> None:
-        dock = QDockWidget("Inspector", self)
-        dock.setObjectName("inspectorDock")
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+    def _scroll_form(self) -> tuple[QScrollArea, QFormLayout]:
+        page = QScrollArea()
+        page.setWidgetResizable(True)
+        page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        page.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         body = QWidget()
-        layout = QVBoxLayout(body)
-        self.meta = QLabel("No clip selected.")
-        self.meta.setObjectName("metadataLabel")
-        self.meta.setWordWrap(True)
-        self.meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        details = QGroupBox("Clip")
-        form = QFormLayout(details)
+        body.setObjectName("inspectorBody")
+        form = QFormLayout(body)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        page.setWidget(body)
+        return page, form
+
+    def _color_page(self) -> QWidget:
+        page, form = self._scroll_form()
+        self.profile_detected = WrappedLabel("No clip.")
+        form.addRow(self.profile_detected)
+        self.profile = QComboBox()
+        self.profile.addItem("Auto", "auto")
+        self.profile.addItem("S-Log3 / S-Gamut3.Cine", "slog3_sgamut3cine")
+        self.profile.addItem("HLG / BT.2020", "hlg_bt2020")
+        self.profile.addItem("Preserve input", "preserve")
+        form.addRow("Input profile", self.profile)
+        self.exposure = QDoubleSpinBox()
+        self.exposure.setRange(-6, 6)
+        self.exposure.setSingleStep(0.1)
+        self.exposure.setSuffix(" EV")
+        form.addRow("Exposure", self.exposure)
+        self.contrast = QDoubleSpinBox()
+        self.contrast.setRange(0.5, 2.0)
+        self.contrast.setSingleStep(0.05)
+        self.contrast.setValue(1.0)
+        form.addRow("Contrast", self.contrast)
+        self.saturation = QDoubleSpinBox()
+        self.saturation.setRange(0, 2)
+        self.saturation.setSingleStep(0.05)
+        self.saturation.setValue(1.0)
+        form.addRow("Saturation", self.saturation)
+        self.input_lut = QLineEdit()
+        self.look_lut = QLineEdit()
+        form.addRow("Input LUT", self._path_row(self.input_lut, "Input LUT"))
+        form.addRow("Look LUT", self._path_row(self.look_lut, "Look LUT"))
+        self.look_includes = QCheckBox("Look includes camera")
+        self.look_includes.setToolTip("The look LUT already includes the camera transform, so automatic normalization stays off.")
+        form.addRow("Look", self.look_includes)
+        note = WrappedLabel(
+            "Exposure adjusts scene light. An Input LUT replaces automatic camera conversion. "
+            "A Look LUT is applied afterwards."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+        buttons = QHBoxLayout()
+        apply = QPushButton("Apply to selected")
+        apply.clicked.connect(self.apply_recipe_to_selected)
+        reset = QPushButton("Reset")
+        reset.clicked.connect(self.reset_recipe)
+        buttons.addWidget(apply)
+        buttons.addWidget(reset)
+        form.addRow(buttons)
+        return page
+
+    def _stab_page(self) -> QWidget:
+        page, form = self._scroll_form()
+        self.gyro_enabled = QCheckBox("Stabilize with embedded gyro")
+        form.addRow(self.gyro_enabled)
+        self.gyro_strength = QSlider(Qt.Orientation.Horizontal)
+        self.gyro_strength.setRange(0, 100)
+        self.gyro_strength.setValue(50)
+        self.gyro_strength_value = QLabel("50%")
+        self.gyro_strength.valueChanged.connect(lambda value: self.gyro_strength_value.setText(f"{value}%"))
+        strength_row = QHBoxLayout()
+        strength_row.addWidget(self.gyro_strength, 1)
+        strength_row.addWidget(self.gyro_strength_value)
+        form.addRow("Strength", strength_row)
+        self.gyro_fov = QDoubleSpinBox()
+        self.gyro_fov.setRange(0.1, 3.0)
+        self.gyro_fov.setSingleStep(0.05)
+        self.gyro_fov.setDecimals(2)
+        self.gyro_fov.setValue(1.0)
+        form.addRow("Field of view", self.gyro_fov)
+        self.gyro_horizon = QSlider(Qt.Orientation.Horizontal)
+        self.gyro_horizon.setRange(0, 100)
+        self.gyro_horizon_value = QLabel("0%")
+        self.gyro_horizon.valueChanged.connect(lambda value: self.gyro_horizon_value.setText(f"{value}%"))
+        horizon_row = QHBoxLayout()
+        horizon_row.addWidget(self.gyro_horizon, 1)
+        horizon_row.addWidget(self.gyro_horizon_value)
+        form.addRow("Horizon lock", horizon_row)
+        note = WrappedLabel(
+            "Higher strength smooths more camera movement. Field of view above 1 keeps more of the frame. "
+            "Horizon lock at 0% leaves the original horizon."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+        self.gyro_preview_button = QPushButton("Update preview")
+        self.gyro_preview_button.setToolTip("Render the current gyro geometry, then compare it with colour applied once.")
+        self.gyro_preview_button.clicked.connect(self.update_stabilization_preview)
+        form.addRow(self.gyro_preview_button)
+        self.gyro_apply_button = QPushButton("Apply to selected")
+        self.gyro_apply_button.setToolTip("Apply these stabilization settings to every selected clip. Keep each clip's colour and LUT settings.")
+        self.gyro_apply_button.clicked.connect(self.apply_gyro_to_selected)
+        form.addRow(self.gyro_apply_button)
+        self.gyro_status = WrappedLabel("Stabilization preview has not been rendered.")
+        self.gyro_status.setWordWrap(True)
+        form.addRow(self.gyro_status)
+        return page
+
+    def _meta_page(self) -> QWidget:
+        page, form = self._scroll_form()
+        refresh = QPushButton("Refresh metadata")
+        refresh.setToolTip("Re-read the selected clips and their sidecars. Recipes stay. Re-import does not do this.")
+        refresh.clicked.connect(self.refresh_selected_metadata)
+        form.addRow(refresh)
+        self.metadata_cancel_button = QPushButton("Cancel refresh")
+        self.metadata_cancel_button.setEnabled(False)
+        self.metadata_cancel_button.clicked.connect(self.cancel_metadata_refresh)
+        form.addRow(self.metadata_cancel_button)
+        self.notes = QPlainTextEdit()
+        self.notes.textChanged.connect(self._notes_edited)
         self.flag = QComboBox()
-        self.flag.addItem("None", "")
+        self.flag.addItem("", "")
         self.flag.addItem("OK", "OK")
         self.flag.addItem("KEEP", "KEEP")
         self.flag.addItem("NG", "NG")
-        self.flag.currentIndexChanged.connect(self._save_flag)
-        self.notes = QPlainTextEdit()
-        self.notes.setObjectName("notesEdit")
-        self.notes.setFixedHeight(72)
-        self.notes.textChanged.connect(self._notes_edited)
-        save_notes = QPushButton("Save notes")
-        save_notes.clicked.connect(self.save_notes)
         self.trim_in = QDoubleSpinBox()
         self.trim_out = QDoubleSpinBox()
         for box in (self.trim_in, self.trim_out):
             box.setRange(0, 86400)
             box.setDecimals(3)
-            box.setSingleStep(0.04)
-        self.trim_in.editingFinished.connect(self.save_trim)
-        self.trim_out.editingFinished.connect(self.save_trim)
-        self.markers = QListWidget()
-        self.markers.setFixedHeight(72)
-        add_marker = QPushButton("Add marker at playhead")
-        add_marker.clicked.connect(self.add_marker)
-        remove_marker = QPushButton("Remove marker")
-        remove_marker.clicked.connect(self.remove_marker)
-        form.addRow("Rating", self.flag)
+            box.setSingleStep(0.1)
+        form.addRow("Flag", self.flag)
         form.addRow("Notes", self.notes)
-        form.addRow("", save_notes)
         form.addRow("Trim in", self.trim_in)
         form.addRow("Trim out", self.trim_out)
-        form.addRow("Markers", self.markers)
-        form.addRow("", add_marker)
-        form.addRow("", remove_marker)
-        self._clip_group = details
+        save = QPushButton("Save trim")
+        save.clicked.connect(self.save_trim)
+        form.addRow(save)
+        return page
 
-        grade = QGroupBox("Adjustments")
-        grade_form = QFormLayout(grade)
-        self.exposure = QDoubleSpinBox()
-        self.exposure.setRange(-1, 1)
-        self.exposure.setSingleStep(0.05)
-        self.saturation = QDoubleSpinBox()
-        self.saturation.setRange(0, 3)
-        self.saturation.setValue(1)
-        self.saturation.setSingleStep(0.05)
-        self.rotate = QComboBox()
-        for label, value in (("0°", "0"), ("90°", "90"), ("180°", "180"), ("270°", "270")):
-            self.rotate.addItem(label, value)
-        self.fit = QComboBox()
-        for label, value in (("None", "none"), ("Resize", "resize"), ("Crop", "crop"), ("Letterbox", "letterbox")):
-            self.fit.addItem(label, value)
-        self.fit.currentIndexChanged.connect(self._fit_changed)
-        self.out_width = QSpinBox()
-        self.out_height = QSpinBox()
-        for box in (self.out_width, self.out_height):
-            box.setRange(2, 7680)
-            box.setSingleStep(2)
-        self.out_width.setValue(1920)
-        self.out_height.setValue(1080)
-        self.lut = QLineEdit()
-        self.lut.setObjectName("lutPath")
-        lut_browse = QPushButton("LUT…")
-        lut_browse.clicked.connect(self.browse_lut)
-        lut_row = QHBoxLayout()
-        lut_row.addWidget(self.lut)
-        lut_row.addWidget(lut_browse)
-        self.stabilization = QComboBox()
-        for label, value in (("Off", "off"), ("vidstab", "vidstab"), ("deshake", "deshake")):
-            self.stabilization.addItem(label, value)
-        self.vidstab_auto = QCheckBox("Use the built-in vidstab starting values")
-        self.smoothing = QSpinBox()
-        self.smoothing.setRange(0, 1000)
-        self.smoothing.setValue(10)
-        self.shakiness = QSpinBox()
-        self.shakiness.setRange(1, 10)
-        self.shakiness.setValue(5)
-        self.accuracy = QSpinBox()
-        self.accuracy.setRange(1, 15)
-        self.accuracy.setValue(15)
-        self.crop = QComboBox()
-        self.crop.addItem("black", "black")
-        self.crop.addItem("keep", "keep")
-        self.zoom = QSpinBox()
-        self.zoom.setRange(-100, 100)
-        self.optzoom = QComboBox()
-        self.optzoom.addItem("0 off", 0)
-        self.optzoom.addItem("1 static", 1)
-        self.optzoom.addItem("2 adaptive", 2)
-        self.deshake_rx = QSpinBox()
-        self.deshake_ry = QSpinBox()
-        for box in (self.deshake_rx, self.deshake_ry):
-            box.setRange(0, 64)
-            box.setValue(16)
-        grade_form.addRow("Exposure", self.exposure)
-        grade_form.addRow("Saturation", self.saturation)
-        grade_form.addRow("Rotate", self.rotate)
-        grade_form.addRow("Fit", self.fit)
-        grade_form.addRow("Width", self.out_width)
-        grade_form.addRow("Height", self.out_height)
-        grade_form.addRow("LUT", lut_row)
-        grade_form.addRow("Stabilization", self.stabilization)
-        grade_form.addRow("", self.vidstab_auto)
-        grade_form.addRow("Smoothing", self.smoothing)
-        grade_form.addRow("Shakiness", self.shakiness)
-        grade_form.addRow("Accuracy", self.accuracy)
-        grade_form.addRow("Crop", self.crop)
-        grade_form.addRow("Zoom", self.zoom)
-        grade_form.addRow("Optzoom", self.optzoom)
-        grade_form.addRow("Deshake rx", self.deshake_rx)
-        grade_form.addRow("Deshake ry", self.deshake_ry)
-        note = QLabel("vidstab and deshake run only during export. They are not gyro stabilization.")
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        grade_form.addRow(note)
-        self._grade_group = grade
+    def _path_row(self, edit: QLineEdit, title: str) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        browse = QPushButton("…")
+        browse.clicked.connect(lambda: self._browse_into(edit, title))
+        clear = QPushButton("Clear")
+        clear.clicked.connect(edit.clear)
+        clear.clicked.connect(self._schedule_recipe)
+        layout.addWidget(edit, 1)
+        layout.addWidget(browse)
+        layout.addWidget(clear)
+        return row
 
-        export = QGroupBox("Export")
-        export_form = QFormLayout(export)
-        self.preset = QComboBox()
-        self.preset.setObjectName("presetCombo")
-        for preset in PRESETS.values():
-            self.preset.addItem(preset["label"], preset["id"])
-        self.preset.currentIndexChanged.connect(self._update_conversion)
-        self.audio = QCheckBox("Include audio")
-        self.audio.setChecked(True)
-        self.ack = QCheckBox("Acknowledge bit-depth conversion")
-        self.ack.setObjectName("bitDepthAck")
-        self.conversion = QLabel("")
-        self.conversion.setWordWrap(True)
-        self.destination = QLineEdit()
-        self.destination.setObjectName("destinationEdit")
-        dest_button = QPushButton("Folder…")
-        dest_button.clicked.connect(self.browse_destination)
-        dest_row = QHBoxLayout()
-        dest_row.addWidget(self.destination)
-        dest_row.addWidget(dest_button)
-        self.suffix = QLineEdit()
-        self.suffix.setPlaceholderText("optional suffix")
-        export_one = QPushButton("Export focused clip")
-        export_one.setObjectName("exportButton")
-        export_one.setProperty("primary", True)
-        export_one.clicked.connect(self.queue_focused_export)
-        export_batch = QPushButton("Export checked clips")
-        export_batch.setObjectName("exportBatchButton")
-        export_batch.clicked.connect(lambda: self.queue_checked_batch("export"))
-        export_form.addRow("Preset", self.preset)
-        export_form.addRow("", self.audio)
-        export_form.addRow("", self.ack)
-        export_form.addRow(self.conversion)
-        export_form.addRow("Destination", dest_row)
-        export_form.addRow("Suffix", self.suffix)
-        export_form.addRow(export_one)
-        export_form.addRow(export_batch)
-        self._export_group = export
-
-        gyro = QGroupBox("Gyro batch")
-        gyro_form = QFormLayout(gyro)
-        self.gyro_format = QComboBox()
-        self.gyro_format.addItem("H.264 MP4", "h264_mp4")
-        self.gyro_format.addItem("ProRes 422", "prores_422")
-        self.gyro_source_size = QCheckBox("Keep source size")
-        self.gyro_source_size.setChecked(True)
-        self.gyro_source_size.toggled.connect(self._gyro_size_toggled)
-        self.gyro_width = QSpinBox()
-        self.gyro_height = QSpinBox()
-        for box in (self.gyro_width, self.gyro_height):
-            box.setRange(2, 7680)
-            box.setSingleStep(2)
-            box.setEnabled(False)
-        self.gyro_width.setValue(1920)
-        self.gyro_height.setValue(1080)
-        self.gyro_audio = QCheckBox("Audio")
-        self.gyro_audio.setChecked(True)
-        self.gyro_preset = QLineEdit()
-        self.gyro_preset.setObjectName("gyroPresetPath")
-        gyro_preset_button = QPushButton("Preset…")
-        gyro_preset_button.clicked.connect(self.browse_gyro_preset)
-        preset_row = QHBoxLayout()
-        preset_row.addWidget(self.gyro_preset)
-        preset_row.addWidget(gyro_preset_button)
-        gyro_button = QPushButton("Gyro checked clips")
-        gyro_button.setObjectName("gyroBatchButton")
-        gyro_button.clicked.connect(lambda: self.queue_checked_batch("gyro"))
-        gyro_form.addRow("Format", self.gyro_format)
-        gyro_form.addRow("", self.gyro_source_size)
-        gyro_form.addRow("Width", self.gyro_width)
-        gyro_form.addRow("Height", self.gyro_height)
-        gyro_form.addRow("", self.gyro_audio)
-        gyro_form.addRow("Shared preset", preset_row)
-        gyro_form.addRow(gyro_button)
-        self._gyro_group = gyro
-
-        manual = QGroupBox("Advanced manual gyro")
-        manual_form = QFormLayout(manual)
-        self.manual_project = QLineEdit()
-        self.manual_gcsv = QLineEdit()
-        self.manual_preset = QLineEdit()
-        self.manual_output = QLineEdit()
-        manual_form.addRow("Project", self._file_row(self.manual_project, "Gyroflow project", "*.gyroflow"))
-        manual_form.addRow("GCSV", self._file_row(self.manual_gcsv, "Gyro log", "*.gcsv"))
-        manual_form.addRow("Preset", self._file_row(self.manual_preset, "Gyroflow preset", "*.gyroflow"))
-        manual_form.addRow("Output", self._save_row(self.manual_output, "Gyro output"))
-        parse_gcsv = QPushButton("Parse GCSV")
-        parse_gcsv.clicked.connect(self.parse_gcsv)
-        telemetry = QPushButton("Inspect telemetry")
-        telemetry.clicked.connect(self.inspect_telemetry)
-        manual_queue = QPushButton("Queue manual gyro")
-        manual_queue.setObjectName("manualGyroButton")
-        manual_queue.clicked.connect(self.queue_manual_gyro)
-        manual_form.addRow(parse_gcsv)
-        manual_form.addRow(telemetry)
-        manual_form.addRow(manual_queue)
-        self._manual_group = manual
-        tabs = self._inspector_tabs()
-        dock.setWidget(tabs)
-        self.inspector_dock = dock
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._fit_changed()
-        for edit in self.findChildren(QLineEdit) + self.findChildren(QSpinBox) + self.findChildren(QDoubleSpinBox):
-            edit.setMinimumWidth(0)
-            edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-    def _inspector_tabs(self):
-        from PySide6.QtWidgets import QTabWidget
-
-        tabs = QTabWidget()
-        tabs.setObjectName("inspectorTabs")
-        tabs.setDocumentMode(True)
-        tabs.tabBar().setUsesScrollButtons(True)
-        tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
-
-        def page(*widgets: QWidget) -> QScrollArea:
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-            host = QWidget()
-            host.setObjectName("inspectorPage")
-            host.setAutoFillBackground(False)
-            scroll.viewport().setAutoFillBackground(False)
-            column = QVBoxLayout(host)
-            for widget in widgets:
-                column.addWidget(widget)
-            column.addStretch(1)
-            scroll.setWidget(host)
-            return scroll
-
-        copy = QPushButton("Copy path")
-        copy.clicked.connect(self.copy_clip_path)
-        self.meta_toggle = QPushButton("Technical details")
-        self.meta_toggle.setCheckable(True)
-        self.meta_toggle.setToolTip("Path, checksum, and color details")
-        self.meta_details = QPlainTextEdit()
-        self.meta_details.setObjectName("metadataDetails")
-        self.meta_details.setReadOnly(True)
-        self.meta_details.setVisible(False)
-        self.meta_details.setMinimumHeight(96)
-        self.meta_toggle.toggled.connect(self.meta_details.setVisible)
-        tabs.addTab(page(self.meta, self.meta_toggle, self.meta_details, copy, self._clip_group), "Clip")
-        tabs.addTab(page(self._grade_group), "Adjust")
-        tabs.addTab(page(self._export_group), "Export")
-        tabs.addTab(page(self._gyro_group, self._manual_group), "Gyro")
-        self.inspector_tabs = tabs
-        return tabs
-
-    def _build_queue(self) -> None:
-        dock = QDockWidget("Queue", self)
-        dock.setObjectName("queueDock")
-        body = QWidget()
-        body.setObjectName("queueBody")
-        layout = QVBoxLayout(body)
-        self.queue = QTableWidget(0, 5)
-        self.queue.setObjectName("queueTable")
-        self.queue.setHorizontalHeaderLabels(["File", "Kind", "Status", "Progress", "Error"])
-        self.queue.setWordWrap(False)
-        self.queue.setTextElideMode(Qt.TextElideMode.ElideRight)
-        queue_header = self.queue.horizontalHeader()
-        queue_header.setSectionResizeMode(0, queue_header.ResizeMode.Stretch)
-        queue_header.setSectionResizeMode(4, queue_header.ResizeMode.Stretch)
-        self.queue.verticalHeader().setVisible(False)
-        self.queue.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.queue_empty = QLabel("The queue is empty.")
-        self.queue_empty.setObjectName("queueEmpty")
-        layout.addWidget(self.queue_empty)
-        layout.addWidget(self.queue)
-        self.batch_errors = QPlainTextEdit()
-        self.batch_errors.setObjectName("batchErrors")
-        self.batch_errors.setReadOnly(True)
-        self.batch_errors.setFixedHeight(44)
-        layout.addWidget(self.batch_errors)
-        buttons = QHBoxLayout()
-        cancel = QPushButton("Cancel job")
-        cancel.clicked.connect(self.cancel_selected_job)
-        retry = QPushButton("Retry job")
-        retry.clicked.connect(self.retry_selected_job)
-        cancel_batch = QPushButton("Cancel batch")
-        cancel_batch.setObjectName("cancelBatchButton")
-        cancel_batch.clicked.connect(self.cancel_current_batch)
-        retry_failed = QPushButton("Retry failed")
-        retry_failed.setObjectName("retryFailedButton")
-        retry_failed.clicked.connect(self.retry_failed_batch)
-        for button in (cancel, retry, cancel_batch, retry_failed):
-            buttons.addWidget(button)
-        layout.addLayout(buttons)
-        dock.setWidget(body)
-        self.queue_dock = dock
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+    def _transport_button(self, name: str, icon: str, slot) -> QPushButton:
+        button = QPushButton()
+        button.setObjectName("transportButton")
+        button.setAccessibleName(name)
+        button.setToolTip(name)
+        button.setFixedSize(36, 32)
+        button.clicked.connect(slot)
+        button.setProperty("iconName", icon)
+        return button
 
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("File")
         toolbar = QToolBar("Main")
         toolbar.setObjectName("mainToolBar")
         toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(18, 18))
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
-        actions = [
-            ("New", self.new_project, "Ctrl+N"),
+        self.brand_mark = QLabel()
+        icon = load_app_icon()
+        if not icon.isNull():
+            self.brand_mark.setPixmap(icon.pixmap(18, 18))
+        toolbar.addWidget(self.brand_mark)
+        self.mode_group = QButtonGroup(self)
+        self.browse_button = QPushButton("Browse")
+        self.view_button = QPushButton("View")
+        self.browse_button.setCheckable(True)
+        self.view_button.setCheckable(True)
+        self.browse_button.setChecked(True)
+        self.mode_group.addButton(self.browse_button, 0)
+        self.mode_group.addButton(self.view_button, 1)
+        self.mode_group.idClicked.connect(self._show_mode)
+        toolbar.addWidget(self.browse_button)
+        toolbar.addWidget(self.view_button)
+        self.project_chip = QLabel("New")
+        self.project_chip.setObjectName("projectChip")
+        toolbar.addWidget(self.project_chip)
+        for label, slot, shortcut in (
             ("Open…", self.open_project_interactive, "Ctrl+O"),
             ("Save", self.save_project_interactive, "Ctrl+S"),
-            ("Save as…", self.save_project_as, "Ctrl+Shift+S"),
-            ("Import files…", self.import_files, None),
             ("Import folder…", self.import_folder, None),
-        ]
-        for label, slot, shortcut in actions:
+        ):
             action = QAction(label, self)
             if shortcut:
-                action.setShortcut(shortcut)
-            action.triggered.connect(lambda _checked=False, fn=slot: fn())
+                action.setShortcut(QKeySequence(shortcut))
+            action.triggered.connect(slot)
             file_menu.addAction(action)
-            if label in {"Open…", "Save", "Import files…"}:
-                toolbar.addAction(action)
+            toolbar.addAction(action)
+        file_menu.addAction("Import files…", self.import_files)
+        file_menu.addAction("Import folder and subfolders…", self.import_folder_deep)
+        file_menu.addAction("New", self.new_project)
         self.recent_menu = file_menu.addMenu("Recent")
-        file_menu.addSeparator()
-        quit_action = QAction("Quit", self)
-        quit_action.triggered.connect(self.close)
-        file_menu.addAction(quit_action)
         self._rebuild_recent()
-
-        edit_menu = self.menuBar().addMenu("Edit")
-        edit_menu.addAction("Select all for batch", self.select_all_batch)
-        edit_menu.addAction("Clear batch checks", self.clear_batch)
-
-        queue_menu = self.menuBar().addMenu("Queue")
-        queue_menu.addAction("Export focused clip", self.queue_focused_export)
-        queue_menu.addAction("Export checked clips", lambda: self.queue_checked_batch("export"))
-        queue_menu.addAction("Gyro checked clips", lambda: self.queue_checked_batch("gyro"))
-
-        tools_menu = self.menuBar().addMenu("Tools")
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
+        self.export_button = QPushButton("Export")
+        self.export_button.setObjectName("exportButton")
+        self.export_button.clicked.connect(self.open_export)
+        toolbar.addWidget(self.export_button)
         self.settings_action = QAction("Tools", self)
         self.settings_action.setProperty("iconName", "settings")
-        self.settings_action.setToolTip("External programs")
         self.settings_action.triggered.connect(self.open_settings)
         toolbar.addAction(self.settings_action)
-        tools_menu.addAction("External programs…", self.open_settings)
-        tools_menu.addAction(
-            "Refresh tool report",
-            lambda: self._start(lambda cancel: self.service.capabilities(cancel=cancel), self._apply_capabilities, key="caps"),
-        )
-
-        view_menu = self.menuBar().addMenu("View")
-        for label, choice in (("Light", "light"), ("Dark", "dark"), ("System", "system")):
-            action = QAction(label, self)
-            action.setObjectName(f"theme-{choice}")
+        tools_menu = self.menuBar().addMenu("Tools")
+        tools_menu.addAction(self.settings_action)
+        appearance = tools_menu.addMenu("Appearance")
+        self.theme_group = QActionGroup(self)
+        self.theme_group.setExclusive(True)
+        self.theme_actions = {}
+        for choice in ("system", "light", "dark"):
+            action = appearance.addAction(choice.title())
+            action.setCheckable(True)
+            self.theme_group.addAction(action)
             action.triggered.connect(lambda _checked=False, value=choice: self.set_theme(value))
-            view_menu.addAction(action)
-        view_menu.addSeparator()
-        view_menu.addAction(self.library_dock.toggleViewAction())
-        view_menu.addAction(self.inspector_dock.toggleViewAction())
-        view_menu.addAction(self.queue_dock.toggleViewAction())
-        view_menu.addAction("Reset layout", self.reset_layout)
+            self.theme_actions[choice] = action
+        edit = self.menuBar().addMenu("Edit")
+        edit.addAction("Select all", self.select_all_batch, QKeySequence.StandardKey.SelectAll)
+        edit.addAction("Clear selection", self.clear_batch)
+        self.export_dialog = ExportDialog(self)
+        self.export_dialog.queued.connect(lambda: self.queue_checked_batch("prepare"))
+        self.export_dialog.cancel_button.clicked.connect(self.cancel_current_batch)
+        self.export_dialog.retry_button.clicked.connect(self.retry_failed_batch)
+        self.destination = self.export_dialog.destination
+        self.suffix = self.export_dialog.suffix
+        self.preset = self.export_dialog.preset
+        self.audio = self.export_dialog.audio
+        self.ack = self.export_dialog.ack
+        self.fit = self.export_dialog.fit
+        self.out_width = self.export_dialog.out_width
+        self.out_height = self.export_dialog.out_height
+        self.batch_errors = self.export_dialog.jobs
 
-        help_menu = self.menuBar().addMenu("Help")
-        help_menu.addAction("About", self.show_about)
-        help_menu.addAction("Preview limits", self.show_preview_help)
-        help_menu.addAction("Log folder", self.show_log)
-        help_menu.addAction("Licenses", self.show_licenses)
+    def _show_mode(self, index: int) -> None:
+        self.center.setCurrentIndex(0 if index == 0 else 1)
+        self.right.setCurrentIndex(0 if index == 0 else 1)
+        if hasattr(self, "places"):
+            # View keeps the picture and the correction panel. Places stays on Browse.
+            self.places.setVisible(index == 0)
+        if hasattr(self, "browse_button"):
+            self.browse_button.setChecked(index == 0)
+            self.view_button.setChecked(index != 0)
+        if index != 0 and self.clips:
+            self._fill_focus()
+            self.request_comparison()
 
-        for label, slot in (("Play", self.play), ("Pause", self.pause)):
-            action = QAction(label, self)
-            action.triggered.connect(slot)
-            toolbar.addAction(action)
-
-    def _file_row(self, edit: QLineEdit, title: str, pattern: str):
-        button = QPushButton("Browse")
-        button.clicked.connect(lambda: self._browse_into(edit, title, pattern))
-        row = QHBoxLayout()
-        row.addWidget(edit)
-        row.addWidget(button)
-        return row
-
-    def _save_row(self, edit: QLineEdit, title: str):
-        button = QPushButton("Browse")
-
-        def choose() -> None:
-            chosen, _filter = QFileDialog.getSaveFileName(self, title, edit.text())
-            if chosen:
-                edit.setText(chosen)
-
-        button.clicked.connect(choose)
-        row = QHBoxLayout()
-        row.addWidget(edit)
-        row.addWidget(button)
-        return row
-
-    def _browse_into(self, edit: QLineEdit, title: str, pattern: str) -> None:
-        chosen, _filter = QFileDialog.getOpenFileName(self, title, edit.text(), pattern)
-        if chosen:
-            edit.setText(chosen)
+    def _open_adjust(self, clip_id: str) -> None:
+        self.focus_clip(clip_id)
+        self._show_mode(1)
 
     def set_theme(self, choice: str) -> str:
-        choice = choice if choice in {"light", "dark", "system"} else "system"
         resolved = apply_theme(self, choice)
-        self._paint_icons(resolved)
         self.state["theme"] = choice
+        for name, action in getattr(self, "theme_actions", {}).items():
+            action.setChecked(name == choice)
+        self._paint_icons(resolved)
         self._save_preferences()
-        if not self._scheme_connected:
-            from PySide6.QtGui import QGuiApplication
-
-            QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_system_scheme)
-            self._scheme_connected = True
         return resolved
 
-    def _on_system_scheme(self, *_args) -> None:
-        if self.state.get("theme") == "system":
-            self.set_theme("system")
-
     def _paint_icons(self, theme: str) -> None:
-        from PySide6.QtGui import QPixmap
-        from PySide6.QtWidgets import QApplication
+        for button in (
+            self.play_button,
+            self.pause_button,
+            self.frame_back_button,
+            self.frame_forward_button,
+            self.mark_in_button,
+            self.mark_out_button,
+        ):
+            button.setIcon(action_icon(str(button.property("iconName")), theme))
+        self.export_button.setIcon(action_icon("export", theme, role="on-primary"))
+        self.settings_action.setIcon(action_icon("settings", theme))
+        if hasattr(self, "inspector_tabs"):
+            for index, name in enumerate(("adjusted", "gyro", "clip")):
+                self.inspector_tabs.setTabIcon(index, action_icon(name, theme))
 
-        from .brand import load_app_icon
-        from .icons import action_icon
-
-        icon = load_app_icon()
-        self.setWindowIcon(icon)
-        app = QApplication.instance()
-        if app is not None and not icon.isNull():
-            app.setWindowIcon(icon)
-        mark = icon.pixmap(28, 28)
-        if not mark.isNull():
-            self.brand_mark.setPixmap(mark)
-        self._tint_scrolls(theme)
-        self._style_toolbar_buttons(theme)
-        menu_actions = {menu.menuAction() for menu in self.findChildren(QMenu)}
-        for action in menu_actions:
-            action.setIcon(QIcon())
-        for widget in self.findChildren(QPushButton) + self.findChildren(QAction):
-            if isinstance(widget, QAction) and widget in menu_actions:
-                continue
-            named = widget.property("iconName")
-            label = widget.text() or ""
-            key = str(named) if named else _ICON_FOR_LABEL.get(label)
-            if not key:
-                continue
-            role = "on-primary" if widget.objectName() == "exportButton" else "normal"
-            widget.setIcon(action_icon(key, theme, role=role))
-            if isinstance(widget, QPushButton):
-                widget.setIconSize(QSize(16, 16))
-                if label and not widget.accessibleName():
-                    widget.setAccessibleName(label)
-            if isinstance(widget, QAction) and widget.shortcut():
-                widget.setToolTip(f"{widget.text()} ({widget.shortcut().toString()})")
-            elif not widget.toolTip():
-                widget.setToolTip(widget.text() or widget.accessibleName())
-        tabs = getattr(self, "inspector_tabs", None)
-        if tabs is not None:
-            for index, icon_name in enumerate(("clip", "adjusted", "export", "gyro")):
-                tabs.setTabIcon(index, action_icon(icon_name, theme))
-        del QPixmap
-
-    def _style_toolbar_buttons(self, theme: str) -> None:
-        from PySide6.QtGui import QColor, QPalette
-        from PySide6.QtWidgets import QToolBar, QToolButton
-
-        dark = theme == "dark"
-        text = QColor("#e8eef4" if dark else "#1a2028")
-        muted = QColor("#6e7c8c" if dark else "#8b97a3")
-        surface = QColor("#171c23" if dark else "#f6f7f8")
-        for bar in self.findChildren(QToolBar):
-            for button in bar.findChildren(QToolButton):
-                palette = button.palette()
-                for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
-                    palette.setColor(group, QPalette.ColorRole.Window, surface)
-                    palette.setColor(group, QPalette.ColorRole.Button, surface)
-                    palette.setColor(group, QPalette.ColorRole.WindowText, text)
-                    palette.setColor(group, QPalette.ColorRole.ButtonText, text)
-                    palette.setColor(group, QPalette.ColorRole.Text, text)
-                palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, muted)
-                palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, muted)
-                button.setPalette(palette)
-
-    def _tint_scrolls(self, theme: str) -> None:
-        from PySide6.QtGui import QColor, QPalette
-
-        color = QColor("#12161c" if theme == "dark" else "#e8ecef")
-        panel = QColor("#171c23" if theme == "dark" else "#f6f7f8")
-        for scroll in self.findChildren(QScrollArea):
-            chosen = color if scroll.objectName() == "transportScroll" else panel
-            viewport = scroll.viewport()
-            viewport.setAutoFillBackground(True)
-            palette = viewport.palette()
-            palette.setColor(QPalette.ColorRole.Window, chosen)
-            palette.setColor(QPalette.ColorRole.Base, chosen)
-            viewport.setPalette(palette)
-
-    def reset_layout(self) -> None:
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.library_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.queue_dock)
-        self.library_dock.show()
-        self.inspector_dock.show()
-        self.queue_dock.show()
-        self.resizeDocks([self.queue_dock], [180], Qt.Orientation.Vertical)
-        self.resizeDocks([self.library_dock, self.inspector_dock], [240, 300], Qt.Orientation.Horizontal)
-
-    def showEvent(self, event) -> None:  # noqa: N802
-        super().showEvent(event)
-        if not self._laid_out:
-            self._laid_out = True
-            if not self.state.get("window_state"):
-                self.reset_layout()
-
-    def copy_clip_path(self) -> None:
-        clip = self.focused_clip()
-        if clip is None:
+    def _folder_chosen(self, folder: str) -> None:
+        if not self._flush_pending_edit():
             return
-        QApplication.clipboard().setText(clip["path"])
-        self.statusBar().showMessage("Path copied.", 3000)
-
-    def show_preview_help(self) -> None:
-        TextDialog(
-            "Preview limits",
-            (
-                f"Playback prefers the source when it is 8-bit H.264. Anything else, or a source the player "
-                f"cannot decode, uses an H.264 proxy about 640 pixels wide and at most {int(PROXY_LIMIT_SECONDS)} seconds. "
-                "The proxy is not the export. Adjustments are not baked into playback. "
-                "Original and Adjusted stills use the same filter graph as export, without vidstab or deshake. "
-                "Those stabilizers run only when an export is queued. The source file is not modified."
-            ),
-            self,
-        ).exec()
-
-    def _restore_window(self) -> None:
-        geometry = self.state.get("geometry") or ""
-        if geometry:
-            self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
-        window_state = self.state.get("window_state") or ""
-        if window_state:
-            self.restoreState(QByteArray.fromBase64(window_state.encode("ascii")))
-
-    def _save_preferences(self) -> bool:
-        from .prefs import PrefsWriteError
-
-        try:
-            save_state(self.state, self.state_path)
-        except (PrefsWriteError, OSError) as exc:
-            import logging
-
-            logging.getLogger(__name__).error("Window preferences were not replaced: %s", exc)
-            self.last_error = "Window layout could not be saved. The previous preferences file was left unchanged."
-            self.statusBar().showMessage(self.last_error, 8000)
-            return False
-        return True
-
-    def _persist_window(self) -> None:
-        self.state["geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
-        self.state["window_state"] = bytes(self.saveState().toBase64()).decode("ascii")
-        self._save_preferences()
-
-    def dragEnterEvent(self, event) -> None:  # noqa: N802
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event) -> None:  # noqa: N802
-        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        if paths:
-            self.import_paths(paths)
+        self._remember_folder(folder)
+        self.places.show_tree(folder)
+        self.import_paths([folder])
 
     def import_files(self) -> None:
-        paths, _filter = QFileDialog.getOpenFileNames(self, "Import media")
+        paths, _filter = QFileDialog.getOpenFileNames(self, "Import clips", "", "Video (*.mp4 *.mov *.mxf *.mts *.m2ts)")
         if paths:
             self.import_paths(paths)
 
     def import_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Import folder")
-        if path:
-            self.import_paths([path])
+        folder = QFileDialog.getExistingDirectory(self, "Import folder")
+        if folder:
+            if not self._flush_pending_edit():
+                return
+            self._remember_folder(folder)
+            self.places.show_tree(folder)
+            self.import_paths([folder])
 
-    def import_paths(self, paths: list[str]) -> None:
-        items = [path for path in paths if path]
-        if not items:
+    def import_folder_deep(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Import folder and subfolders")
+        if folder:
+            if not self._flush_pending_edit():
+                return
+            self._remember_folder(folder)
+            self.places.show_tree(folder)
+            self.import_paths([folder], deep=True)
+
+    def _remember_folder(self, folder: str) -> None:
+        folders = [item for item in self.state.get("folders") or [] if item != folder]
+        folders.insert(0, folder)
+        self.state["folders"] = folders[:8]
+        self._save_preferences()
+        self.places.set_lists(self.state.get("folders") or [], self.state.get("favorites") or [])
+
+    def import_paths(self, paths: list[str], *, deep: bool = False) -> None:
+        if not self._flush_pending_edit():
             return
-        generation = self._project_gen
+        files: list[Path] = []
+        missing: list[str] = []
+        directories: list[Path] = []
+        for raw in paths:
+            path = Path(raw)
+            if path.is_dir():
+                directories.append(path)
+            elif path.is_file():
+                files.append(path.resolve())
+            else:
+                missing.append(raw)
+        if directories:
+            self._import_directories(directories, files, missing, deep=deep)
+            return
+        files.sort(key=lambda item: item.name.casefold())
+        if len(paths) == 1 and Path(paths[0]).is_dir():
+            self._browsed_root = Path(paths[0]).resolve()
+        self._folder_token += 1
+        token = self._folder_token
+        self._thumbs.cancel()
+        skipped = [{"path": item, "reason": "File was not found."} for item in missing]
+        self._partial = {"added": [], "skipped": skipped, "token": token, "pending": files}
+        self._paint_cards([], skipped, pending=files)
+        self._import_timer.start()
 
-        def work(cancel):
-            from ..errors import Cancelled
-
-            reports = []
-            errors = []
-            for path in items:
-                if cancel.is_set():
+        def work(cancel) -> dict:
+            added: list[dict] = []
+            local_skipped = list(skipped)
+            for path in files:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                if self._folder_token != token:
                     raise Cancelled()
                 try:
-                    reports.append(self.service.import_media(path, cancel=cancel))
+                    report = self.service.import_media(str(path), cancel=cancel)
                 except Cancelled:
                     raise
                 except CraftsError as exc:
-                    errors.append(f"{path}: {exc.message}")
-            return generation, reports, errors
+                    local_skipped.append({"path": str(path), "reason": "Unreadable media"})
+                else:
+                    added.extend(report.get("added") or [])
+                    local_skipped.extend(report.get("skipped") or [])
+                self._partial = {"added": list(added), "skipped": list(local_skipped), "token": token, "pending": files}
+            return {"added": added, "skipped": local_skipped, "missing": missing, "token": token}
 
-        def done(payload):
-            project_gen, reports, errors = payload
-            if project_gen != self._project_gen:
-                return
-            if reports:
-                self._imported(reports)
-            elif self.clips:
-                self.reload_all()
-            if errors:
-                self.last_error = "\n".join(errors)
-                self.statusBar().showMessage(self.last_error, 10000)
+        self._start(work, self._imported, key="import")
 
-        self._start(work, done, key="import")
+    def _import_directories(self, directories: list[Path], files: list[Path], missing: list[str], *, deep: bool) -> None:
+        """List a folder off the UI thread. One level unless the user asked for subfolders."""
+        self._folder_token += 1
+        token = self._folder_token
+        if len(directories) == 1:
+            self._browsed_root = directories[0].resolve()
+        self._thumbs.cancel()
+        self.statusBar().showMessage("Listing folder…")
+        self._partial = {"added": [], "skipped": [], "token": token, "pending": []}
+        self._import_timer.start()
 
-    def _imported(self, reports) -> None:
-        added = sum(len(item.get("added") or []) for item in reports)
-        duplicates = sum(len(item.get("duplicates") or []) for item in reports)
-        skipped = sum(len(item.get("skipped") or []) for item in reports)
-        self.statusBar().showMessage(f"Imported {added}. Duplicates {duplicates}. Skipped {skipped}.", 8000)
-        self.reload_all()
+        def work(cancel) -> dict:
+            listed = list(files)
+            local_missing = list(missing)
+            for folder in directories:
+                if cancel is not None and cancel.is_set() or self._folder_token != token:
+                    raise Cancelled()
+                try:
+                    # Normal import stays in this folder. Deep import is the explicit subfolder action.
+                    found = list_media_paths(folder) if deep else list_directory_media(folder)
+                    listed.extend(found)
+                except (OSError, CraftsError) as exc:
+                    local_missing.append(f"{folder} ({exc})")
+            listed.sort(key=lambda item: item.name.casefold())
+            self._partial = {
+                "added": [],
+                "skipped": [{"path": item, "reason": "File was not found."} for item in local_missing],
+                "token": token,
+                "pending": listed,
+            }
+            added: list[dict] = []
+            local_skipped = list(self._partial["skipped"])
+            for path in listed:
+                if cancel is not None and cancel.is_set() or self._folder_token != token:
+                    raise Cancelled()
+                try:
+                    report = self.service.import_media(str(path), cancel=cancel)
+                except Cancelled:
+                    raise
+                except CraftsError:
+                    local_skipped.append({"path": str(path), "reason": "Unreadable media"})
+                else:
+                    added.extend(report.get("added") or [])
+                    local_skipped.extend(report.get("skipped") or [])
+                self._partial = {"added": list(added), "skipped": list(local_skipped), "token": token, "pending": listed}
+            return {"added": added, "skipped": local_skipped, "missing": local_missing, "token": token}
+
+        self._start(work, self._imported, key="import")
+
+    def _paint_partial(self) -> None:
+        partial = self._partial
+        if not partial or partial.get("token") != self._folder_token:
+            return
+        self._paint_cards(partial.get("added") or [], partial.get("skipped") or [], pending=partial.get("pending") or [])
+
+    def _imported(self, report: dict) -> None:
+        self._import_timer.stop()
+        if report.get("token") != self._folder_token:
+            return
+        self._partial = None
+        skipped = report.get("skipped") or []
+        self._import_errors = [
+            {
+                "id": "error:" + str(item.get("path")),
+                "name": Path(str(item.get("path") or "clip")).name,
+                "meta": "Unreadable",
+                "error": str(item.get("reason") or "Unreadable"),
+            }
+            for item in skipped
+        ]
+        if skipped:
+            self.last_error = "\n".join(f"{item['name']}: {item['error']}" for item in self._import_errors)
+            self.statusBar().showMessage(self.last_error, 8000)
+        self.reload_all(keep_focus=False)
+        shown = self._shown_clips()
+        if shown:
+            self.focus_clip(shown[0]["id"])
+
+    def _paint_cards(self, added: list[dict], skipped: list[dict], pending: list[Path] | None = None) -> None:
+        known = {clip["path"] for clip in added}
+        items = [self._card_item(clip) for clip in added]
+        for item in skipped:
+            items.append(
+                {
+                    "id": "error:" + str(item.get("path")),
+                    "name": Path(str(item.get("path") or "clip")).name,
+                    "meta": "Unreadable",
+                    "error": str(item.get("reason") or "Unreadable"),
+                }
+            )
+        for path in pending or []:
+            if str(path) in known:
+                continue
+            items.append({"id": "pending:" + str(path), "name": path.name, "meta": "Reading", "error": ""})
+        self.grid.set_items(items)
+        if added:
+            self._thumbs.request(added, adjusted=True)
+
+    def _shown_clips(self) -> list[dict]:
+        root = self._browsed_root
+        if root is None:
+            return self.clips
+        shown = []
+        for clip in self.clips:
+            try:
+                Path(clip["path"]).resolve().relative_to(root)
+            except (ValueError, OSError):
+                continue
+            shown.append(clip)
+        shown.sort(key=lambda clip: str(clip.get("name") or "").casefold())
+        return shown
+
+    def _card_item(self, clip: dict) -> dict:
+        described = describe_clip(clip)
+        profile = described["profile"]
+        sidecar = described["sidecar"]
+        duration = (clip.get("summary") or {}).get("duration")
+        if duration is None:
+            duration = (clip.get("probe") or {}).get("duration")
+        badges = []
+        if sidecar.get("status") == "ok":
+            badges.append("XML")
+        elif sidecar.get("status") not in {None, "missing"}:
+            badges.append(str(sidecar.get("status")).replace("_", " "))
+        label = profile_label(str(profile.get("pipeline") or ""))
+        if label not in {"Unknown", "Preserve"}:
+            badges.append(label)
+        elif profile.get("status") == "preserve":
+            badges.append("Preserve")
+        text = f"{float(duration or 0):.1f}s"
+        if badges:
+            text += "  " + " ".join(badges)
+        return {"id": clip["id"], "name": clip.get("name") or Path(clip["path"]).name, "meta": text, "error": ""}
+
+    def _thumb_ready(self, generation: int, clip_id: str, path: str, error: str) -> None:
+        if generation != self._thumbs.generation:
+            return
+        if not any(clip["id"] == clip_id for clip in self._shown_clips()):
+            return
+        if error and not path:
+            self.grid.set_card_error(clip_id, "Unreadable")
+            return
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            self.grid.set_card_error(clip_id, "Unreadable thumbnail")
+            return
+        self.grid.set_thumbnail(clip_id, pixmap)
 
     def reload_all(self, *, keep_checks: bool = True, keep_focus: bool = True) -> None:
+        del keep_checks, keep_focus
         self.clips = self.service.clips()
-        self.library_empty.setVisible(not self.clips)
-        self._refresh_project_chip()
-        self._fill_library(keep_checks=keep_checks, keep_focus=keep_focus)
-        self.refresh_queue()
-        self._fill_focus()
-        title = self.service.project.get("name") or "Untitled"
-        path = self.service.project_path
-        self.setWindowTitle(f"{APP_NAME} — {title}" + ("" if path is None else f" — {path.name}"))
-
-    def _fill_library(self, *, keep_checks: bool = True, keep_focus: bool = True) -> None:
-        previous = self.focused_id() if keep_focus else None
-        checks = set(self.checked_ids()) if keep_checks else set()
-        self._filling = True
-        self.library.blockSignals(True)
-        self.library.setRowCount(len(self.clips))
-        for row, clip in enumerate(self.clips):
-            check = QTableWidgetItem()
-            shown = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-            check.setFlags(shown | Qt.ItemFlag.ItemIsUserCheckable)
-            check.setCheckState(Qt.CheckState.Checked if clip["id"] in checks else Qt.CheckState.Unchecked)
-            check.setData(Qt.ItemDataRole.UserRole, clip["id"])
-            self.library.setItem(row, 0, check)
-            for column, text in (
-                (1, clip["name"]),
-                (2, clip.get("flag") or ""),
-                (3, "" if clip["summary"].get("duration") is None else f"{float(clip['summary']['duration']):.2f}s"),
-            ):
-                cell = QTableWidgetItem(text)
-                cell.setFlags(shown)
-                self.library.setItem(row, column, cell)
-        self.library.blockSignals(False)
-        self._filling = False
+        shown = self._shown_clips()
+        self.grid.set_items([self._card_item(clip) for clip in shown] + list(self._import_errors))
         self._update_count()
-        if previous:
-            self.focus_clip(previous)
-        elif keep_focus and self.clips:
-            self.library.setCurrentCell(0, 1)
-        elif not keep_focus:
-            self.library.setCurrentCell(-1, -1)
+        self._refresh_project_chip()
+        self.places.set_lists(self.state.get("folders") or [], self.state.get("favorites") or [])
+        self._thumbs.request(shown, adjusted=True)
+        self._fill_focus()
 
-    def _check_changed(self, _item) -> None:
-        if not self._filling:
-            self._update_count()
+    def _selection_changed(self) -> None:
+        if self._selection_guard:
+            return
+        if self._pending_edit is not None:
+            origin = self._pending_edit[0]
+            if not self._flush_pending_edit():
+                self._selection_guard = True
+                try:
+                    self.grid.select_only(origin)
+                finally:
+                    self._selection_guard = False
+                self.statusBar().showMessage(self.last_error or "The edit was not saved.", 6000)
+                return
+        previous = self._filled_id
+        self._update_count()
+        current = self.focused_id()
+        if current != previous:
+            self._invalidate_viewer()
+            if self.player is not None:
+                self.player.setPosition(0)
+        self._fill_focus()
+        self._filled_id = current
+        if self.center.currentIndex() == 1:
+            self.request_comparison()
 
     def _update_count(self) -> None:
-        self.batch_count.setText(f"{len(self.checked_ids())} of {len(self.clips)} selected")
+        self.batch_count.setText(f"{len(self.selected_ids())} selected")
+
+    def selected_ids(self) -> list[str]:
+        return [clip_id for clip_id in self.grid.selected_ids() if not str(clip_id).startswith(("error:", "pending:"))]
 
     def checked_ids(self) -> list[str]:
-        chosen = []
-        for row in range(self.library.rowCount()):
-            item = self.library.item(row, 0)
-            if item and item.checkState() == Qt.CheckState.Checked:
-                chosen.append(str(item.data(Qt.ItemDataRole.UserRole)))
-        return chosen
+        return self.selected_ids()
 
     def focused_id(self) -> str | None:
-        row = self.library.currentRow()
-        if row < 0:
-            return None
-        item = self.library.item(row, 0)
-        if item is None:
-            return None
-        return str(item.data(Qt.ItemDataRole.UserRole))
+        current = self.grid.current_id()
+        if current and not str(current).startswith(("error:", "pending:")):
+            return current
+        return None
 
     def focused_clip(self) -> dict | None:
         clip_id = self.focused_id()
@@ -1089,618 +951,319 @@ class MainWindow(QMainWindow):
         return None
 
     def focus_clip(self, clip_id: str) -> None:
-        for row in range(self.library.rowCount()):
-            item = self.library.item(row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == clip_id:
-                self.library.setCurrentCell(row, 1)
-                return
+        self.grid.select_only(clip_id)
 
     def select_all_batch(self) -> None:
-        self._set_all_checks(Qt.CheckState.Checked)
+        self.grid.select_all()
 
     def clear_batch(self) -> None:
-        self._set_all_checks(Qt.CheckState.Unchecked)
-
-    def _set_all_checks(self, state: Qt.CheckState) -> None:
-        self.library.blockSignals(True)
-        for row in range(self.library.rowCount()):
-            item = self.library.item(row, 0)
-            if item:
-                item.setCheckState(state)
-        self.library.blockSignals(False)
-        self._update_count()
-
-    def _focus_changed(self, row, _column, previous, _previous_column) -> None:
-        if self._filling:
-            return
-        if self._notes_dirty and previous >= 0:
-            item = self.library.item(previous, 0)
-            if item is not None and not self._commit_notes_to(str(item.data(Qt.ItemDataRole.UserRole))):
-                self._filling = True
-                self.library.setCurrentCell(previous, 1)
-                self._filling = False
-                return
-        if row < 0:
-            self._invalidate_viewer()
-            return
-        self._invalidate_viewer()
-        self._fill_focus()
-        self.request_playback()
+        self.grid.clear_selection()
 
     def _fill_focus(self) -> None:
         clip = self.focused_clip()
         self._filling = True
-        if clip is None:
-            self.meta.setText("No clip selected.")
-            self.meta_details.setPlainText("")
-            self._filling = False
-            return
-        summary = clip["summary"]
-        video = (clip["probe"].get("video") or [{}])[0] or {}
-        audio = ", ".join(str(item) for item in summary.get("audio_codecs") or []) or "none"
-        data = summary.get("data_streams")
-        duration = summary.get("duration")
-        duration_text = "" if duration is None else f"{float(duration):.2f}s"
-        self.meta.setText(
-            "\n".join(
-                [
-                    clip["name"],
-                    f"{summary.get('width')}×{summary.get('height')}   {summary.get('frame_rate')}   {duration_text}",
-                    f"{summary.get('codec')}   {summary.get('pix_fmt')}   {summary.get('bit_depth')}-bit",
-                ]
-            )
-        )
-        self.meta_details.setPlainText(
-            "\n".join(
-                [
-                    clip["path"],
-                    "SHA-256 " + clip["sha256"],
-                    f"Timecode {summary.get('timecode')}",
-                    f"Color {video.get('color_space')} / {video.get('color_transfer')} / {video.get('color_primaries')} / {video.get('color_range')}",
-                    f"Audio {audio}",
-                    f"Data streams {data}. {clip['probe'].get('motion_metadata', {}).get('note', '')}",
-                ]
-            )
-        )
-        index = self.flag.findData(clip.get("flag") or "")
-        self.flag.setCurrentIndex(max(0, index))
-        self.notes.setPlainText(clip.get("notes") or "")
-        self.trim_in.setValue(float(clip.get("trim_in") or 0))
-        self.trim_out.setValue(float(clip.get("trim_out") or 0))
-        self.markers.clear()
-        for marker in clip.get("markers") or []:
-            self.markers.addItem(f"{float(marker.get('seconds') or 0):.3f}  {marker.get('label') or ''}")
-            self.markers.item(self.markers.count() - 1).setData(Qt.ItemDataRole.UserRole, marker.get("id"))
-        self._filling = False
-        self._update_conversion()
-
-    def _save_flag(self) -> None:
-        if self._filling:
-            return
-        if not self.commit_editor():
-            return
-        clip = self.focused_clip()
-        if clip is None:
-            return
         try:
-            self.service.update_clip(clip["id"], {"flag": self.flag.currentData()})
-        except CraftsError as exc:
-            self.statusBar().showMessage(exc.message, 8000)
-        self.reload_all()
+            if clip is None:
+                self.meta_summary.setText("Select a clip.")
+                self.meta_details.setPlainText("")
+                self.profile_detected.setText("No clip.")
+                return
+            described = describe_clip(clip)
+            profile = described["profile"]
+            sidecar = described["sidecar"]
+            recipe = described["recipe"]
+            video = ((clip.get("probe") or {}).get("video") or [{}])[0]
+            lines = [
+                clip.get("name") or "",
+                f"{video.get('width')}×{video.get('height')}  {video.get('codec')}  {video.get('pix_fmt')}",
+                profile.get("message") or "",
+                sidecar.get("message") or "",
+            ]
+            if sidecar.get("gyro_announced"):
+                lines.append("Sidecar announces gyroscope acquisition. It is not a numeric gyro log.")
+            if sidecar.get("device"):
+                lines.append(" ".join(str(part) for part in sidecar["device"].values()))
+            lines.extend(lut_status(recipe))
+            self.meta_summary.setText("\n".join(line for line in lines if line))
+            preview = self.grid._pixmaps.get(clip["id"])
+            if isinstance(preview, QPixmap) and not preview.isNull():
+                self.browse_preview.set_source(preview)
+            self.meta_details.setPlainText(
+                f"{clip.get('path')}\nsha256 {clip.get('sha256')}\n"
+                f"gamma {sidecar.get('gamma_raw') or '-'}  primaries {sidecar.get('primaries_raw') or '-'}\n"
+                f"tags {video.get('color_transfer')} / {video.get('color_primaries')} / {video.get('color_range')}"
+            )
+            self.profile_detected.setText(profile.get("message") or profile_label(str(profile.get("pipeline") or "")))
+            index = self.profile.findData(recipe.get("profile") or "auto")
+            if index >= 0:
+                self.profile.setCurrentIndex(index)
+            self.exposure.setValue(float(recipe.get("exposure_ev") or 0))
+            self.contrast.setValue(float(recipe.get("contrast") if recipe.get("contrast") is not None else 1))
+            self.saturation.setValue(float(recipe.get("saturation") if recipe.get("saturation") is not None else 1))
+            self.input_lut.setText(recipe.get("input_lut") or "")
+            self.look_lut.setText(recipe.get("look_lut") or "")
+            self.look_includes.setChecked(bool(recipe.get("look_includes_camera")))
+            self.gyro_enabled.setChecked(bool(recipe.get("gyro_enabled")))
+            smoothness = recipe.get("gyro_smoothness")
+            self.gyro_strength.setValue(int(round(float(0.5 if smoothness is None else smoothness) * 100)))
+            fov = recipe.get("gyro_fov")
+            self.gyro_fov.setValue(float(1.0 if fov is None else fov))
+            horizon = recipe.get("gyro_horizon")
+            self.gyro_horizon.setValue(int(round(float(0 if horizon is None else horizon))))
+            self.notes.setPlainText(clip.get("notes") or "")
+            flag_index = self.flag.findData(clip.get("flag") or "")
+            if flag_index >= 0:
+                self.flag.setCurrentIndex(flag_index)
+            self.trim_in.setValue(float(clip.get("trim_in") or 0))
+            self.trim_out.setValue(float(clip.get("trim_out") or 0))
+            self._notes_dirty = False
+            self.filmstrip.setText(clip.get("name") or "")
+            self._show_gyro_state(clip)
+        finally:
+            self._filling = False
 
     def _notes_edited(self) -> None:
         if not self._filling:
             self._notes_dirty = True
-            self._refresh_project_chip()
 
-    def _refresh_project_chip(self) -> None:
-        name = self.service.project.get("name") or "Untitled"
-        path = self.service.project_path
-        dirty = self.is_unsaved()
-        if path is None:
-            state = "Unsaved" if dirty else "New"
-            full = f"{name} · {state}"
-            tip = "This project has not been saved." if dirty else "New project. Nothing is waiting to be saved."
-        else:
-            state = path.name
-            full = f"{name} · {state}" + (" · Unsaved" if dirty else "")
-            tip = str(path)
-            if dirty:
-                tip = tip + "\nUnsaved changes are still in this window."
-        width = max(80, self.project_chip.maximumWidth())
-        shown = self.project_chip.fontMetrics().elidedText(full, Qt.TextElideMode.ElideMiddle, width)
-        self.project_chip.setText(shown)
-        self.project_chip.setToolTip(tip if path is None else f"{full}\n{tip}")
+    def recipe_from_controls(self) -> dict:
+        return {
+            "profile": self.profile.currentData(),
+            "exposure_ev": self.exposure.value(),
+            "contrast": self.contrast.value(),
+            "saturation": self.saturation.value(),
+            "input_lut": self.input_lut.text().strip(),
+            "look_lut": self.look_lut.text().strip(),
+            "look_includes_camera": self.look_includes.isChecked(),
+            "gyro_enabled": self.gyro_enabled.isChecked(),
+            "gyro_smoothness": self.gyro_strength.value() / 100,
+            "gyro_fov": self.gyro_fov.value(),
+            "gyro_horizon": float(self.gyro_horizon.value()),
+        }
 
-    def _commit_notes_to(self, clip_id: str) -> bool:
-        if not self._notes_dirty:
+    def _schedule_recipe(self, *_args) -> None:
+        if self._filling:
+            return
+        clip_id = self.focused_id()
+        if not clip_id:
+            return
+        # The snapshot is this clip, not whoever is focused when the timer fires.
+        self._pending_edit = (clip_id, self.recipe_from_controls())
+        self._recipe_timer.start()
+
+    def _flush_pending_edit(self) -> bool:
+        pending = self._pending_edit
+        self._recipe_timer.stop()
+        if pending is None:
             return True
+        clip_id, recipe = pending
         try:
-            self.service.update_clip(clip_id, {"notes": self.notes.toPlainText()})
+            updated = self.service.update_clip(clip_id, {"recipe": recipe})
         except CraftsError as exc:
-            self.statusBar().showMessage(exc.message, 8000)
+            self.last_error = exc.message
+            self.statusBar().showMessage(exc.message, 6000)
             return False
+        self._pending_edit = None
+        self.clips = self.service.clips()
+        self._show_gyro_state(updated)
+        return True
+
+    def _commit_focused_recipe(self, preview: bool = True) -> bool:
+        if not self._flush_pending_edit():
+            return False
+        if not preview:
+            return True
+        clip = self.focused_clip()
+        if clip is None:
+            return True
+        if self.center.currentIndex() == 1:
+            self.request_comparison()
+        else:
+            self._thumbs.request([clip], adjusted=True)
+        return True
+
+    def apply_recipe_to_selected(self) -> None:
+        if not self._flush_pending_edit():
+            return
+        controls = self.recipe_from_controls()
+        recipe = {key: value for key, value in controls.items() if not key.startswith("gyro_")}
+        ids = self.selected_ids() or ([self.focused_id()] if self.focused_id() else [])
+        if not ids:
+            self.statusBar().showMessage("Select at least one clip.", 5000)
+            return
+        try:
+            for clip_id in ids:
+                self.service.update_clip(clip_id, {"recipe": recipe})
+        except CraftsError as exc:
+            self.last_error = exc.message
+            self.statusBar().showMessage(exc.message, 8000)
+            return
+        self.reload_all()
+        self.preview_status.setText("Colour changed. The processed preview is stale until it is rebuilt.")
+        self.request_comparison()
+
+    def reset_recipe(self) -> None:
+        self.profile.setCurrentIndex(0)
+        self.exposure.setValue(0)
+        self.contrast.setValue(1)
+        self.saturation.setValue(1)
+        self.input_lut.clear()
+        self.look_lut.clear()
+        self.look_includes.setChecked(False)
+        self.apply_recipe_to_selected()
+
+    def apply_gyro_to_selected(self) -> None:
+        if not self._flush_pending_edit():
+            return
+        controls = self.recipe_from_controls()
+        recipe = {key: controls[key] for key in ("gyro_enabled", "gyro_smoothness", "gyro_fov", "gyro_horizon")}
+        ids = self.selected_ids()
+        if not ids:
+            self.statusBar().showMessage("Select at least one clip.", 5000)
+            return
+        try:
+            for clip_id in ids:
+                self.service.update_clip(clip_id, {"recipe": recipe})
+        except CraftsError as exc:
+            self.last_error = exc.message
+            self.statusBar().showMessage(exc.message, 8000)
+            return
+        self.reload_all()
+        self.statusBar().showMessage(f"Stabilization settings applied to {len(ids)} clip(s).", 5000)
+        if self.center.currentIndex() == 1:
+            self.request_comparison()
+
+    def commit_editor(self) -> bool:
+        clip = self.focused_clip()
+        if clip is None:
+            return True
+        notes = self.notes.toPlainText()
+        if len(notes) > 8000:
+            self.last_error = "Notes must be text up to 8000 characters."
+            self.statusBar().showMessage(self.last_error, 6000)
+            return False
+        markers = self._pending_markers if self._pending_markers is not None else list(clip.get("markers") or [])
+        try:
+            self.service.update_clip(
+                clip["id"],
+                {
+                    "notes": notes,
+                    "flag": self.flag.currentData() or "",
+                    "trim_in": self.trim_in.value(),
+                    "trim_out": self.trim_out.value(),
+                    "markers": markers,
+                },
+            )
+        except CraftsError as exc:
+            self.last_error = exc.message
+            self.statusBar().showMessage(exc.message, 6000)
+            return False
+        self._pending_markers = None
         self._notes_dirty = False
         self.clips = self.service.clips()
         return True
 
-    def commit_editor(self) -> bool:
-        clip_id = self.focused_id()
-        if clip_id is None:
-            self._notes_dirty = False
-            return True
-        return self._commit_notes_to(clip_id)
-
-    def save_notes(self) -> None:
-        if self.commit_editor():
-            self.statusBar().showMessage("Notes stored in the project. The source file was not changed.", 5000)
-
     def save_trim(self) -> None:
-        if self._filling:
-            return
-        if not self.commit_editor():
-            return
-        clip = self.focused_clip()
-        if clip is None:
-            return
-        try:
-            self.service.update_clip(clip["id"], {"trim_in": self.trim_in.value(), "trim_out": self.trim_out.value()})
-        except CraftsError as exc:
-            self.statusBar().showMessage(exc.message, 8000)
-            self._fill_focus()
-            return
-        self.clips = self.service.clips()
-        self.statusBar().showMessage("Trim stored in the project. The source file was not cut.", 5000)
+        self.commit_editor()
 
     def add_marker(self) -> None:
-        if not self.commit_editor():
-            return
         clip = self.focused_clip()
         if clip is None:
             return
-        seconds = (self.player.position() / 1000.0) if self.player else float(clip.get("trim_in") or 0)
         markers = list(clip.get("markers") or [])
-        markers.append({"id": uuid.uuid4().hex, "seconds": seconds, "label": "Marker"})
-        try:
-            self.service.update_clip(clip["id"], {"markers": markers})
-        except CraftsError as exc:
-            self.statusBar().showMessage(exc.message, 8000)
-            return
-        self.clips = self.service.clips()
-        self._fill_focus()
-
-    def remove_marker(self) -> None:
-        if not self.commit_editor():
-            return
-        clip = self.focused_clip()
-        row = self.markers.currentRow()
-        if clip is None or row < 0:
-            return
-        marker_id = self.markers.item(row).data(Qt.ItemDataRole.UserRole)
-        markers = [item for item in clip.get("markers") or [] if item.get("id") != marker_id]
-        self.service.update_clip(clip["id"], {"markers": markers})
-        self.clips = self.service.clips()
-        self._fill_focus()
-
-    def _fit_changed(self) -> None:
-        enabled = self.fit.currentData() != "none"
-        self.out_width.setEnabled(enabled)
-        self.out_height.setEnabled(enabled)
-
-    def _gyro_size_toggled(self, checked: bool) -> None:
-        self.gyro_width.setEnabled(not checked)
-        self.gyro_height.setEnabled(not checked)
-
-    def browse_lut(self) -> None:
-        chosen, _filter = QFileDialog.getOpenFileName(self, "LUT", self.lut.text(), "*.cube")
-        if chosen:
-            self.lut.setText(chosen)
-
-    def browse_destination(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "Destination", self.destination.text())
-        if chosen:
-            self.destination.setText(chosen)
-
-    def browse_gyro_preset(self) -> None:
-        self._browse_into(self.gyro_preset, "Gyroflow preset", "*.gyroflow")
-
-    def adjustment_body(self) -> dict:
-        fit = self.fit.currentData()
-        return {
-            "preset_id": self.preset.currentData(),
-            "audio": self.audio.isChecked(),
-            "acknowledge_bit_depth_conversion": self.ack.isChecked(),
-            "exposure": self.exposure.value(),
-            "saturation": self.saturation.value(),
-            "rotate": self.rotate.currentData(),
-            "fit": fit,
-            "width": self.out_width.value() if fit != "none" else None,
-            "height": self.out_height.value() if fit != "none" else None,
-            "stabilization": self.stabilization.currentData(),
-            "use_vidstab_auto": self.vidstab_auto.isChecked(),
-            "stab_smoothing": self.smoothing.value(),
-            "stab_shakiness": self.shakiness.value(),
-            "stab_accuracy": self.accuracy.value(),
-            "stab_crop": self.crop.currentData(),
-            "stab_zoom": self.zoom.value(),
-            "stab_optzoom": int(self.optzoom.currentData()),
-            "deshake_rx": self.deshake_rx.value(),
-            "deshake_ry": self.deshake_ry.value(),
-            "lut_path": self.lut.text().strip() or None,
-        }
-
-    def filter_spec(self, adjusted: bool) -> FilterSpec:
-        if not adjusted:
-            return FilterSpec(include_temporal=False, stabilization="off")
-        body = self.adjustment_body()
-        return FilterSpec(
-            exposure=float(body["exposure"]),
-            saturation=float(body["saturation"]),
-            lut_path=body["lut_path"],
-            rotate=str(body["rotate"]),
-            fit=str(body["fit"]),
-            width=body["width"],
-            height=body["height"],
-            stabilization="off",
-            include_temporal=False,
-        )
-
-    def _update_conversion(self) -> None:
-        clip = self.focused_clip()
-        preset = PRESETS.get(self.preset.currentData() or "")
-        if clip is None or preset is None:
-            self.conversion.setText("")
-            return
-        summary = clip["summary"]
-        note = conversion_note(summary.get("pix_fmt"), summary.get("bit_depth"), preset)
-        self.conversion.setText(note["message"])
-
-    def play(self) -> None:
-        if self.player:
-            self.player.play()
-
-    def pause(self) -> None:
-        if self.player:
-            self.player.pause()
-
-    def step_frame(self, direction: int) -> None:
-        if not self.player:
-            return
-        self.player.pause()
-        delta = int(self._frame_seconds() * 1000 * direction)
-        self.player.setPosition(max(0, self.player.position() + delta))
-
-    def _frame_seconds(self) -> float:
-        clip = self.focused_clip()
-        rate = "" if clip is None else str(clip["summary"].get("frame_rate") or "")
-        try:
-            if "/" in rate:
-                num, den = rate.split("/", 1)
-                value = float(num) / float(den)
-            else:
-                value = float(rate)
-            if value > 0:
-                return 1.0 / value
-        except (TypeError, ValueError, ZeroDivisionError):
-            pass
-        return 0.04
-
-    def _seek(self, position: int) -> None:
-        if self.player:
-            self.player.setPosition(position)
-
-    def _break_long(self, text: str, size: int = 42) -> str:
-        if len(text) <= size:
-            return text
-        return "\n".join(text[index : index + size] for index in range(0, len(text), size))
-
-    def _format_time(self, ms: int) -> str:
-        seconds = max(0, ms) / 1000
-        return f"{int(seconds // 60)}:{seconds % 60:04.1f}"
-
-    def _on_position(self, position: int) -> None:
-        if not self.scrub.isSliderDown():
-            self.scrub.setValue(position)
-        self.time_label.setText(f"{self._format_time(position)} / {self._format_time(self.scrub.maximum())}")
-
-    def _on_duration(self, duration: int) -> None:
-        self.scrub.setRange(0, max(0, duration))
-        self.time_label.setText(f"{self._format_time(self.player.position() if self.player else 0)} / {self._format_time(duration)}")
-
-    def _on_player_error(self, error, message: str) -> None:
-        from PySide6.QtMultimedia import QMediaPlayer
-
-        if error == QMediaPlayer.Error.NoError or self._proxy_fallback:
-            return
-        self.playback_note.setText(f"Playback failed ({message}). Building a viewing proxy.")
-        self._proxy_fallback = True
-        self._request_proxy(force=True)
+        seconds = (self.player.position() / 1000.0) if self.player is not None else float(self.trim_in.value())
+        markers.append({"seconds": seconds, "label": "mark"})
+        self._pending_markers = markers
+        self.commit_editor()
 
     def set_trim_from_player(self, edge: str) -> None:
-        clip = self.focused_clip()
-        if clip is None:
-            return
-        seconds = (self.player.position() / 1000.0) if self.player else 0.0
+        seconds = (self.player.position() / 1000.0) if self.player is not None else 0.0
         if edge == "in":
             self.trim_in.setValue(seconds)
         else:
             self.trim_out.setValue(seconds)
         self.save_trim()
 
-    def request_playback(self) -> None:
-        self._request_proxy(force=False)
-
-    def _request_proxy(self, force: bool) -> None:
-        clip = self.focused_clip()
-        if clip is None:
-            return
-        project_gen = self._project_gen
-        view_gen = self._view_gen
-        clip_id = clip["id"]
-
-        def work(cancel):
-            return self.service.proxy(clip_id, cancel=cancel, force=force)
-
-        self._start(
-            work,
-            lambda result: self._show_playback(project_gen, view_gen, result),
-            key="viewer-proxy",
+    def open_export(self) -> None:
+        ids = set(self.selected_ids())
+        profiles = []
+        gyro = 0
+        for clip in self.clips:
+            if clip["id"] not in ids:
+                continue
+            described = describe_clip(clip)
+            profiles.append(str(described["profile"].get("pipeline")))
+            if described["recipe"].get("gyro_enabled"):
+                gyro += 1
+        summary = (
+            f"One preparation job per clip. Profiles: {', '.join(profiles) or 'none'}. "
+            f"Gyro on {gyro} clip(s). Colour and LUT stay in the same job. Full clip unless saved trim is enabled."
         )
-
-    def _show_playback(self, project_gen: int, view_gen: int, result: dict) -> None:
-        if project_gen != self._project_gen or view_gen != self._view_gen:
-            return
-        self.playback_result = result
-        note = result.get("note") or ""
-        if result.get("limited"):
-            note = f"Proxy, at most {int(PROXY_LIMIT_SECONDS)}s. {note}"
-        self.playback_note.setText(note)
-        self.playback_note.setToolTip(result.get("note") or "")
-        path = result.get("proxy_path") or result.get("path")
-        if path and self.player:
-            self.player.setSource(QUrl.fromLocalFile(str(path)))
-
-    def request_still(self, adjusted: bool) -> None:
-        clip = self.focused_clip()
-        if clip is None:
-            return
-        project_gen = self._project_gen
-        self._still_seq += 1
-        sequence = self._still_seq
-        seconds = (self.player.position() / 1000.0) if self.player else 0.0
-        spec = self.filter_spec(adjusted)
-        clip_id = clip["id"]
-
-        def work(cancel):
-            return str(self.service.thumbnail(clip_id, seconds, spec, cancel=cancel))
-
-        self._start(
-            work,
-            lambda path: self._show_still(project_gen, sequence, adjusted, path),
-            key="still",
-        )
-
-    def _show_still(self, project_gen: int, sequence: int, adjusted: bool, path: str) -> None:
-        if project_gen != self._project_gen or sequence != self._still_seq:
-            return
-        self.still_path = path
-        label = self.still_adjusted if adjusted else self.still_original
-        self.still_label = label
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            label.setText(path)
-            label.set_source(QPixmap())
-            return
-        label.setText("")
-        label.set_source(pixmap)
-        self.viewer_stack.setCurrentIndex(2 if adjusted else 1)
+        self.export_dialog.set_summary(len(ids), summary)
+        self.refresh_queue()
+        self.export_dialog.show()
+        self.export_dialog.raise_()
 
     def queue_focused_export(self) -> None:
-        if not self.commit_editor():
-            return
-        clip = self.focused_clip()
-        if clip is None:
-            self.statusBar().showMessage("Select a clip first.", 5000)
-            return
-        if not self._require_destination():
-            return
-        body = self.adjustment_body()
-        body.update(
-            {
-                "clip_id": clip["id"],
-                "in_seconds": float(clip.get("trim_in") or 0),
-                "out_seconds": float(clip.get("trim_out") or 0),
-                "destination_dir": self.destination.text().strip(),
-                "suffix": self.suffix.text().strip(),
-            }
-        )
-        try:
-            job = self.service.enqueue_export(body)
-        except CraftsError as exc:
-            self.last_error = exc.message
-            self.statusBar().showMessage(exc.message, 10000)
-            if exc.code == "bit_depth":
-                self.ack.setChecked(False)
-            return
-        self.statusBar().showMessage(f"Queued {job.get('request', {}).get('filename', 'export')}.", 5000)
-        self.refresh_queue()
+        if self.focused_id() and self.focused_id() not in self.selected_ids():
+            self.focus_clip(self.focused_id())
+        self.queue_checked_batch("prepare")
 
     def queue_checked_batch(self, operation: str) -> None:
-        if not self.commit_editor():
+        if not self._commit_focused_recipe(preview=False) or not self.commit_editor():
             return
-        clip_ids = self.checked_ids()
-        if not clip_ids:
-            self.statusBar().showMessage("Check at least one clip. Focus and batch selection are separate.", 6000)
+        ids = self.selected_ids()
+        if not ids and self.focused_id():
+            ids = [self.focused_id()]
+        if not ids:
+            self.last_error = "Select at least one clip."
+            self.statusBar().showMessage(self.last_error, 5000)
             return
-        if not self._require_destination():
+        if not self.destination.text().strip():
+            self.last_error = "Choose a destination folder. Nothing was queued."
+            self.statusBar().showMessage(self.last_error, 6000)
             return
-        if operation == "export":
-            payload = {
-                "operation": "export",
-                "clip_ids": clip_ids,
-                "destination_dir": self.destination.text().strip(),
-                "suffix": self.suffix.text().strip(),
-                "export": self.adjustment_body(),
-            }
-        else:
-            width = None if self.gyro_source_size.isChecked() else self.gyro_width.value()
-            height = None if self.gyro_source_size.isChecked() else self.gyro_height.value()
-            payload = {
-                "operation": "gyro",
-                "clip_ids": clip_ids,
-                "destination_dir": self.destination.text().strip(),
-                "suffix": self.suffix.text().strip(),
-                "gyro": {
-                    "format": self.gyro_format.currentData(),
-                    "audio": self.gyro_audio.isChecked(),
-                    "width": width,
-                    "height": height,
-                    "preset_path": self.gyro_preset.text().strip() or None,
-                },
-            }
+        if operation == "gyro":
+            try:
+                for clip_id in ids:
+                    current = next(clip for clip in self.service.clips() if clip["id"] == clip_id)
+                    recipe = {**(current.get("recipe") or default_recipe()), "gyro_enabled": True}
+                    self.service.update_clip(clip_id, {"recipe": recipe})
+            except (CraftsError, StopIteration) as exc:
+                self.last_error = str(exc)
+                return
+            operation = "prepare"
+        shared = {
+            "preset_id": self.preset.currentData(),
+            "audio": self.audio.isChecked(),
+            "acknowledge_bit_depth_conversion": self.ack.isChecked(),
+            "use_trim": self.export_dialog.use_trim.isChecked(),
+            "fit": self.fit.currentData() or "none",
+            "crf": self.export_dialog.crf.value(),
+        }
+        if shared["fit"] == "resize":
+            shared["width"] = self.out_width.value()
+            shared["height"] = self.out_height.value()
         try:
-            result = self.service.enqueue_batch(payload)
+            result = self.service.enqueue_batch(
+                {
+                    "operation": "prepare" if operation in {"export", "prepare"} else operation,
+                    "clip_ids": ids,
+                    "destination_dir": self.destination.text().strip(),
+                    "suffix": self.suffix.text(),
+                    "prepare": shared,
+                }
+            )
         except CraftsError as exc:
             self.last_error = exc.message
-            lines = [exc.message]
-            for item in exc.details or []:
-                if isinstance(item, dict):
-                    lines.append(f"{item.get('clip_id') or 'clip'}: {item.get('message')}")
-            self.batch_errors.setPlainText("\n".join(lines))
-            self.statusBar().showMessage(exc.message, 10000)
+            self.statusBar().showMessage(exc.message, 8000)
             return
         self.last_batch_id = result["batch_id"]
-        self.batch_errors.setPlainText("")
-        self.statusBar().showMessage(f"Queued {result['count']} {operation} job(s).", 6000)
-        self.refresh_queue()
-
-    def queue_manual_gyro(self) -> None:
-        if not self.commit_editor():
-            return
-        clip = self.focused_clip()
-        output = self.manual_output.text().strip()
-        if not output:
-            self.statusBar().showMessage("Choose a manual gyro output path.", 6000)
-            return
-        body = {
-            "clip_id": None if clip is None else clip["id"],
-            "media_path": None if clip is None else clip["path"],
-            "project_path": self.manual_project.text().strip() or None,
-            "gyro_path": self.manual_gcsv.text().strip() or None,
-            "preset_path": self.manual_preset.text().strip() or None,
-            "output_path": output,
-        }
-        try:
-            job = self.service.enqueue_gyro(body)
-        except CraftsError as exc:
-            self.last_error = exc.message
-            self.statusBar().showMessage(exc.message, 10000)
-            return
-        self.statusBar().showMessage(f"Queued manual gyro {job['id']}.", 5000)
-        self.refresh_queue()
-
-    def parse_gcsv(self) -> None:
-        path = self.manual_gcsv.text().strip()
-        if not path:
-            self.statusBar().showMessage("Choose a GCSV file first.", 5000)
-            return
-        self._start(lambda cancel: self.service.parse_gcsv(path, cancel=cancel), lambda result: self._show_text("GCSV", result), key="gcsv")
-
-    def inspect_telemetry(self) -> None:
-        clip = self.focused_clip()
-        if clip is None:
-            return
-        clip_id = clip["id"]
-        self._start(
-            lambda cancel: self.service.inspect_telemetry(clip_id, cancel=cancel),
-            lambda result: self._show_text("Telemetry", result),
-            key="telemetry",
-        )
-
-    def _show_text(self, title: str, result) -> None:
-        import json
-
-        TextDialog(title, json.dumps(result, indent=2), self).exec()
-
-    def _require_destination(self) -> bool:
-        if self.destination.text().strip():
-            return True
-        self.browse_destination()
-        if self.destination.text().strip():
-            return True
-        self.statusBar().showMessage("Choose a destination folder. Nothing was queued.", 6000)
-        return False
-
-    def refresh_queue(self) -> None:
-        jobs = self.service.jobs()
-        self.queue_empty.setVisible(not jobs)
-        self.queue.setRowCount(len(jobs))
-        for row, job in enumerate(jobs):
-            request = job.get("request") or {}
-            name = request.get("filename") or Path(str(request.get("output_path") or "")).name or job["id"][:8]
-            values = [
-                str(name),
-                str(job.get("kind") or ""),
-                str(job.get("status") or ""),
-                f"{float(job.get('progress') or 0):.0%}",
-                str(job.get("error") or ""),
-            ]
-            shown = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setFlags(shown)
-                item.setData(Qt.ItemDataRole.UserRole, job["id"])
-                self.queue.setItem(row, column, item)
-        if self.service.persist_error:
-            self._lock_message_shown = True
-            self.statusBar().showMessage(self.service.persist_error)
-            return
-        if self._lock_message_shown:
-            self._lock_message_shown = False
-            self.statusBar().clearMessage()
-        if self.last_batch_id:
-            try:
-                status = self.service.batch_status(self.last_batch_id)
-            except CraftsError:
-                return
-            self.statusBar().showMessage(
-                f"Batch {status['succeeded']} succeeded, {status['failed']} failed, "
-                f"{status['running']} running, {status['queued']} queued, {status['cancelled']} cancelled.",
-                3000,
-            )
-
-    def _selected_job_id(self) -> str | None:
-        row = self.queue.currentRow()
-        if row < 0:
-            return None
-        item = self.queue.item(row, 0)
-        if item is None:
-            return None
-        return str(item.data(Qt.ItemDataRole.UserRole))
-
-    def cancel_selected_job(self) -> None:
-        job_id = self._selected_job_id()
-        if not job_id:
-            return
-        try:
-            self.service.cancel(job_id)
-        except CraftsError as exc:
-            self.statusBar().showMessage(exc.message, 6000)
-        self.refresh_queue()
-
-    def retry_selected_job(self) -> None:
-        job_id = self._selected_job_id()
-        if not job_id:
-            return
-        try:
-            self.service.retry(job_id)
-        except CraftsError as exc:
-            self.statusBar().showMessage(exc.message, 6000)
+        self.statusBar().showMessage(f"Queued {result['count']} preparation job(s).", 6000)
         self.refresh_queue()
 
     def cancel_current_batch(self) -> None:
         if not self.last_batch_id:
-            self.statusBar().showMessage("No batch has been queued in this window.", 5000)
             return
         try:
             self.service.cancel_batch(self.last_batch_id)
@@ -1710,7 +1273,6 @@ class MainWindow(QMainWindow):
 
     def retry_failed_batch(self) -> None:
         if not self.last_batch_id:
-            self.statusBar().showMessage("No batch has been queued in this window.", 5000)
             return
         try:
             result = self.service.retry_batch_failures(self.last_batch_id)
@@ -1720,21 +1282,580 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Requeued {len(result['retried'])} failed job(s).", 5000)
         self.refresh_queue()
 
+    def refresh_queue(self) -> None:
+        if self.service.persist_error:
+            self.statusBar().showMessage(self.service.persist_error, 8000)
+        elif "Could not replace the project file" in (self.statusBar().currentMessage() or ""):
+            self.statusBar().clearMessage()
+        lines = []
+        for job in self.service.jobs():
+            result = job.get("result") if isinstance(job.get("result"), dict) else {}
+            colour = result.get("colour") or {}
+            gyro = result.get("gyro") or {}
+            lines.append(
+                " ".join(
+                    part
+                    for part in (
+                        str(job.get("status") or ""),
+                        f"{float(job.get('progress') or 0) * 100:.0f}%",
+                        str(job.get("kind") or ""),
+                        str((job.get("request") or {}).get("filename") or ""),
+                        str(colour.get("pipeline") or ""),
+                        "gyro" if gyro.get("applied") else "",
+                        str(job.get("error") or ""),
+                    )
+                    if part
+                )
+            )
+        self.export_dialog.jobs.setPlainText("\n".join(lines))
+
+    def request_playback(self) -> None:
+        self.request_comparison()
+
+    def request_still(self, adjusted: bool) -> None:
+        clip = self.focused_clip()
+        if clip is None:
+            return
+        seconds = self._current_seconds(clip)
+        sequence = self._still_seq
+        generation = self._project_gen
+
+        def work(cancel):
+            ffmpeg, _ffprobe = self.service._tools()
+            directory = self.service.data_dir / "still-src" / clip["id"]
+            filters, files, _message = safe_filters(clip, directory, adjusted=adjusted, cache=self.service.data_dir / "colour-cache")
+            destination = self.service.data_dir / f"still-{clip['id']}-{int(adjusted)}-{sequence}.jpg"
+            duration = float((clip.get("probe") or {}).get("duration") or 0)
+            return str(
+                extract_thumbnail(
+                    ffmpeg=ffmpeg,
+                    source=Path(clip["path"]),
+                    seconds=seconds,
+                    destination=destination,
+                    spec=FilterSpec(),
+                    duration=duration,
+                    cancel=cancel,
+                    extra_filters=filters or None,
+                    stage_files=files or None,
+                )
+            )
+
+        self._start(work, lambda path: self._show_still(generation, sequence, adjusted, path), key="still")
+
+    def request_comparison(self) -> None:
+        clip = self.focused_clip()
+        if clip is None:
+            return
+        self._compare_token += 1
+        token = self._compare_token
+        position = self.player.position() if self.player is not None else 0
+        described = describe_clip(clip)
+        pipeline = str(described["profile"].get("pipeline") or "")
+        gyro_on = bool(described["recipe"].get("gyro_enabled"))
+        geometry = self._current_geometry(clip) if gyro_on else None
+        gyro_path = geometry
+        owner = ("compare", token)
+        if gyro_path:
+            self._geometry_users[owner] = str(gyro_path)
+        self.preview_status.setText(self._gyro_message(clip) if gyro_on and geometry is None else "Comparison preview is rendering.")
+
+        def work(cancel):
+            ffmpeg, _ffprobe = self.service._tools()
+            directory = self.service.data_dir / "compare-src" / clip["id"]
+            filters, files, message = safe_filters(clip, directory, adjusted=True, cache=self.service.data_dir / "colour-cache")
+            if pipeline in {"slog3_sgamut3cine", "hlg_bt2020"} and not filters:
+                raise CraftsError(message or "The processed comparison was not built.", code="colour_unresolved")
+            right = Path(gyro_path) if gyro_on and gyro_path and Path(gyro_path).is_file() else None
+            destination = self.service.data_dir / f"compare-{clip['id']}-{token}.mp4"
+            make_comparison_proxy(
+                ffmpeg=ffmpeg,
+                source=Path(clip["path"]),
+                destination=destination,
+                colour_filter=filters,
+                stage_files=files or None,
+                right_source=right,
+                cancel=cancel,
+            )
+            prime = destination.with_suffix(".png")
+            from ..process import run_captured
+
+            run_captured(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-ss", "0", "-i", str(destination), "-frames:v", "1", str(prime)],
+                timeout=60,
+                cancel=cancel,
+            )
+            return {
+                "path": str(destination),
+                "prime": str(prime),
+                "message": message,
+                "gyro": bool(right),
+                "pipeline": pipeline,
+                "token": token,
+            }
+
+        def done(result: dict) -> None:
+            if result.get("token") != self._compare_token or self.player is None:
+                return
+            prime = QPixmap(result.get("prime") or "")
+            if not prime.isNull():
+                self.compare.present_split(prime, position / 1000.0)
+                self.still_original.set_source(self.compare._left)
+                self.still_adjusted.set_source(self.compare._right)
+            self._compare_path = result["path"]
+            self.player.setVideoSink(self.frame_sink)
+            self.player.setSource(QUrl.fromLocalFile(result["path"]))
+            self.player.setPosition(position)
+            self.still_path = result["path"]
+            self.playback_result = {"kind": "comparison", "proxy_path": result["path"], "limited": False}
+            self.comparison_used_gyro = bool(result.get("gyro"))
+            if gyro_on and not result.get("gyro"):
+                note = self._gyro_message(clip)
+            elif result.get("gyro"):
+                note = "Both sides follow one clock. Colour and the look run once on the current gyro geometry."
+            else:
+                note = "Both sides follow one clock."
+            self.preview_status.setText(" ".join(part for part in (result.get("message"), note) if part))
+            self.viewer_stack.setCurrentIndex(0)
+            self._retire_owned_previews()
+
+        self._start(work, done, key="compare", on_finished=lambda: self._release_geometry(owner))
+
+    def _current_geometry(self, clip: dict) -> str | None:
+        record = self._gyro_geometry.get(clip["id"]) or {}
+        path = str(record.get("path") or "")
+        if not path or not Path(path).is_file():
+            return None
+        from ..prepare import gyro_geometry_key
+
+        described = describe_clip(clip)
+        if record.get("key") != gyro_geometry_key(clip, described["recipe"]):
+            return None
+        return path
+
+    def _gyro_message(self, clip: dict) -> str:
+        from ..prepare import gyro_geometry_key
+
+        described = describe_clip(clip)
+        recipe = described["recipe"]
+        if not recipe.get("gyro_enabled"):
+            return "Gyro is off."
+        record = self._gyro_geometry.get(clip["id"]) or {}
+        key = gyro_geometry_key(clip, recipe)
+        if record.get("path") and Path(str(record["path"])).is_file() and record.get("key") != key:
+            return (
+                "Stabilization is stale. Strength, field of view, horizon, or rotation changed. "
+                "The previous file is not the current geometry."
+            )
+        if record.get("key") == key and record.get("path") and Path(str(record["path"])).is_file():
+            return "Stabilization geometry is current."
+        return "Stabilization preview has not been rendered."
+
+    def _show_gyro_state(self, clip: dict | None) -> None:
+        if clip is None or not hasattr(self, "gyro_status"):
+            return
+        self.gyro_status.setText(self._gyro_message(clip))
+
+    def refresh_selected_metadata(self) -> None:
+        if not self._flush_pending_edit():
+            return
+        ids = self.selected_ids() or ([self.focused_id()] if self.focused_id() else [])
+        if not ids:
+            self.statusBar().showMessage("Select at least one clip.", 5000)
+            return
+        self._metadata_token += 1
+        token, generation = self._metadata_token, self._project_gen
+        self.statusBar().showMessage(f"Refreshing metadata for {len(ids)} clip(s)…")
+        self.metadata_cancel_button.setEnabled(True)
+
+        def done(report):
+            if generation != self._project_gen or token != self._metadata_token:
+                return
+            self.reload_all()
+            messages = []
+            for item in report.get("clips") or []:
+                if item.get("status") == "missing":
+                    messages.append("A selected source is missing. Its recipe was kept.")
+                messages.extend(str(issue) for issue in (item.get("assessment") or {}).get("issues") or [])
+            self.statusBar().showMessage(" ".join(messages) or "Metadata refreshed. Recipes were kept.", 8000)
+
+        def finished():
+            if token == self._metadata_token:
+                if self._metadata_cancel is not None and self._metadata_cancel.is_set():
+                    self.statusBar().showMessage("Metadata refresh cancelled.", 5000)
+                self._metadata_cancel = None
+                self.metadata_cancel_button.setEnabled(False)
+
+        self._metadata_cancel = self._start(
+            lambda cancel: self.service.refresh_metadata(ids, cancel=cancel), done,
+            key="metadata", on_finished=finished,
+        )
+
+    def cancel_metadata_refresh(self) -> None:
+        if self._metadata_cancel is not None:
+            self._metadata_cancel.set()
+            self.statusBar().showMessage("Stopping metadata refresh…")
+
+    def _retire_owned_previews(self) -> None:
+        """Drop old owned previews. Never the file the player has open, and never a user export."""
+        active = Path(self._compare_path).resolve() if getattr(self, "_compare_path", "") else None
+        import re
+
+        held = {Path(item).resolve() for item in self._geometry_users.values() if item}
+        current = self._gyro_geometry.get(self.focused_id()) or {}
+        if current.get("path"):
+            held.add(Path(str(current["path"])).resolve())
+        geometry_dir = self.service.data_dir / "gyro-geometry"
+        if geometry_dir.is_dir():
+            files = sorted(
+                (path for path in geometry_dir.glob("*.mov") if re.fullmatch(r"[0-9a-f]{24}-[0-9a-f]{8}\.mov", path.name)),
+                key=lambda path: path.stat().st_mtime, reverse=True,
+            )
+            spare = [path for path in files if path.resolve() not in held]
+            remaining = max(0, 4 - sum(path.resolve() in held for path in files))
+            for path in spare[remaining:]:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    continue  # A player/tool may still be releasing it. Retry next time.
+            self._gyro_geometry = {
+                key: record for key, record in self._gyro_geometry.items()
+                if record.get("path") and Path(str(record["path"])).is_file()
+            }
+        compares = sorted(self.service.data_dir.glob("compare-*.mp4"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in compares[6:]:
+            if active is not None and path.resolve() == active:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+                path.with_suffix(".png").unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def _release_geometry(self, owner: tuple[str, int]) -> None:
+        self._geometry_users.pop(owner, None)
+        self._retire_owned_previews()
+
+    def update_stabilization_preview(self) -> None:
+        if not self._flush_pending_edit():
+            return
+        clip = self.focused_clip()
+        if clip is None:
+            return
+        if not self.gyro_enabled.isChecked():
+            self.gyro_status.setText("Gyro is off, so there is no stabilization preview to render.")
+            return
+        from ..prepare import gyro_geometry_key
+
+        described = describe_clip(clip)
+        recipe = dict(described["recipe"])
+        recipe["gyro_enabled"] = True
+        key = gyro_geometry_key(clip, recipe)
+        self._gyro_token += 1
+        token = self._gyro_token
+        clip_id = clip["id"]
+        generation = self._project_gen
+        import uuid
+
+        directory = self.service.data_dir / "gyro-geometry"
+        directory.mkdir(parents=True, exist_ok=True)
+        output = directory / f"{key}-{uuid.uuid4().hex[:8]}.mov"
+        owner = ("gyro", token)
+        self._geometry_users[owner] = str(output)
+        self.gyro_status.setText("Rendering gyro geometry in the original colour space. Colour is not applied in this stage.")
+
+        def work(cancel):
+            from ..gyroflow_cli import run_gyroflow
+            from ..probe import display_dimensions, normalize_rotation
+
+            _ffmpeg, ffprobe = self.service._tools()
+            fresh = next(item for item in self.service.clips() if item["id"] == clip_id)
+            video = ((fresh.get("probe") or {}).get("video") or [{}])[0]
+            width, height = display_dimensions(video)
+            rotation = normalize_rotation(video.get("rotation"))
+            try:
+                result = run_gyroflow(
+                    settings=self.service.settings,
+                    media=Path(fresh["path"]),
+                    project=None,
+                    gyro_file=None,
+                    preset=None,
+                    output=output,
+                    ffprobe=ffprobe,
+                    cancel=cancel,
+                    on_progress=lambda _value: None,
+                    automatic=True,
+                    output_settings={
+                        "format": "prores_422",
+                        "audio": False,
+                        "width": width,
+                        "height": height,
+                        "rotation": rotation,
+                    },
+                    stabilization={
+                        "smoothness": recipe["gyro_smoothness"],
+                        "fov": recipe["gyro_fov"],
+                        "horizon_lock_amount": recipe["gyro_horizon"],
+                    },
+                )
+            except CraftsError as exc:
+                return {"error": exc.message, "token": token, "clip_id": clip_id}
+            return {"path": str(result.get("output_path") or output), "key": key, "token": token, "clip_id": clip_id}
+
+        def done(result: dict) -> None:
+            if result.get("token") != self._gyro_token or generation != self._project_gen:
+                return
+            if result.get("error"):
+                if self.focused_id() == result["clip_id"]:
+                    self.gyro_status.setText(str(result["error"]))
+                return
+            path = str(result.get("path") or "")
+            self._gyro_geometry[result["clip_id"]] = {"key": result.get("key"), "path": path}
+            if self.focused_id() == result["clip_id"]:
+                self.playback_result = {"kind": "gyro-geometry", "proxy_path": path, "key": result.get("key")}
+                self._show_gyro_state(self.focused_clip())
+                self.request_comparison()
+            self._retire_owned_previews()
+
+        self._start(work, done, key="gyro-preview", on_finished=lambda: self._release_geometry(owner))
+
+    def _current_seconds(self, clip: dict) -> float:
+        if self.player is not None and self.player.position() > 0:
+            return min(self.player.position() / 1000.0, float((clip.get("probe") or {}).get("duration") or 0) or 0)
+        duration = float((clip.get("probe") or {}).get("duration") or 0)
+        return min(0.2, duration / 2 if duration else 0.0)
+
+    def _show_still(self, generation: int, sequence: int, adjusted: bool, path: str) -> None:
+        if generation != self._project_gen or sequence != self._still_seq:
+            return
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return
+        self.still_path = path
+        if adjusted:
+            self.still_adjusted.set_source(pixmap)
+        else:
+            self.still_original.set_source(pixmap)
+
+    def _invalidate_viewer(self) -> None:
+        self._view_gen += 1
+        self._still_seq += 1
+        self._compare_token += 1
+        self._frame_token = getattr(self, "_frame_token", 0) + 1
+        self._paused_frame_target = None
+        if getattr(self, "_frame_cancel", None) is not None:
+            self._frame_cancel.set()
+        self._proxy_fallback = False
+        self.still_path = ""
+        self.playback_result = None
+        self.still_original.set_source(QPixmap())
+        self.still_adjusted.set_source(QPixmap())
+        self.compare.set_pair(QPixmap(), QPixmap(), 0.0)
+        self.compare._paired = False
+        self.compare.frames_presented = 0
+        if self.player is not None:
+            self.player.stop()
+            self.player.setSource(QUrl())
+        if hasattr(self, "scrub"):
+            self.scrub.setRange(0, 0)
+            self.time_label.setText("0:00.0 / 0:00.0")
+
+    def _compare_mode_changed(self) -> None:
+        mode = str(self.compare_mode.currentData() or "split")
+        self.compare.set_mode(mode if mode in {"split", "wipe", "original", "processed"} else "split")
+        self.viewer_stack.setCurrentIndex(0)
+
+    def _on_compare_frame(self, frame) -> None:
+        image = frame.toImage() if hasattr(frame, "toImage") else None
+        if image is None or image.isNull() or self.player is None:
+            return
+        if getattr(self, "_paused_frame_target", None) is not None:
+            return
+        timestamp = frame.startTime() if hasattr(frame, "startTime") else -1
+        seconds = timestamp / 1_000_000 if timestamp >= 0 else self.player.position() / 1000.0
+        self.compare.present_split(image, seconds)
+        self.still_original.set_source(self.compare._left)
+        self.still_adjusted.set_source(self.compare._right)
+        self.still_path = getattr(self, "_compare_path", "") or self.still_path
+
+    def _frame_ms(self) -> int:
+        clip = self.focused_clip()
+        video = (((clip or {}).get("probe") or {}).get("video") or [{}])[0] or {}
+        num = int(video.get("frame_rate_num") or 25)
+        den = int(video.get("frame_rate_den") or 1)
+        if num <= 0:
+            return 40
+        return max(1, int(round(1000 * den / num)))
+
+    def play(self) -> None:
+        if self.player is not None:
+            self._frame_token += 1
+            self._paused_frame_target = None
+            if self._frame_cancel is not None:
+                self._frame_cancel.set()
+            self.player.play()
+
+    def pause(self) -> None:
+        if self.player is not None:
+            self.player.pause()
+
+    def step_frame(self, direction: int) -> None:
+        if self.player is None:
+            return
+        import math
+        import re
+        import uuid
+
+        path = getattr(self, "_compare_path", "")
+        if not path or not Path(path).is_file():
+            return
+        clip = self.focused_clip() or {}
+        video = ((clip.get("probe") or {}).get("video") or [{}])[0] or {}
+        num = int(video.get("frame_rate_num") or 25)
+        den = max(1, int(video.get("frame_rate_den") or 1))
+        fps = num / den if num > 0 else 25.0
+        current = self._paused_frame_target if self._paused_frame_target is not None else self.compare.seconds
+        index = max(0, int(round(current * fps)) + (1 if direction > 0 else -1))
+        duration = self.player.duration() / 1000.0
+        if duration > 0:
+            index = min(index, max(0, math.ceil(duration * fps) - 1))
+        target = index / fps
+        self.player.pause()
+        self._paused_frame_target = target
+        self.player.setPosition(round(target * 1000))
+        self._frame_token += 1
+        token, generation = self._frame_token, self._project_gen
+        image_path = self.service.data_dir / f".frame-step-{uuid.uuid4().hex}.png"
+
+        def work(cancel):
+            from ..process import run_captured
+
+            ffmpeg, _ffprobe = self.service._tools()
+            code, _out, error = run_captured(
+                [ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "info", "-copyts",
+                 "-ss", f"{target:.9f}", "-i", path, "-vf", "showinfo", "-frames:v", "1",
+                 "-fps_mode", "passthrough", str(image_path)], timeout=30, cancel=cancel,
+            )
+            timestamp = re.search(r"pts_time:([0-9.]+)", error)
+            if code or not image_path.is_file() or timestamp is None:
+                raise CraftsError("The requested frame could not be decoded.", code="preview_frame")
+            return float(timestamp.group(1))
+
+        def done(seconds):
+            if token != self._frame_token or generation != self._project_gen or path != self._compare_path:
+                return
+            image = QPixmap(str(image_path))
+            if image.isNull():
+                return
+            self.compare.present_split(image, seconds)
+            self.still_original.set_source(self.compare._left)
+            self.still_adjusted.set_source(self.compare._right)
+            self._paused_frame_target = seconds
+            self.playback_result = {"kind": "paused-frame", "proxy_path": path, "frame_time_seconds": seconds}
+
+        self._frame_cancel = self._start(work, done, key="frame-step", on_finished=lambda: image_path.unlink(missing_ok=True))
+
+    def _seek(self, position: int) -> None:
+        if self.player is not None:
+            self._frame_token += 1
+            self._paused_frame_target = None
+            if self._frame_cancel is not None:
+                self._frame_cancel.set()
+            self.player.setPosition(position)
+
+    def _on_position(self, position: int) -> None:
+        self.time_label.setText(self._format_time(position))
+        if not self.scrub.isSliderDown():
+            self.scrub.setValue(position)
+
+    def _on_duration(self, duration: int) -> None:
+        self.scrub.setRange(0, max(0, duration))
+
+    def _format_time(self, ms: int) -> str:
+        seconds = ms / 1000
+        return f"{int(seconds // 60)}:{seconds % 60:04.1f}"
+
+    def _on_player_error(self, error, message: str) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        if error == QMediaPlayer.Error.NoError or self._proxy_fallback:
+            return
+        self.playback_note.setText(f"Playback failed ({message}). Building a viewing proxy.")
+        self._proxy_fallback = True
+        self._request_proxy(force=True, processed=False)
+
+    def _request_proxy(self, force: bool, processed: bool = False) -> None:
+        clip = self.focused_clip()
+        if clip is None:
+            return
+        clip_id = clip["id"]
+
+        def work(cancel):
+            if not processed and not force:
+                report = self.service.proxy(clip_id, cancel=cancel, force=False)
+                if report.get("kind") == "source":
+                    report["path"] = clip["path"]
+                    return report
+            ffmpeg, _ffprobe = self.service._tools()
+            described = describe_clip(clip)
+            digest = recipe_fingerprint(described["recipe"]) if processed else "original"
+            destination = self.service.data_dir / f"view-{clip['sha256']}-{digest}.mp4"
+            filters = ""
+            files: dict = {}
+            if processed:
+                filters, files, _message = safe_filters(
+                    clip,
+                    self.service.data_dir / "view-src" / clip_id,
+                    adjusted=True,
+                    cache=self.service.data_dir / "colour-cache",
+                )
+            video_filter = filters + ",scale=960:-2" if filters else "scale=960:-2"
+            if force or not destination.is_file():
+                if force and destination.exists():
+                    destination.unlink()
+                make_proxy(
+                    ffmpeg=ffmpeg,
+                    source=Path(clip["path"]),
+                    destination=destination,
+                    duration=float((clip.get("probe") or {}).get("duration") or 0),
+                    cancel=cancel,
+                    max_seconds=None,
+                    video_filter=video_filter,
+                    stage_files=files or None,
+                )
+            return {
+                "kind": "proxy",
+                "proxy_path": str(destination),
+                "limited": False,
+                "note": f"Full-length preview. It is not cut at {int(PROXY_LIMIT_SECONDS)} seconds.",
+            }
+
+        self._start(work, self._show_proxy, key="viewer-proxy")
+
+    def _show_proxy(self, result: dict) -> None:
+        self.playback_result = result
+        path = result.get("proxy_path") or result.get("path")
+        if self.player is not None and path:
+            self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.playback_note.setText(result.get("note") or "Playback ready.")
+
+    def _browse_into(self, edit: QLineEdit, title: str) -> None:
+        path, _filter = QFileDialog.getOpenFileName(self, title, edit.text(), "LUT (*.cube)")
+        if path:
+            edit.setText(path)
+            self._schedule_recipe()
+
     def is_unsaved(self) -> bool:
-        if self._notes_dirty:
+        if self._notes_dirty or self._pending_edit is not None:
             return True
         if self.service.project_path is not None:
             return False
         project = self.service.project
-        if project.get("clips") or project.get("jobs"):
-            return True
-        return (project.get("name") or "Untitled") != "Untitled"
+        return bool(project.get("clips") or project.get("jobs") or (project.get("name") or "Untitled") != "Untitled")
 
     def _prompt_unsaved(self) -> str:
         box = QMessageBox(self)
         box.setWindowTitle(APP_NAME)
         box.setText("This project has not been saved.")
-        box.setInformativeText("Queued exports are not resumed automatically when a project is opened later.")
         save = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
         discard = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
         cancel = box.addButton(QMessageBox.StandardButton.Cancel)
@@ -1744,12 +1865,10 @@ class MainWindow(QMainWindow):
             return "save"
         if clicked is discard:
             return "discard"
-        if clicked is cancel:
-            return "cancel"
         return "cancel"
 
     def new_project(self, discard: bool = False) -> bool:
-        if not self.commit_editor():
+        if not self._prepare_to_leave():
             return False
         if self.is_unsaved() and not discard:
             choice = self._prompt_unsaved()
@@ -1757,9 +1876,7 @@ class MainWindow(QMainWindow):
                 return False
             if choice == "save" and not self.save_project_interactive():
                 return False
-        if self._busy_queue():
-            return False
-        if not self._runner.settle():
+        if self._busy_queue() or not self._runner.settle():
             self.statusBar().showMessage("Background work did not stop. The project was not replaced.", 8000)
             return False
         with self.service.lock:
@@ -1780,7 +1897,7 @@ class MainWindow(QMainWindow):
             self.open_project_path(path)
 
     def open_project_path(self, path: str) -> bool:
-        if not self.commit_editor():
+        if not self._prepare_to_leave():
             return False
         if self.is_unsaved():
             choice = self._prompt_unsaved()
@@ -1788,9 +1905,7 @@ class MainWindow(QMainWindow):
                 return False
             if choice == "save" and not self.save_project_interactive():
                 return False
-        if self._busy_queue():
-            return False
-        if not self._runner.settle():
+        if self._busy_queue() or not self._runner.settle():
             self.statusBar().showMessage("Background work did not stop. The current project was kept.", 8000)
             return False
         try:
@@ -1803,43 +1918,32 @@ class MainWindow(QMainWindow):
         self._save_preferences()
         self._rebuild_recent()
         self._reset_workspace()
-        self.statusBar().showMessage("Opened. Saved queued exports stay paused until you retry them.", 8000)
         return True
 
     def _reset_workspace(self) -> None:
         self._project_gen += 1
-        self._view_gen += 1
+        self._folder_token += 1
+        self._gyro_token += 1
+        self._metadata_token += 1
+        self._metadata_cancel = None
+        self.metadata_cancel_button.setEnabled(False)
+        self._thumbs.cancel()
         self._still_seq += 1
         self._notes_dirty = False
         self._proxy_fallback = False
         self.last_batch_id = ""
         self.batch_errors.setPlainText("")
-        self._clear_viewer()
-        self.reload_all(keep_checks=False, keep_focus=False)
-
-    def _invalidate_viewer(self) -> None:
-        self._view_gen += 1
-        self._still_seq += 1
-        self._proxy_fallback = False
-        self.still_path = ""
-        self.playback_result = None
-        self.still_original.set_source(QPixmap())
-        self.still_original.setText("Original still")
-        self.still_adjusted.set_source(QPixmap())
-        self.still_adjusted.setText("Adjusted still")
-        if self.player is not None:
-            self.player.stop()
-            self.player.setSource(QUrl())
-        self.scrub.setRange(0, 0)
-        self.time_label.setText("0:00.0 / 0:00.0")
-
-    def _clear_viewer(self) -> None:
+        self._import_errors = []
+        self._browsed_root = None
+        self.grid.clear_selection()
         self._invalidate_viewer()
-        self.playback_note.setText("No clip.")
-        self.viewer_stack.setCurrentIndex(0)
+        self._gyro_geometry.clear()
+        self._geometry_users.clear()
+        self._retire_owned_previews()
+        self.reload_all()
 
     def save_project_interactive(self) -> bool:
-        if not self.commit_editor():
+        if not self._flush_pending_edit() or not self.commit_editor():
             return False
         if self.service.project_path is None:
             return self.save_project_as()
@@ -1860,7 +1964,7 @@ class MainWindow(QMainWindow):
         return self.save_project_to(path)
 
     def save_project_to(self, path: str) -> bool:
-        if not self.commit_editor():
+        if not self._flush_pending_edit() or not self.commit_editor():
             return False
         try:
             self.service.save_project(path)
@@ -1892,16 +1996,9 @@ class MainWindow(QMainWindow):
 
     def _apply_capabilities(self, report: dict) -> None:
         self.capabilities = report
-        missing = [
-            name
-            for name in ("ffmpeg", "ffprobe", "gyroflow")
-            if not (report.get(name) or {}).get("available")
-        ]
+        missing = [name for name in ("ffmpeg", "ffprobe", "gyroflow") if not (report.get(name) or {}).get("available")]
         if missing:
-            self.statusBar().showMessage(
-                "Not found yet: " + ", ".join(missing) + ". Set the paths under Tools. Crafts Prepare does not download them.",
-                12000,
-            )
+            self.statusBar().showMessage("Not found yet: " + ", ".join(missing) + ". Set the paths under Tools.", 12000)
         else:
             self.statusBar().showMessage("ffmpeg, ffprobe, and Gyroflow were found.", 6000)
 
@@ -1918,16 +2015,10 @@ class MainWindow(QMainWindow):
     def show_licenses(self) -> None:
         from ..runtime import bundle_dir, is_frozen, repo_root
 
-        if is_frozen():
-            bundled = bundle_dir()
-            folder = (bundled / "licenses") if bundled else None
-        else:
-            folder = repo_root() / "packaging" / "third-party-licenses"
-        text = "License files"
+        folder = (bundle_dir() / "licenses") if is_frozen() and bundle_dir() else repo_root() / "packaging" / "third-party-licenses"
         if folder and folder.is_dir():
-            text = str(folder)
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
-        TextDialog("Licenses", text, self).exec()
+        TextDialog("Licenses", str(folder), self).exec()
 
     def handle_peer(self, payload: bytes) -> None:
         if b"raise" in payload:
@@ -1936,19 +2027,46 @@ class MainWindow(QMainWindow):
             self.activateWindow()
             self.peer_raised.emit()
 
-    def shutdown_owned(self) -> None:
-        for job in self.service.jobs():
-            if job["status"] in _ACTIVE:
-                try:
-                    self.service.cancel(job["id"])
-                except CraftsError:
-                    pass
-        self.service.shutdown(timeout=8)
-        if not self._runner.shutdown(timeout=8):
-            self.statusBar().showMessage("A background task was still stopping.", 8000)
+    def _refresh_project_chip(self) -> None:
+        if self.service.project_path is None:
+            text = "New" if not self.service.project.get("clips") else "New · Unsaved"
+            self.project_chip.setText(text)
+            self.project_chip.setToolTip(text)
+            return
+        name = Path(str(self.service.project_path)).name
+        self.project_chip.setToolTip(str(self.service.project_path))
+        self.project_chip.setText(name if len(name) < 42 else name[:18] + "…" + name[-12:])
+
+    def _restore_window(self) -> None:
+        self.places.set_lists(self.state.get("folders") or [], self.state.get("favorites") or [])
+
+    def _save_preferences(self) -> bool:
+        try:
+            save_state(self.state, self.state_path)
+            return True
+        except Exception:
+            return False
+
+    def _persist_window(self) -> None:
+        self._save_preferences()
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self.import_paths(paths)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.matches(QKeySequence.StandardKey.SelectAll):
+            self.select_all_batch()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        if not self.commit_editor():
+        if not self._prepare_to_leave(discard=self.force_close, allow_discard=True):
             event.ignore()
             return
         if self.is_unsaved() and not self.force_close:
@@ -1959,17 +2077,19 @@ class MainWindow(QMainWindow):
             if choice == "save" and not self.save_project_interactive():
                 event.ignore()
                 return
-        if not self._runner.settle(timeout=8):
+        if not self._runner.settle(timeout=8) and not self.force_close:
             self.statusBar().showMessage("A background tool is still stopping. The window stays open.", 8000)
-            if not self._refresh_timer.isActive():
-                self._refresh_timer.start()
             event.ignore()
             return
         self._refresh_timer.stop()
+        self._import_timer.stop()
         if self.player is not None:
             self.player.stop()
-            self.player.setVideoOutput(None)
+            self.player.setVideoSink(None)
             self.player.setSource(QUrl())
+            from PySide6.QtWidgets import QApplication
+
+            QApplication.processEvents()
         for job in self.service.jobs():
             if job["status"] in _ACTIVE:
                 try:
@@ -1977,10 +2097,8 @@ class MainWindow(QMainWindow):
                 except CraftsError:
                     pass
         self.service.shutdown(timeout=8)
+        self._thumbs.shutdown()
         if not self._runner.shutdown(timeout=4):
-            self.statusBar().showMessage("A background tool is still stopping. The window stays open.", 8000)
-            if not self._refresh_timer.isActive():
-                self._refresh_timer.start()
             event.ignore()
             return
         try:
@@ -1991,25 +2109,65 @@ class MainWindow(QMainWindow):
             logging.getLogger(__name__).exception("Window preferences failed during close")
         event.accept()
 
-    def _start(self, fn, on_ok, *, key: str | None = None) -> None:
+    def _discard_editor(self) -> None:
+        self._recipe_timer.stop()
+        self._pending_edit = None
+        self._pending_markers = None
+        self._notes_dirty = False
+        self._fill_focus()
+
+    def _prompt_discard_edit(self) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setText("This edit could not be saved.")
+        box.setInformativeText((self.last_error or "Check the current settings.") + "\nDiscard this edit and continue?")
+        discard = box.addButton("Discard edit", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        return box.clickedButton() is discard
+
+    def _prepare_to_leave(self, *, discard: bool = False, allow_discard: bool = False) -> bool:
+        if discard:
+            self._discard_editor()
+            return True
+        if self._flush_pending_edit() and self.commit_editor():
+            return True
+        if not allow_discard or not self._prompt_discard_edit():
+            return False
+        self._discard_editor()
+        return True
+
+    def _start(self, fn, on_ok, *, key: str | None = None, on_finished=None):
         token = self._token
         self._token += 1
         self._inflight += 1
         self._callbacks[token] = on_ok
-        self._runner.submit(token, fn, key)
+        if on_finished is not None:
+            self._finalizers[token] = on_finished
+        return self._runner.submit(token, fn, key)
+
+    def _finish_task(self, token: int) -> None:
+        finalizer = self._finalizers.pop(token, None)
+        try:
+            if finalizer is not None:
+                finalizer()
+        finally:
+            self._note_finished()
 
     def _task_ok(self, token: int, value) -> None:
         callback = self._callbacks.pop(token, None)
-        if callback:
-            callback(value)
-        self._note_finished()
+        try:
+            if callback and value is not None:
+                callback(value)
+        finally:
+            self._finish_task(token)
 
     def _task_fail(self, token: int, message: str) -> None:
         self._callbacks.pop(token, None)
         if message != "cancelled":
             self.last_error = message
             self.statusBar().showMessage(message, 10000)
-        self._note_finished()
+        self._finish_task(token)
 
     def _note_finished(self) -> None:
         self._inflight = max(0, self._inflight - 1)

@@ -31,6 +31,69 @@ def test_normal_hardlink_publication(tmp_path: Path):
     assert identity == {"device": st.st_dev, "inode": st.st_ino}
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Needs a real Win32 handle without delete sharing")
+def test_published_file_survives_transient_windows_staging_lock(tmp_path: Path, monkeypatch):
+    import ctypes
+    import threading
+    from ctypes import wintypes
+
+    source, partial, final = _pair(tmp_path)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    real_link = os.link
+    handles = []
+    releaser = []
+
+    def link_then_hold(src, dst):
+        real_link(src, dst)
+        handle = kernel32.CreateFileW(str(src), 0x80000000, 0x1 | 0x2, None, 3, 0x80, None)
+        if handle in {None, ctypes.c_void_p(-1).value}:
+            raise ctypes.WinError(ctypes.get_last_error())
+        handles.append(handle)
+        # Prove the lock really prevents the cleanup operation before retrying.
+        with pytest.raises(OSError) as locked:
+            partial.unlink()
+        assert locked.value.winerror == 32
+        timer = threading.Timer(0.2, lambda: kernel32.CloseHandle(handles.pop()))
+        releaser.append(timer)
+        timer.start()
+
+    monkeypatch.setattr(os, "link", link_then_hold)
+    try:
+        identity = publish_exclusive(partial, final, source)
+        assert final.read_bytes() == b"finished-bytes"
+        assert source.read_bytes() == b"source-bytes"
+        assert not partial.exists()
+        assert identity["inode"] == final.lstat().st_ino
+    finally:
+        for timer in releaser:
+            timer.join(timeout=2)
+        for handle in handles:
+            kernel32.CloseHandle(handle)
+
+
+def test_persistent_cleanup_error_does_not_turn_published_output_into_failure(tmp_path: Path, monkeypatch, caplog):
+    source, partial, final = _pair(tmp_path)
+    original = Path.unlink
+
+    def locked(path, *args, **kwargs):
+        if path == partial:
+            error = PermissionError("another process holds the staging file")
+            error.winerror = 32
+            raise error
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+    identity = publish_exclusive(partial, final, source)
+    assert final.read_bytes() == partial.read_bytes() == b"finished-bytes"
+    assert source.read_bytes() == b"source-bytes"
+    assert identity["inode"] == final.lstat().st_ino
+    assert "staging cleanup is still locked" in caplog.text
+
+
 def test_existing_destination_bytes_are_preserved(tmp_path: Path):
     source, partial, final = _pair(tmp_path)
     final.write_bytes(b"keep-me")

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import logging
 import os
 import re
+import time
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -218,6 +220,19 @@ _LINK_UNSUPPORTED = {
 }
 
 
+def _retry_windows_share(operation):
+    """Wait briefly for a scanner/player to release a handle; never force it."""
+    delay = 0.05
+    for attempt in range(8):
+        try:
+            return operation()
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 7:
+                raise
+            time.sleep(delay)
+            delay = min(0.4, delay * 2)
+
+
 def publish_exclusive(partial: Path, final: Path, source: Path) -> dict:
     """Publish partial onto final without replacing an existing file.
 
@@ -237,7 +252,7 @@ def publish_exclusive(partial: Path, final: Path, source: Path) -> dict:
     if not partial.is_file() or partial.stat().st_size <= 0:
         raise CraftsError("Refusing to publish an empty staging file.", code="invalid_output")
     try:
-        os.link(partial, final)
+        _retry_windows_share(lambda: os.link(partial, final))
     except FileExistsError as exc:
         raise _collision(final) from exc
     except OSError as exc:
@@ -247,7 +262,13 @@ def publish_exclusive(partial: Path, final: Path, source: Path) -> dict:
             raise
         rename_noreplace(partial, final)
     else:
-        partial.unlink(missing_ok=True)
+        try:
+            _retry_windows_share(lambda: partial.unlink(missing_ok=True))
+        except OSError:
+            # The complete validated file is already published atomically.
+            # Cleanup must not turn that success into a failed job with an
+            # existing output. The owning job also retires its staging folder.
+            logging.getLogger(__name__).warning("Published output; staging cleanup is still locked: %s", partial.name)
     return file_identity(final)
 
 
@@ -255,7 +276,7 @@ def rename_noreplace(src: Path, dst: Path) -> None:
     """Move src onto a name that must not already exist. Leaves src in place on failure."""
     if os.name == "nt":
         try:
-            os.rename(src, dst)
+            _retry_windows_share(lambda: os.rename(src, dst))
         except FileExistsError as exc:
             raise _collision(dst) from exc
         return

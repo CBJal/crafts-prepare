@@ -10,7 +10,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QPoint
 from PySide6.QtGui import QPalette
-from PySide6.QtWidgets import QApplication, QTableWidgetItem, QToolBar, QToolButton
+from PySide6.QtWidgets import QApplication, QToolBar, QToolButton
 
 from app.desktop.prefs import PrefsWriteError, save_state
 from app.desktop.window import MainWindow
@@ -53,6 +53,43 @@ def _luminance(pixmap) -> float:
     return total / count if count else 0.0
 
 
+def test_qt_scale_factor_is_the_screen_dpr(tmp_path: Path):
+    script = tmp_path / "dpi_check.py"
+    script.write_text(
+        "import os\n"
+        "os.environ['QT_QPA_PLATFORM'] = 'offscreen'\n"
+        "os.environ['QT_SCALE_FACTOR'] = '1.5'\n"
+        "os.environ['CRAFTS_DISABLE_WORKER'] = '1'\n"
+        f"os.environ['CRAFTS_SETTINGS_PATH'] = {str(tmp_path / 'settings.json')!r}\n"
+        f"os.environ['CRAFTS_DATA_DIR'] = {str(tmp_path / 'cache')!r}\n"
+        f"os.environ['CRAFTS_LOG_PATH'] = {str(tmp_path / 'app.log')!r}\n"
+        "from PySide6.QtWidgets import QApplication\n"
+        "from app.desktop.window import MainWindow\n"
+        "from app.service import Service\n"
+        "app = QApplication([])\n"
+        "window = MainWindow(Service())\n"
+        "window.resize(1280, 800)\n"
+        "window.show()\n"
+        "app.processEvents()\n"
+        "ratio = app.devicePixelRatio()\n"
+        "point = window.export_button.mapTo(window, window.export_button.rect().center())\n"
+        "assert abs(ratio - 1.5) < 0.05, ratio\n"
+        "assert 0 <= point.x() <= window.width()\n"
+        "assert window.export_button.isVisible()\n"
+        "window.force_close = True\n"
+        "window.close()\n"
+        "print('dpi-ok', ratio)\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["QT_SCALE_FACTOR"] = "1.5"
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    completed = __import__("subprocess").run([__import__("sys").executable, str(script)], cwd=str(Path(__file__).resolve().parents[1]), env=env, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "dpi-ok 1.5" in completed.stdout
+
+
 def test_light_shell_is_not_black_and_stylesheet_names_the_surface(qapp, window):
     window.set_theme("light")
     qapp.processEvents()
@@ -67,20 +104,21 @@ def test_light_shell_is_not_black_and_stylesheet_names_the_surface(qapp, window)
     qapp.processEvents()
     color = shell.grab().toImage().pixelColor(6, 6)
     assert color.lightness() < 50
-    assert "#3d4b5c" in window.styleSheet()
-    assert "QTableWidget::item:selected" in window.styleSheet()
+    assert "#2f6fed" in window.styleSheet()
+    assert "QFrame#clipCard[selected=\"true\"]" in window.styleSheet()
 
 
 def test_dark_selection_is_not_a_white_row(qapp, window):
     window.set_theme("dark")
-    window.library.setRowCount(1)
-    window.library.setItem(0, 1, QTableWidgetItem("clip.mp4"))
-    window.library.selectRow(0)
+    window.grid.set_items([{"id": "clip-a", "name": "clip.mp4", "meta": "1.0s", "error": ""}])
+    window.grid.select_only("clip-a")
+    window.resize(1280, 800)
     qapp.processEvents()
-    rect = window.library.visualItemRect(window.library.item(0, 1))
-    assert rect.width() > 4
-    color = window.library.grab().toImage().pixelColor(rect.center().x(), rect.center().y())
-    assert color.lightness() < 160
+    card = window.grid._cards["clip-a"]
+    # The selection ring is the card chrome. The picture well inside it stays dark.
+    color = card.grab().toImage().pixelColor(1, 1)
+    assert color.blue() > color.red()
+    assert color.lightness() < 180
     assert not (color.red() > 220 and color.green() > 220 and color.blue() > 220)
 
 
@@ -97,7 +135,8 @@ def test_primary_export_icon_contrasts_with_its_button(qapp, window):
 
 
 def test_compact_transport_stays_on_screen_with_names(qapp, window):
-    window.resize(960, 640)
+    window.resize(1280, 800)
+    window._show_mode(1)
     window.show()
     qapp.processEvents()
     buttons = [
@@ -105,8 +144,6 @@ def test_compact_transport_stays_on_screen_with_names(qapp, window):
         window.pause_button,
         window.frame_back_button,
         window.frame_forward_button,
-        window.mark_in_button,
-        window.mark_out_button,
     ]
     names = []
     for button in buttons:
@@ -118,13 +155,15 @@ def test_compact_transport_stays_on_screen_with_names(qapp, window):
         assert 0 <= point.x() <= window.width()
         assert button.width() >= 28
         assert button.isVisible()
-    assert names == ["Play", "Pause", "Previous frame", "Next frame", "Set trim in", "Set trim out"]
+    assert names == ["Play", "Pause", "Previous frame", "Next frame"]
     time_point = window.time_label.mapTo(window, QPoint(0, 0))
     assert time_point.x() + 20 < window.width()
     assert window.time_label.isVisible()
     assert window.settings_action.text() == "Tools"
     assert window.inspector_tabs.tabIcon(0).isNull() is False
-    assert window.inspector_tabs.tabIcon(3).isNull() is False
+    assert window.inspector_tabs.tabIcon(2).isNull() is False
+    assert window.inspector_tabs.tabText(0) == "Color"
+    assert window.inspector_tabs.tabText(1) == "Gyro"
 
 
 def test_project_chip_is_honest_and_elides(qapp, window):

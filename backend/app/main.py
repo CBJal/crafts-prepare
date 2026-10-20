@@ -124,14 +124,28 @@ class BatchGyroBody(BaseModel):
     preset_path: str | None = None
 
 
+class BatchPrepareBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    preset_id: str
+    audio: bool = True
+    acknowledge_bit_depth_conversion: bool = False
+    use_trim: bool = False
+    fit: str = "none"
+    width: int | None = Field(default=None, ge=2, le=7680)
+    height: int | None = Field(default=None, ge=2, le=4320)
+    crf: int | None = Field(default=None, ge=0, le=51)
+    rotate: str = "0"
+
+
 class BatchBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    operation: Literal["export", "gyro"]
+    operation: Literal["export", "gyro", "prepare"]
     clip_ids: list[str] = Field(min_length=1, max_length=40)
     destination_dir: str = Field(min_length=1, max_length=4096)
     suffix: str = ""
     export: BatchExportBody | None = None
     gyro: BatchGyroBody | None = None
+    prepare: BatchPrepareBody | None = None
 
 
 class SettingsBody(BaseModel):
@@ -302,6 +316,8 @@ def create_app() -> FastAPI:
             raise CraftsError("Export batch settings are missing.", code="bad_batch")
         if body.operation == "gyro" and body.gyro is None:
             raise CraftsError("Gyro batch settings are missing.", code="bad_batch")
+        if body.operation == "prepare" and body.prepare is None:
+            raise CraftsError("Prepare batch settings are missing.", code="bad_batch")
         return service.enqueue_batch(payload)
 
     @app.get("/api/jobs/batch/{batch_id}")

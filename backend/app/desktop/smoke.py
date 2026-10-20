@@ -133,41 +133,146 @@ def run_smoke(
         if not proof["steps"][-1]["ok"]:
             code = 2
             return code
+        def painted() -> int:
+            count = 0
+            for key, pix in window.grid._pixmaps.items():
+                if str(key).startswith(("error", "pending")):
+                    continue
+                if pix is not None and not pix.isNull():
+                    count += 1
+            return count
+
+        wait_signal(lambda: painted() >= len(window.clips) and len(window.clips) > 0, 30000)
+        proof["steps"].append(
+            {
+                "step": "thumbnails",
+                "ok": painted() == len(window.clips) and len(window.clips) > 0,
+                "count": len(window.clips),
+                "painted": painted(),
+            }
+        )
+        recipe = dict(settings.get("recipe") or {})
+        if settings.get("lut"):
+            recipe["look_lut"] = settings["lut"]
+        if recipe and window.clips:
+            for clip in list(window.clips):
+                window.service.update_clip(clip["id"], {"recipe": recipe})
+            window.clips = window.service.clips()
+        profiles = []
+        for clip in window.clips:
+            from .grade import describe_clip
+
+            described = describe_clip(clip)
+            profiles.append(
+                {
+                    "name": clip.get("name"),
+                    "sidecar": (described["sidecar"] or {}).get("status"),
+                    "pipeline": (described["profile"] or {}).get("pipeline"),
+                    "source": (described["profile"] or {}).get("source"),
+                    "message": (described["profile"] or {}).get("message"),
+                }
+            )
+        unresolved = [item for item in profiles if item.get("pipeline") in {None, "", "unknown"} or item.get("sidecar") in {"conflict", "ambiguous", "unsafe"}]
+        proof["steps"].append({"step": "profiles", "ok": bool(profiles) and not unresolved, "clips": profiles})
         if window.clips:
             window.focus_clip(window.clips[0]["id"])
-        window.request_playback()
-        window.wait_until_idle(90000)
+        window._show_mode(1)
+        window.request_comparison()
+        window.wait_until_idle(120000)
+        start_frames = window.compare.frames_presented
+        start_seconds = window.compare.seconds
+        window.play()
+
+        def comparison_moved() -> bool:
+            return (
+                window.compare.same_time()
+                and window.compare.frames_presented > start_frames
+                and window.compare.seconds > start_seconds + 0.02
+                and not window.compare._left.isNull()
+                and not window.compare._right.isNull()
+            )
+
+        wait_signal(comparison_moved, 8000)
+        window.pause()
         playback = _observe_playback(window, wait_signal)
-        window.request_still(False)
-        window.wait_until_idle(90000)
-        window.request_still(True)
-        window.wait_until_idle(90000)
+        comparison_ok = window.compare.same_time() and comparison_moved()
         grab("viewer")
-        proof["steps"].append({"step": "viewer", "ok": bool(window.still_path) and playback["advanced"], "playback": playback, "still": window.still_path, "detail": window.last_error})
+        proof["steps"].append(
+            {
+                "step": "viewer",
+                "ok": bool(window.still_path) and playback["advanced"],
+                "playback": playback,
+                "still": window.still_path,
+                "detail": window.last_error,
+            }
+        )
+        proof["steps"].append(
+            {
+                "step": "comparison",
+                "ok": comparison_ok,
+                "seconds": window.compare.seconds,
+                "mode": window.compare.mode,
+                "detail": window.preview_status.text(),
+            }
+        )
         window.destination.setText(str(output))
         window.select_all_batch()
         _apply_export(window, settings.get("export") or {})
-        window.queue_checked_batch("export")
-        _apply_gyro(window, settings.get("gyro") or {})
-        window.queue_checked_batch("gyro")
+        gyro_settings = settings.get("gyro") or {}
+        gyro_expect = gyro_settings.get("expect")
+        if gyro_settings:
+            for clip in list(window.clips):
+                recipe = {"gyro_enabled": True}
+                if "smoothness" in gyro_settings:
+                    recipe["gyro_smoothness"] = float(gyro_settings["smoothness"])
+                if "fov" in gyro_settings:
+                    recipe["gyro_fov"] = float(gyro_settings["fov"])
+                if "horizon" in gyro_settings:
+                    recipe["gyro_horizon"] = float(gyro_settings["horizon"])
+                window.service.update_clip(clip["id"], {"recipe": recipe})
+            window.clips = window.service.clips()
+        gyro_compare_ok = True
+        if gyro_expect == "succeeded" and window.clips:
+            window.focus_clip(window.clips[0]["id"])
+            window._show_mode(1)
+            window.gyro_enabled.setChecked(True)
+            window.update_stabilization_preview()
+            gyro_compare_ok = wait_signal(
+                lambda: bool(window.comparison_used_gyro) and window.compare.frames_presented > 0,
+                int(gyro_settings.get("timeout_ms") or 180000),
+            )
+            proof["steps"].append(
+                {
+                    "step": "gyro-comparison",
+                    "ok": gyro_compare_ok,
+                    "detail": window.gyro_status.text(),
+                    "preview": window.preview_status.text(),
+                    "geometry": window.playback_result,
+                }
+            )
+            if not gyro_compare_ok:
+                code = 2
+        # Focusing the representative gyro clip above (and trim controls) uses
+        # select_only. The export contract is still every imported sample.
+        window.select_all_batch()
+        proof["selected_for_export"] = len(window.selected_ids())
+        window.queue_checked_batch("prepare")
         _wait_jobs(app, service, window)
         jobs = _job_rows(service)
         expectations = settings.get("expect") or {}
-        export_ok = [item for item in jobs if item["kind"] == "export" and item["status"] == "succeeded" and item["honest"]]
-        gyro_rows = [item for item in jobs if item["kind"] == "gyroflow"]
-        gyro_expect = (settings.get("gyro") or {}).get("expect")
-        gyro_good = [item for item in gyro_rows if item["status"] == "succeeded" and item["honest"]]
+        prepare_rows = [item for item in jobs if item["kind"] == "prepare"]
+        prepare_ok = [item for item in prepare_rows if item["status"] == "succeeded" and item["honest"]]
+        gyro_expect = gyro_settings.get("expect")
         min_export = int(expectations.get("min_export_succeeded", len(paths)))
         if gyro_expect == "succeeded":
-            min_gyro = int(expectations.get("min_gyro_succeeded", len(paths)))
-            gyro_ok = len(gyro_good) >= min_gyro and len(gyro_rows) >= min_gyro
+            queue_ok = len(prepare_ok) >= int(expectations.get("min_gyro_succeeded", len(paths)))
         elif gyro_expect == "failed":
-            gyro_ok = bool(gyro_rows) and all(item["status"] == "failed" for item in gyro_rows)
+            queue_ok = bool(prepare_rows) and all(item["status"] == "failed" for item in prepare_rows)
+            queue_ok = queue_ok and not any(Path(str(item.get("output_path") or "")).is_file() for item in prepare_rows)
         else:
-            gyro_ok = True
-        queue_ok = bool(jobs) and len(export_ok) >= min_export and all(item["honest"] for item in jobs) and gyro_ok
+            queue_ok = bool(prepare_rows) and len(prepare_ok) >= min_export and all(item["honest"] for item in jobs)
         grab("queue")
-        proof["steps"].append({"step": "queue", "ok": queue_ok, "jobs": jobs, "export_succeeded": len(export_ok)})
+        proof["steps"].append({"step": "queue", "ok": queue_ok, "jobs": jobs, "export_succeeded": len(prepare_ok)})
         after = {str(path): _sha256(path) for path in paths if path.is_file()}
         proof["source_sha256_before"] = before
         proof["source_sha256_after"] = after

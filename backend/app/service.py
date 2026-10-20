@@ -21,6 +21,8 @@ from .filters import VIDSTAB_AUTO, FilterSpec, validate_adjustment, validate_lut
 from .gcsv import parse_gcsv_file
 from .gyroflow_cli import gyro_format, run_gyroflow
 from .importer import import_path
+from .prepare import plan_prepare_clip, run_prepare
+from .recipe import freeze_lut_paths
 from .presets import PRESETS, conversion_note, preset_availability
 from .preview import PROXY_LIMIT_SECONDS, browser_playable, extract_thumbnail, make_proxy
 from .probe import discover_executable
@@ -406,6 +408,75 @@ class Service:
                 return clip
         raise CraftsError("Clip not found.", code="not_found", status=404)
 
+    def refresh_metadata(self, clip_ids: list[str], cancel=None) -> dict:
+        """Re-probe and re-pair selected clips in place. Recipes are kept.
+
+        Re-import deduplicates by checksum and does not refresh a clip that is
+        already in the project. This is the path that repairs a changed or
+        missing sidecar. A missing source is reported and does not wipe the clip.
+        """
+        from .importer import sha256_file
+        from .probe import probe_file
+        from .sony_xml import assess_sidecar, pair_sidecar
+
+        _ffmpeg, ffprobe = self._tools()
+        results = []
+        with self.lock:
+            project = self.project
+            selected = [(clip_id, self._clip(clip_id), Path(self._clip(clip_id)["path"])) for clip_id in dict.fromkeys(clip_ids)]
+        changes = []
+        # Probing and hashing must not hold the lock used by UI/queue reads.
+        # Commit the complete refresh only if its project and sources still match.
+        for clip_id, clip, path in selected:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            if not path.is_file():
+                changes.append((clip_id, clip, path, None))
+                continue
+            probed = probe_file(ffprobe, path, cancel=cancel)
+            sidecar = pair_sidecar(path)
+            if sidecar.get("status") == "ok":
+                sidecar["assessment"] = assess_sidecar(sidecar, probed)
+            checksum = sha256_file(path, cancel=cancel)
+            stat = path.stat()
+            changes.append((clip_id, clip, path, (probed, sidecar, checksum, stat)))
+        with self.lock:
+            if self.project is not project or (cancel is not None and cancel.is_set()):
+                raise Cancelled("The metadata refresh was cancelled before replacing any metadata.")
+            if any(self._clip(clip_id) is not clip or Path(clip["path"]) != path for clip_id, clip, path, _data in changes):
+                raise Cancelled("The selected sources changed during metadata refresh.")
+            for clip_id, clip, path, data in changes:
+                recipe_kept = isinstance(clip.get("recipe"), dict)
+                if data is None:
+                    side = dict(clip.get("sidecar") or {})
+                    side["refresh"] = "missing"
+                    side["message"] = "The source file is missing, so metadata was not replaced. The saved recipe was kept."
+                    clip["sidecar"] = side
+                    clip["source_missing"] = True
+                    results.append({"id": clip_id, "status": "missing", "recipe_kept": recipe_kept})
+                    continue
+                probed, sidecar, checksum, stat = data
+                clip["probe"] = probed
+                clip["sidecar"] = sidecar
+                clip["sha256"] = checksum
+                clip["size"] = stat.st_size
+                clip["device"] = stat.st_dev
+                clip["inode"] = stat.st_ino
+                clip["source_missing"] = False
+                duration = float(probed.get("duration") or 0)
+                if duration and float(clip.get("trim_out") or 0) > duration + 0.05:
+                    clip["trim_out"] = duration
+                results.append(
+                    {
+                        "id": clip_id,
+                        "status": "refreshed",
+                        "assessment": sidecar.get("assessment") or {},
+                        "recipe_kept": recipe_kept,
+                    }
+                )
+            self._persist()
+        return {"clips": results}
+
     def update_clip(self, clip_id: str, patch: dict) -> dict:
         with self.lock:
             clip = self._clip(clip_id)
@@ -429,6 +500,11 @@ class Service:
                 new_in = _finite_number("Trim in", patch["trim_in"])
             if "trim_out" in patch and patch["trim_out"] is not None:
                 new_out = _finite_number("Trim out", patch["trim_out"])
+            new_recipe = clip.get("recipe") if isinstance(clip.get("recipe"), dict) else None
+            if "recipe" in patch and patch["recipe"] is not None:
+                from .recipe import normalize_recipe
+
+                new_recipe = normalize_recipe(patch["recipe"], previous=new_recipe)
             duration = float(clip["probe"].get("duration") or 0)
             if new_in < 0 or new_out <= new_in:
                 raise CraftsError("Trim in/out must be a positive interval.", code="bad_trim")
@@ -439,6 +515,8 @@ class Service:
             clip["markers"] = new_markers
             clip["trim_in"] = new_in
             clip["trim_out"] = new_out
+            if new_recipe is not None:
+                clip["recipe"] = new_recipe
             self._persist()
             return public_clip(clip)
 
@@ -627,8 +705,8 @@ class Service:
         """Queue every selected clip, or queue none and list every problem."""
         operation = body.get("operation")
         clip_ids = body.get("clip_ids")
-        if operation not in {"export", "gyro"}:
-            raise CraftsError("Batch operation must be export or gyro.", code="bad_batch")
+        if operation not in {"export", "gyro", "prepare"}:
+            raise CraftsError("Batch operation must be export, gyro, or prepare.", code="bad_batch")
         if not isinstance(clip_ids, list) or not clip_ids or len(clip_ids) > 40:
             raise CraftsError("A batch needs 1 to 40 clips.", code="batch_limit")
         if not all(isinstance(item, str) and item.strip() for item in clip_ids):
@@ -648,9 +726,12 @@ class Service:
             if operation == "export":
                 shared = body.get("export") or {}
                 self._validate_shared_export(shared)
-            else:
+            elif operation == "gyro":
                 shared = body.get("gyro") or {}
                 self._validate_shared_gyro(shared)
+            else:
+                shared = body.get("prepare") or {}
+                self._validate_shared_prepare(shared)
             for clip_id in clip_ids:
                 if clip_id in seen:
                     problems.append(
@@ -675,8 +756,16 @@ class Service:
                 try:
                     if operation == "export":
                         plan = self._plan_export_clip(clip, shared, destination, suffix)
-                    else:
+                    elif operation == "gyro":
                         plan = self._plan_gyro_clip(clip, shared, destination, suffix)
+                    else:
+                        plan = plan_prepare_clip(clip, shared, destination, suffix)
+                        plan["request"]["recipe"] = freeze_lut_paths(
+                            plan["request"]["recipe"],
+                            self.data_dir / "lut-snapshots",
+                        )
+                        sidecar = clip.get("sidecar") if isinstance(clip.get("sidecar"), dict) else {}
+                        plan["request"]["sidecar_sha256"] = str(sidecar.get("sha256") or "")
                     key = str(Path(plan["output"]).resolve(strict=False))
                     if key in claimed:
                         raise CraftsError(
@@ -958,6 +1047,8 @@ class Service:
                 result = self._run_export_job(request, flag, job_id)
             elif kind == "gyroflow":
                 result = self._run_gyro_job(request, flag, job_id)
+            elif kind == "prepare":
+                result = self._run_prepare_job(request, flag, job_id)
             else:
                 raise CraftsError("Unknown job kind.", code="bad_job")
         except Cancelled as exc:
@@ -1021,6 +1112,57 @@ class Service:
             )
         result["source_sha256_unchanged"] = True
         return result
+
+    def _run_prepare_job(self, request: dict, cancel: threading.Event, job_id: str) -> dict:
+        ffmpeg, ffprobe = self._tools()
+        with self.lock:
+            clip = self._clip(request["clip_id"])
+            probe = clip["probe"]
+            source = Path(clip["path"])
+            sidecar = clip.get("sidecar") if isinstance(clip.get("sidecar"), dict) else None
+            before = clip["sha256"]
+        if source.stat().st_size != clip["size"]:
+            raise CraftsError("Source size changed since import. The source was not modified by Crafts Prepare.", code="source_changed")
+
+        def on_progress(value: float) -> None:
+            self._progress(job_id, value)
+
+        return run_prepare(
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            settings=self.settings,
+            source=source,
+            source_sha256=before,
+            probe=probe,
+            sidecar=sidecar,
+            request=request,
+            job_id=job_id,
+            cancel=cancel,
+            on_progress=on_progress,
+            encoders=self._encoder_flags(),
+        )
+
+    def _validate_shared_prepare(self, shared: dict) -> None:
+        if not isinstance(shared, dict):
+            raise CraftsError("Prepare settings must be an object.", code="bad_batch")
+        preset = PRESETS.get(shared.get("preset_id") or "")
+        if preset is None:
+            raise CraftsError("Unknown preset.", code="bad_preset")
+        if "audio" in shared and not isinstance(shared.get("audio"), bool):
+            raise CraftsError("Audio flag is invalid.", code="bad_batch")
+        if "use_trim" in shared and not isinstance(shared.get("use_trim"), bool):
+            raise CraftsError("Trim flag is invalid.", code="bad_batch")
+        if shared.get("crf") is not None and (
+            isinstance(shared.get("crf"), bool) or not isinstance(shared.get("crf"), int) or not 0 <= shared["crf"] <= 51
+        ):
+            raise CraftsError("CRF must be an integer from 0 to 51.", code="bad_adjust")
+        flags = self._encoder_flags()
+        if not any(flags.get(name) for name in preset["encoder_aliases"]):
+            raise CraftsError(
+                f"{preset['label']} is unavailable because this ffmpeg build has no {preset['encoder']} encoder.",
+                code="encoder_missing",
+                status=424,
+            )
 
     def _run_gyro_job(self, request: dict, cancel: threading.Event, job_id: str) -> dict:
         _ffmpeg, ffprobe = self._tools()
@@ -1348,6 +1490,10 @@ def _validate_stored_clip(clip: object, seen: set[str]) -> dict:
     checked["markers"] = markers
     checked["trim_in"] = trim_in
     checked["trim_out"] = trim_out
+    if isinstance(clip.get("recipe"), dict):
+        from .recipe import assert_stored_recipe
+
+        checked["recipe"] = assert_stored_recipe(clip["recipe"])
     return checked
 
 
@@ -1466,7 +1612,7 @@ def _validate_stored_job(job: object, seen: set[str], clip_ids: set[str]) -> dic
         raise CraftsError("Job id is missing or duplicated.", code="bad_project")
     seen.add(job_id)
     kind = job.get("kind")
-    if not isinstance(kind, str) or kind not in {"export", "gyroflow"}:
+    if not isinstance(kind, str) or kind not in {"export", "gyroflow", "prepare"}:
         raise CraftsError("Job kind is invalid.", code="bad_project")
     status = job.get("status")
     if not isinstance(status, str) or status not in {"queued", "running", "paused", "succeeded", "failed", "cancelled", "interrupted"}:
@@ -1476,8 +1622,12 @@ def _validate_stored_job(job: object, seen: set[str], clip_ids: set[str]) -> dic
         raise CraftsError("Job request is invalid.", code="bad_project")
     if kind == "export":
         _validate_export_request(request, clip_ids)
-    else:
+    elif kind == "gyroflow":
         _validate_gyro_request(request, clip_ids)
+    elif kind == "prepare":
+        _validate_prepare_request(request, clip_ids)
+    else:
+        raise CraftsError("Job kind is invalid.", code="bad_project")
     if "attempt" in job and job["attempt"] is not None:
         attempt = job["attempt"]
         if isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= 1000:
@@ -1561,6 +1711,46 @@ def _validate_export_request(request: dict, clip_ids: set[str]) -> None:
         raise CraftsError("Export CRF is invalid.", code="bad_project")
 
 
+def _validate_prepare_request(request: dict, clip_ids: set[str]) -> None:
+    if not request:
+        raise CraftsError("Prepare job request is empty and cannot be resumed.", code="bad_project")
+    clip_id = request.get("clip_id")
+    if not isinstance(clip_id, str) or clip_id not in clip_ids:
+        raise CraftsError("Prepare job does not reference a clip in this project.", code="bad_project")
+    preset_id = request.get("preset_id")
+    if not isinstance(preset_id, str) or preset_id not in PRESETS:
+        raise CraftsError("Prepare job preset is invalid.", code="bad_project")
+    trim_in = _finite_number("Prepare in", request.get("in_seconds"), code="bad_project")
+    trim_out = _finite_number("Prepare out", request.get("out_seconds"), code="bad_project")
+    if trim_in < 0 or trim_out <= trim_in or trim_out > 86400 * 48:
+        raise CraftsError("Prepare trim is invalid.", code="bad_project")
+    destination = request.get("destination_dir")
+    if not isinstance(destination, str) or not destination.strip() or len(destination) > 4096 or "\x00" in destination or "://" in destination:
+        raise CraftsError("Prepare destination is invalid.", code="bad_project")
+    filename = request.get("filename")
+    if not isinstance(filename, str):
+        raise CraftsError("Prepare filename is missing.", code="bad_project")
+    safe_filename(filename)
+    if not isinstance(request.get("audio"), bool):
+        raise CraftsError("Prepare audio flag is invalid.", code="bad_project")
+    if not isinstance(request.get("gyro_enabled"), bool):
+        raise CraftsError("Prepare gyro flag is invalid.", code="bad_project")
+    recipe = request.get("recipe")
+    if not isinstance(recipe, dict):
+        raise CraftsError("Prepare recipe snapshot is missing.", code="bad_project")
+    if recipe.get("profile") not in {"auto", "slog3_sgamut3cine", "hlg_bt2020", "preserve"}:
+        raise CraftsError("Prepare recipe profile is invalid.", code="bad_project")
+    profile = request.get("profile")
+    if not isinstance(profile, dict) or not isinstance(profile.get("pipeline"), str):
+        raise CraftsError("Prepare profile snapshot is missing.", code="bad_project")
+    for key in ("input_lut", "look_lut"):
+        if recipe.get(key) not in (None, "") and not isinstance(recipe.get(key), str):
+            raise CraftsError("Prepare LUT path is invalid.", code="bad_project")
+    from .recipe import assert_stored_recipe
+
+    assert_stored_recipe(recipe)
+
+
 def _validate_gyro_request(request: dict, clip_ids: set[str]) -> None:
     output = request.get("output_path")
     if not isinstance(output, str) or not output.strip() or len(output) > 4096 or "\x00" in output or "://" in output:
@@ -1618,6 +1808,8 @@ def public_clip(clip: dict) -> dict:
         "trim_out": clip.get("trim_out") or 0,
         "browser_playable": browser_playable(probe),
         "probe": probe,
+        "recipe": clip.get("recipe") if isinstance(clip.get("recipe"), dict) else None,
+        "sidecar": clip.get("sidecar") if isinstance(clip.get("sidecar"), dict) else {"status": "missing", "message": "No sidecar was stored."},
         "summary": {
             "codec": video.get("codec") if isinstance(video.get("codec"), str) else None,
             "width": video.get("width") if isinstance(video.get("width"), int) else None,

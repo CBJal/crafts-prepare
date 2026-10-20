@@ -1,6 +1,20 @@
 # Capabilities and limits
 
-Status below is what this repository implements. "Verified here" means an automated test in this session, on Linux, with the system ffmpeg. It is not a Windows UI test and not a Sony camera test.
+## Native 0.3 workflow
+
+The installed application is Qt Widgets, with a folder/thumbnail Browse view, a single-clock moving Original/Processed/2-up/Wipe viewer, per-clip corrections, and an Export dialog containing the batch queue. It does not need a browser. See [BATCH_WORKFLOW.md](BATCH_WORKFLOW.md).
+
+- Adjacent Sony XML files identify the per-clip input colour profile. Supported automatic SDR normalization includes S-Log3/S-Gamut3.Cine and HLG/BT.2020. Unknown/conflicting profiles require a deliberate choice; no guessed conversion is applied. XML is not a numeric gyro log.
+- Input LUTs replace automatic normalization; Look LUTs run afterwards. Queued jobs freeze their LUT bytes. Exposure changes scene light. Rec.709 output is an independent transform, not a reproduction of Sony's rendering.
+- One preparation job combines original-space embedded-gyro stabilization, colour/LUT and final encoding. Source-size portrait output uses upright display dimensions. Audio, frame rate and supported 10-bit presets are retained and validated.
+- Color and Gyro each have Apply to selected; applying one panel keeps the other panel's per-clip settings. Metadata refresh is cancellable and does not hold UI reads behind file probing/hashing. Failed edits block folder/project replacement; closing offers an explicit discard route.
+- The native comparison is full length at bounded preview resolution. Paused frame steps decode the requested adjacent frame, with the timestamp reported by the decoder. Preview images are compressed SDR viewing aids, not calibrated HDR or pixel-identical 10-bit masters.
+- Gyro geometry is retained for current/in-flight use and a bounded cache of four owned files; comparison previews retain six recent files plus an active older player file. User sources and exports are not cache-cleanup targets.
+- The Windows installer uses the existing app identity and leaves settings/projects in place. External FFmpeg/ffprobe and Gyroflow remain separately installed dependencies. Lens-breathing correction, Sony algorithm parity and calibrated HDR monitoring are not provided.
+
+## Earlier optional API/web observations
+
+The table below records the earlier Linux/API and optional web interface's observations. Its browser/proxy limits are historical and do not describe the native 0.3 viewer above.
 
 | Feature | Status | Verified here |
 | --- | --- | --- |
@@ -24,19 +38,19 @@ Status below is what this repository implements. "Verified here" means an automa
 | Exposure and saturation via `eq` | Implemented | Same filter string for the still and the export |
 | `.cube` LUT via `lut3d` | Implemented | The UI has a LUT path field. The file is copied to `grade.cube` in a job directory and referenced by that safe name, so spaces, apostrophes, and Windows drive letters are not placed in the filter graph. FFmpeg 6 export of that path was tested here |
 | HDR display matching | Not implemented | |
-| Sony color transforms | Not implemented | |
+| Sony color transforms | S-Log3/S-Gamut3.Cine and HLG/BT.2020 to documented Rec.709 | Numerical patches and an FFmpeg LUT render on Linux. Not a Sony look LUT |
 | vidstab two-pass | Implemented when the filters exist | Synthetic shake: white-square centroid spread dropped. That is a motion measurement, not a quality grade |
 | deshake fallback | Implemented and labeled as visual fallback | Export ran. Stabilization quality was not scored |
 | Gyroflow CLI adapter | Implemented, including a Gyro panel in the UI | A `.gyroflow` project or preset is copied into the job staging directory. When that file has an output section, its folder (file URI), filename, and legacy output path are pointed at the owned staging file before launch, because Gyroflow 1.6.3 uses the project output instead of `--out-params`. A preset output section is rewritten the same way. Relative media and gyro paths are resolved from the original project directory. Absolute paths and file URIs, including percent-encoding, are left unchanged. An `output_folder_bookmark` is dropped on the copy only. Official Linux Gyroflow 1.6.3 (not bundled) confirmed the path choice on a synthetic clip: the unmodified project queued its stored folder, and the staged copy queued the staging file. That run did not finish a video file; this machine has no OpenCL or GPU. No camera footage was used |
 | `.gcsv` parser | Implemented | Units, negative samples, column order, gaps |
 | telemetry-parser 0.2.6 helper | Optional, builds with the pinned crates | Synthetic MP4 returned unsupported. No camera claim |
 | Library multi-select and batch queue | Implemented | Export and gyro batches queue every selected clip or none, with duplicate, missing, and collision reasons. Saved trim is used for export. Batch ids persist. Opening a project still pauses queued work. Cancel batch and retry-failed were tested |
-| Automatic Gyroflow batch | Implemented when Gyroflow is installed | Each clip is preflighted with `--export-metadata 2` inside that job's staging directory. `raw_imu` must be a progressing sequence of finite timestamped gyro vectors, and files above 256 MiB are not decoded. The requested codec, pixel format, dimensions, and audio replace those fields on the staged project and preset. The render is published only when ffprobe matches. A test double encodes with ffmpeg; this session did not finish a GPU render |
-| Light, Dark, and System themes | Implemented | Neutral slate and white surfaces with a blue accent. The choice is stored locally. Footage is not recolored |
+| Automatic Gyroflow batch | Implemented when Gyroflow is installed | Each clip is preflighted with `--export-metadata 2` inside that job's staging directory. `raw_imu` must be a progressing sequence of finite timestamped gyro vectors, and files above 256 MiB are not decoded. Output size is the upright frame: stored 3840×2160 with rotation 90 is requested as 2160×3840, and `video_info.rotation` is written. Gyroflow 1.6.3 no-geometry CPU output can be tagged TV while preserving code values, so colour still reads the profile range (full range for S-Log3) rather than that tag. The render is published only when ffprobe matches. A test double encodes with ffmpeg; this session did not finish a GPU render |
+| Light, Dark, and System themes | Implemented | Dark surfaces are neutral greys (grid #202020, panels #292929, bars #3b3b3b) with white text and a blue selection. The choice is stored locally. Footage is not recolored |
 | Queue cancel, retry, collision, failed ffmpeg | Implemented | Yes |
 | Windows process-tree kill | Code path uses `taskkill /F /T` with `CREATE_NO_WINDOW` | Not executed on Windows. Linux process-group kill was tested |
 | Native desktop | PySide6 Qt Widgets | Library, viewer, inspector, and queue. No embedded browser and no loopback UI server in the installed app. The optional web UI remains available with `python -m app` |
-| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup, version 0.2.1, same install id as 0.1.0. This Linux session did not run PyInstaller or Inno Setup. FFmpeg and Gyroflow programs are not inside the package. Qt playback libraries, when the wheel includes them, are separate from those programs |
+| Windows per-user installer | Source and build script | PyInstaller onedir plus Inno Setup, version 0.3.0, same install id as 0.1.0. This Linux session did not run PyInstaller or Inno Setup. FFmpeg and Gyroflow programs are not inside the package. Qt playback libraries, when the wheel includes them, are separate from those programs |
 | Accounts, payments, cloud upload | Not implemented | |
 
 Preset pixel formats:

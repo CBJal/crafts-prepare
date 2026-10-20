@@ -434,6 +434,7 @@ def run_gyroflow(
     on_progress,
     automatic: bool = False,
     output_settings: dict | None = None,
+    stabilization: dict | None = None,
 ) -> dict:
     executable = discover_executable(settings.get("gyroflow") or "gyroflow")
     if not executable:
@@ -497,6 +498,15 @@ def run_gyroflow(
                 cancel,
                 on_progress,
             )
+            if stabilization:
+                motion["stabilization_written"] = _write_stabilization(project, stabilization)
+            rotation = (output_settings or {}).get("rotation")
+            if rotation is not None:
+                written = _write_video_rotation(project, rotation)
+                motion["stabilization_written"] = {
+                    **(motion.get("stabilization_written") or {}),
+                    **written,
+                }
         # A loaded .gyroflow project or preset overrides CLI --out-params with its
         # own output_folder and output_filename. Rewrite those fields on owned
         # copies so the external tool can only target this job's staging file.
@@ -596,19 +606,23 @@ def run_gyroflow(
                 )
             ),
             "motion_samples": motion.get("samples"),
+            "stabilization_written": motion.get("stabilization_written") or {},
         }
     finally:
         _remove_owned_staging(staging_dir, final)
 
 
 def _automatic_contract(chosen: dict, settings: dict, media: Path, ffprobe: str, filename: str) -> dict:
+    from .probe import display_dimensions
+
     width = settings.get("width")
     height = settings.get("height")
     if not width or not height:
         probed = probe_file(ffprobe, media)
         video = (probed.get("video") or [None])[0] or {}
-        width = video.get("width")
-        height = video.get("height")
+        # Upright size, not the stored landscape raster. A 90° 3840×2160 clip
+        # is 2160×3840 after one rotation; forcing the stored size center-crops it.
+        width, height = display_dimensions(video)
     if isinstance(width, bool) or isinstance(height, bool) or not isinstance(width, int) or not isinstance(height, int):
         raise CraftsError(
             "Source dimensions could not be read, so the gyro output size was not left to a preset.",
@@ -678,6 +692,84 @@ def _assert_rendered_contract(probed: dict, expected: dict) -> None:
             + "). It was not published.",
             code="gyro_output_mismatch",
         )
+
+
+_SMOOTHNESS_NAMES = ("smoothness", "smoothness_pitch", "smoothness_yaw", "smoothness_roll")
+
+
+def _write_stabilization(project: Path, values: dict) -> dict:
+    """Update an owned Gyroflow 1.6 project without dropping readout or lens fields.
+
+    Strength is ``stabilization.smoothing_params`` entries named ``smoothness``
+    (0–1, the value DefaultAlgo.set_parameter reads). Horizon lock amount is the
+    public 0–100 percent slider. FOV follows the 0.1–3 slider: higher FOV widens
+    the frame. An unused ``stabilization.smoothness`` key is not written.
+    """
+    payload = json.loads(project.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise CraftsError("The exported Gyroflow project is not an object.", code="gyro_stage")
+    current = payload.get("stabilization")
+    if not isinstance(current, dict):
+        current = {}
+    written: dict = {}
+    if values.get("smoothness") is not None:
+        number = float(values["smoothness"])
+        if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+            raise CraftsError("Gyro smoothness must be between 0 and 1.", code="bad_recipe")
+        params = current.get("smoothing_params")
+        if not isinstance(params, list):
+            params = []
+        seen: set[str] = set()
+        for item in params:
+            if isinstance(item, dict) and item.get("name") in _SMOOTHNESS_NAMES:
+                item["value"] = number
+                seen.add(str(item["name"]))
+        for name in _SMOOTHNESS_NAMES:
+            if name not in seen:
+                params.append({"name": name, "value": number})
+        current["smoothing_params"] = params
+        current.pop("smoothness", None)
+        written["smoothing_params"] = [
+            {"name": name, "value": number} for name in _SMOOTHNESS_NAMES
+        ]
+    if values.get("fov") is not None:
+        fov = float(values["fov"])
+        if not math.isfinite(fov) or not 0.1 <= fov <= 3.0:
+            raise CraftsError("Gyro field of view must be between 0.1 and 3.", code="bad_recipe")
+        current["fov"] = fov
+        written["fov"] = fov
+    if values.get("horizon_lock_amount") is not None:
+        amount = float(values["horizon_lock_amount"])
+        if not math.isfinite(amount) or not 0.0 <= amount <= 100.0:
+            raise CraftsError("Horizon lock is a percent from 0 to 100.", code="bad_recipe")
+        current["horizon_lock_amount"] = amount
+        written["horizon_lock_amount"] = amount
+    payload["stabilization"] = current
+    project.write_text(json.dumps(payload), encoding="utf-8")
+    return written
+
+
+def _write_video_rotation(project: Path, rotation) -> dict:
+    """Record display rotation without swapping the stored video_info size.
+
+    Gyroflow 1.6.3 reads ``video_info.rotation`` into ``params.video_rotation``.
+    ``set_output_size`` then treats 90° and 270° as a swapped canvas. The
+    output width and height must be that upright canvas. ``video_info.width``
+    stays the coded size the file actually stores.
+    """
+    from .probe import normalize_rotation
+
+    angle = normalize_rotation(rotation)
+    payload = json.loads(project.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise CraftsError("The exported Gyroflow project is not an object.", code="gyro_stage")
+    info = payload.get("video_info")
+    if not isinstance(info, dict):
+        info = {}
+    info["rotation"] = float(angle)
+    payload["video_info"] = info
+    project.write_text(json.dumps(payload), encoding="utf-8")
+    return {"video_rotation": angle}
 
 
 def _prepare_embedded_project(
